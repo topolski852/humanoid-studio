@@ -1240,3 +1240,26 @@ Decode function in `recoil_protocol.py` is correct. No changes needed.
 `GET http://localhost:8765/debug/decode_frame?arb_id=0x48C&data=E8878DBD FFE809BF`
 
 Returns JSON with fully decoded frame including position_deg, velocity_dps.
+
+---
+
+## Wiki Repository
+
+The GitHub Wiki is a separate git repo cloned at:
+  /home/nse/humanoid-studio-wiki/
+
+The remote is set to SSH: git@github.com:topolski852/humanoid-studio.wiki.git
+
+To update wiki pages:
+  cp /home/nse/humanoid-studio/wiki/PAGENAME.md /home/nse/humanoid-studio-wiki/
+  cd /home/nse/humanoid-studio-wiki
+  git add .
+  git commit -m "Update wiki: description of change"
+  git push origin master
+
+NOTE: Push requires the SSH key to be added to GitHub account:
+  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICTnbkcReV7LV59jcLiRqy+/3pw+SdbklvCv+13v5sGa kelly.topolski@warlocks1507.com
+  Add at: https://github.com/settings/ssh/new
+
+Source wiki files live in /home/nse/humanoid-studio/wiki/ (tracked in main repo).
+The wiki repo at /home/nse/humanoid-studio-wiki/ is the publishing copy.
