@@ -1,0 +1,18 @@
+# Node
+app/node_modules/
+app/dist/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# Electron build output
+out/
+release/
+
+# Misc
+.DS_Store
+*.log

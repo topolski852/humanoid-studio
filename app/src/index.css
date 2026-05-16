@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
+
+  html, body, #root {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  body {
+    @apply bg-surface text-gray-200 font-sans;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { @apply bg-surface-3 rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-accent; }
+}
+
+@layer components {
+  .data-value {
+    @apply font-mono text-white tabular-nums;
+  }
+  .data-label {
+    @apply text-[10px] font-medium text-gray-500 uppercase tracking-widest;
+  }
+  .card {
+    @apply bg-surface-1 border border-surface-3 rounded-xl;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors focus:outline-none disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-accent-hover;
+  }
+  .btn-ghost {
+    @apply btn border border-surface-3 text-gray-400 hover:text-white hover:border-accent/50;
+  }
+  .btn-danger {
+    @apply btn bg-danger/20 text-danger border border-danger/30 hover:bg-danger/30;
+  }
+  .btn-success {
+    @apply btn bg-online/20 text-online border border-online/30 hover:bg-online/30;
+  }
+
+  /* Range input */
+  input[type="range"] {
+    @apply w-full h-1.5 rounded-full bg-surface-3 appearance-none cursor-pointer;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    @apply appearance-none w-4 h-4 rounded-full bg-accent shadow;
+  }
+  input[type="range"]:focus::-webkit-slider-thumb {
+    @apply ring-2 ring-accent/50;
+  }
+}
