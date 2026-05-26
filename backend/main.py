@@ -20,9 +20,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from humanoid.robot_config import RobotConfig
-from humanoid.robot import Robot
+from humanoid.daemon_client import DaemonClient
 from humanoid.flash import FlashManager
-from humanoid.can_monitor import CanMonitor
 from humanoid import settings as _app_settings
 from api import devices_router, motors_router, flash_router, robot_router, debug_router, settings_router
 
@@ -45,7 +44,7 @@ async def _watchdog_task(app: FastAPI) -> None:
     interval = 1.0 / _WATCHDOG_FEED_HZ
     while True:
         await asyncio.sleep(interval)
-        robot: Robot | None = app.state.robot
+        robot: DaemonClient | None = app.state.robot
         if robot and robot.is_connected():
             try:
                 await robot.feed_all_watchdogs()
@@ -70,7 +69,6 @@ async def lifespan(app: FastAPI):
 
     app.state.config      = config
     app.state.config_path = config_file
-    app.state.robot       = Robot(config) if config else None
     app.state.control_ws: WebSocket | None = None  # single control client
 
     if config is not None:
@@ -89,12 +87,16 @@ async def lifespan(app: FastAPI):
     app.state.flash_manager = FlashManager()
     app.state.ws_clients: set[WebSocket] = set()
 
-    # CAN monitor — starts background polling/sniffing tasks
-    monitor = CanMonitor(config)
-    app.state.can_monitor = monitor
-    await monitor.start()
+    # DaemonClient replaces both Robot and CanMonitor.
+    # app.state.robot is None when no config is loaded (preserves existing None-checks in routes).
+    # app.state.can_monitor always points to the client so /devices/can/status works regardless.
+    client = DaemonClient(config)
+    await client.start()
+    app.state.robot       = client if config is not None else None
+    app.state.can_monitor = client
 
-    # Background watchdog feed — keeps all active ESCs alive even when no WS client is connected
+    # Background watchdog feed — no-op with daemon (daemon feeds watchdogs internally),
+    # but kept so the task structure is unchanged.
     wdt_task = asyncio.create_task(_watchdog_task(app))
 
     yield
@@ -105,11 +107,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
-    robot: Robot | None = app.state.robot
-    if robot and robot.is_connected():
-        await robot.disconnect()
-
-    await monitor.stop()
+    await client.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +144,11 @@ async def ws_telemetry(ws: WebSocket) -> None:
 
     interval      = 1.0 / _TELEMETRY_HZ
     health_counter = _HEALTH_EVERY_N - 1  # emit health on first tick so UI gets CAN status immediately
-    monitor: CanMonitor = app.state.can_monitor
+    monitor: DaemonClient = app.state.can_monitor
 
     try:
         while True:
-            robot: Robot | None = app.state.robot
+            robot: DaemonClient | None = app.state.robot
 
             if robot is None or not robot.is_connected():
                 actuator_payload = {"connected": False, "actuators": {}}
@@ -251,7 +249,7 @@ async def ws_control(ws: WebSocket) -> None:
                 continue
             last_cmd_time = now
 
-            robot: Robot | None = app.state.robot
+            robot: DaemonClient | None = app.state.robot
             if robot is None or not robot.is_connected():
                 await ws.send_json({"error": "robot not connected"})
                 continue
