@@ -1746,3 +1746,74 @@ On quit (before-quit):
 - `GET /motors/left_ankle_pitch_joint` → state DISABLED (joint OFFLINE, no CAN) ✓
 - Backend startup/shutdown clean ✓
 
+---
+
+## Session D: Integration Tests (2026-05-26)
+
+### Bugs Fixed
+
+**Bug 1 — get_interface_stats() wrong shape for CAN Monitor**
+`get_interface_stats()` returned `open/rx_frames/joints_online:[]` but CanMonitor.jsx
+expects `state/bus_error_state/rx_packets/joints_online(int)/joints_total/joints[]`.
+Fixed in `backend/humanoid/daemon_client.py`. Now maps daemon bus_health correctly:
+- `state: "UP"/"DOWN"` from `open` bool
+- `bus_error_state: "ERROR-ACTIVE"/"DOWN"` (drives green/grey dot in UI)
+- `rx_packets`: from `rx_frames`
+- `joints_online`: int count of IDLE/ENABLED/CALIBRATING joints on this bus
+- `joints_total`: joint count from config for this bus
+- `joints`: [{name, can_id, status, position_rad, velocity_rads}]
+
+**Bug 2 — ELECTRON_RUN_AS_NODE=1 breaks npm run dev from VS Code terminal**
+VS Code sets `ELECTRON_RUN_AS_NODE=1` in its integrated terminal (VS Code is Electron).
+This causes the Electron binary to run as plain Node.js, making `require('electron')` fail
+with `undefined`. Fixed in `app/package.json` dev script — added `ELECTRON_RUN_AS_NODE=`
+to `cross-env` invocation, clearing the variable before launching Electron.
+
+### New Feature
+
+**CAN Monitor Reset Bus button** (`app/src/pages/CanMonitor.jsx`)
+Added a small "Reset" button to the header of UP adapter cards. Calls the existing
+`/devices/can/{name}/up` endpoint (ip link down → up). Useful for recovering from
+tx_dropped accumulation or stuck-frame conditions.
+
+### Known Daemon Limitation
+
+**UDP SHUTDOWN leaves process alive:** When `DaemonClient.daemon_shutdown()` sends a UDP
+SHUTDOWN command, the daemon calls `robot.stop()` (stops control loop, joints, threads)
+but the main thread is blocked in `pause()` and never receives a signal to exit. The
+process stays alive consuming no CPU, but CAN sockets remain open (though the control
+loop is stopped, so no TX traffic). SIGTERM from Electron's before-quit handler works
+correctly.
+
+**Impact:** The flash wizard calls `daemon_shutdown()` before opening its CAN socket.
+The daemon process stays alive but its control loop is stopped, so no CAN TX conflict.
+The flash wizard can open its own socket without interference. On app quit, Electron sends
+SIGTERM which cleanly exits the daemon.
+
+**Fix required (daemon source):** `robot.cpp` SHUTDOWN handler should call
+`raise(SIGTERM)` after the 100ms delay and `stop()` call. Cannot be fixed without
+modifying daemon/src/.
+
+### Integration Test Results
+
+| Test | Result |
+|---|---|
+| `make` in daemon/ (full rebuild) | Zero errors, zero warnings ✓ |
+| Daemon PING/PONG | ✓ |
+| Daemon telemetry JSON structure | Matches daemon_client.py ✓ |
+| Daemon SIGTERM shutdown | `[daemon] exited cleanly` ✓ |
+| Daemon UDP SHUTDOWN | Robot stops, process stays alive (known bug) |
+| Backend + daemon startup | DaemonClient connected, all endpoints working ✓ |
+| WS telemetry frames | `connected:true, actuators: 22 joints` ✓ |
+| `GET /devices/can/status` | 4 buses with correct state/joints_online ✓ |
+| `GET /motors/{joint}` | Returns ActuatorState correctly ✓ |
+| Electron startup | Daemon → backend → window sequence ✓ |
+| Electron SIGTERM shutdown (backend) | `DaemonClient stopped` cleanly ✓ |
+| can_left_leg open, 4/6 joints IDLE | Hardware verified ✓ |
+
+### What Was NOT Tested (requires hardware)
+
+- Steps 4–6: Motor enable/disable/jog (requires powered motors)
+- Flash wizard daemon_shutdown → flash → reconnect (requires ST-LINK + motor)
+- Right leg, both arms (CAN interfaces not available in test environment)
+
