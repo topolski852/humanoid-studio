@@ -64,7 +64,10 @@ export function TelemetryProvider({ children }) {
   const reconnectTimer  = useRef(null)
 
   useEffect(() => {
+    let cancelled = false
+
     function connect() {
+      if (cancelled) return
       const ws = new WebSocket(WS_URL)
       wsRef.current = ws
 
@@ -91,7 +94,7 @@ export function TelemetryProvider({ children }) {
       ws.onclose = () => {
         setWsConnected(false)
         setRobotConnected(false)
-        reconnectTimer.current = setTimeout(connect, 2000)
+        if (!cancelled) reconnectTimer.current = setTimeout(connect, 2000)
       }
 
       ws.onerror = () => ws.close()
@@ -100,8 +103,22 @@ export function TelemetryProvider({ children }) {
     connect()
 
     return () => {
+      cancelled = true
       clearTimeout(reconnectTimer.current)
-      wsRef.current?.close()
+      const ws = wsRef.current
+      if (!ws) return
+      // Null handlers before closing to prevent the reconnect timer from firing
+      // and to avoid the "closed before connection established" Chrome warning
+      // when React StrictMode double-mounts this effect in development.
+      ws.onclose = null
+      ws.onerror = null
+      if (ws.readyState === WebSocket.CONNECTING) {
+        // Can't close a CONNECTING socket without the Chrome warning; let it
+        // connect first, then close immediately.
+        ws.onopen = () => ws.close()
+      } else {
+        ws.close()
+      }
     }
   }, [])
 

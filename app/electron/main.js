@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, shell } = require('electron')
+const { app, BrowserWindow, dialog, shell, session } = require('electron')
 const path = require('path')
 const { spawn } = require('child_process')
 const http = require('http')
@@ -239,6 +239,31 @@ function createWindow() {
 
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 app.whenReady().then(async () => {
+  // In production, inject a strict CSP via response headers.
+  // Dev mode intentionally keeps unsafe-eval — Vite HMR requires it and the
+  // Electron CSP warning is suppressed in packaged builds anyway.
+  if (!IS_DEV) {
+    const prodCSP = [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data:",
+      "font-src 'self' data:",
+      "connect-src http://localhost:8765 ws://localhost:8765",
+    ].join('; ')
+    session.defaultSession.webRequest.onHeadersReceived(
+      { urls: ['file://*'] },
+      (details, callback) => {
+        callback({
+          responseHeaders: {
+            ...details.responseHeaders,
+            'Content-Security-Policy': [prodCSP],
+          },
+        })
+      }
+    )
+  }
+
   try {
     console.log('[main] Starting C++ daemon from', DAEMON_BINARY)
     await startDaemon()
