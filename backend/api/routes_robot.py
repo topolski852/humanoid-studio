@@ -12,7 +12,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from humanoid.robot_config import RobotConfig
-from humanoid.robot import Robot
+from humanoid.daemon_client import DaemonClient
 
 router = APIRouter(tags=["robot"])
 
@@ -40,20 +40,18 @@ async def get_robot_config(request: Request) -> dict | JSONResponse:
 
 @router.post("/robot/connect", response_model=None)
 async def connect_robot(request: Request) -> dict | JSONResponse:
-    robot: Robot | None = request.app.state.robot
+    robot: DaemonClient | None = request.app.state.robot
     if robot is None:
         return _err("No robot config loaded — PUT /robot/config first", 503)
     if robot.is_connected():
         return _ok({"message": "Already connected"})
     try:
         await robot.connect()
-        # Pull calibration values (flux_offset, encoder offsets) from ESC so apply_config()
-        # won't overwrite them with the 0.0 defaults from the JSON config.
+        # read_calibration_from_devices is a no-op in daemon mode (calibration loaded from JSON).
         await robot.read_calibration_from_devices()
-        # Write design params (gear_ratio, PID, fast_frame_frequency) to ESC RAM.
-        # Errors per-joint are caught and logged inside apply_all_configs.
+        # apply_all_configs tells daemon to write config params to all device RAMs.
         await robot.apply_all_configs()
-        return _ok({"message": "Connected", "joint_count": len(robot.joint_names())})
+        return _ok({"message": "Connected", "joint_count": len(robot.config.joint_names())})
     except Exception as exc:
         try:
             await robot.disconnect()
@@ -64,7 +62,7 @@ async def connect_robot(request: Request) -> dict | JSONResponse:
 
 @router.post("/robot/disconnect", response_model=None)
 async def disconnect_robot(request: Request) -> dict | JSONResponse:
-    robot: Robot | None = request.app.state.robot
+    robot: DaemonClient | None = request.app.state.robot
     if robot is None or not robot.is_connected():
         return _ok({"message": "Already disconnected"})
     try:
@@ -96,13 +94,12 @@ async def put_robot_config(request: Request) -> dict | JSONResponse:
     except OSError as exc:
         return _err(f"Failed to persist config: {exc}", 500)
 
-    # Disconnect existing robot before replacing
-    old_robot: Robot | None = request.app.state.robot
-    if old_robot is not None:
-        await old_robot.disconnect()
-
-    new_robot = Robot(new_config)
-    request.app.state.robot = new_robot
+    # Update the running DaemonClient's config and rebuild per-joint proxies.
+    # DaemonClient.disconnect() is a no-op so we skip it.
+    client: DaemonClient = request.app.state.can_monitor  # always set; robot may be None
+    client.config = new_config
+    client._rebuild_proxies()
+    request.app.state.robot  = client
     request.app.state.config = new_config
 
     return _ok({
