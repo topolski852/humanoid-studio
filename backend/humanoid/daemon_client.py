@@ -61,8 +61,14 @@ def _mode_name(mode_int: int) -> str:
         return f"UNKNOWN(0x{mode_int:02X})"
 
 
-def _daemon_state_to_actuator(d: dict) -> ActuatorState:
-    """Convert a daemon state dict into an ActuatorState pydantic object."""
+def _daemon_state_to_actuator(d: dict) -> ActuatorState | None:
+    """Convert a daemon state dict into an ActuatorState pydantic object.
+
+    Returns None for OFFLINE joints so the frontend null-checks correctly
+    distinguish unreachable devices from reachable-but-idle ones.
+    """
+    if d.get("state") == "OFFLINE":
+        return None
     mode_int = int(d.get("mode", 0))
     bv = d.get("bus_voltage")
     return ActuatorState(
