@@ -278,21 +278,19 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
   }
 
   async function handleDone() {
+    // Stop polling before flashReset so the IDLE state update never reaches the UI.
+    clearInterval(pollRef.current)
     await api.flashReset().catch(() => {})
-
-    // After flashing new firmware the ESC flash resets to defaults.
-    // Connect the robot (writes config to firmware RAM) then persist
-    // that joint's config to ESC flash so gear_ratio etc. survive power cycles.
-    if (jointName) {
-      try {
-        await api.connectRobot()
-        await api.storeMotorToFlash(jointName)
-      } catch {
-        // Non-fatal: user can apply and store manually via Tune tab
-      }
-    }
-
     onClose()
+
+    // After closing: restart daemon (it was stopped for SWD), apply config (firmware
+    // RAM), then persist this joint's params to ESC flash. Non-fatal if any step fails.
+    if (jointName) {
+      Promise.resolve(window.electron?.ensureDaemon?.())
+        .then(() => api.connectRobot())
+        .then(() => api.storeMotorToFlash(jointName))
+        .catch(() => {})
+    }
   }
 
   async function handleConfirm(correct) {
