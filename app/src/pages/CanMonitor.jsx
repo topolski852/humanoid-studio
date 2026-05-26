@@ -103,8 +103,9 @@ function SilentBusHint({ busName }) {
 
 // ── Adapter card ──────────────────────────────────────────────────────────────
 function AdapterCard({ meta, iface, hasAdapter, silentSince, onBringUp, onNavigateSetup }) {
-  const [bringing, setBringing] = useState(false)
+  const [bringing, setBringing]   = useState(false)
   const [bringError, setBringError] = useState(null)
+  const [resetting, setResetting] = useState(false)
   const color   = busColor(iface?.state, iface?.bus_error_state)
   const isDown  = !iface || iface.state !== 'UP'
   const isUnconfigured = !iface || iface.state === 'UNCONFIGURED'
@@ -125,6 +126,17 @@ function AdapterCard({ meta, iface, hasAdapter, silentSince, onBringUp, onNaviga
     setBringing(false)
   }
 
+  async function handleReset() {
+    setResetting(true)
+    setBringError(null)
+    try {
+      await api.bringUpInterface(meta.name)
+    } catch (e) {
+      setBringError(e.message)
+    }
+    setResetting(false)
+  }
+
   return (
     <div className={`bg-surface-1 border rounded-xl p-4 flex flex-col gap-3 ${
       isDown ? 'border-warn/30' : 'border-surface-3'
@@ -138,6 +150,16 @@ function AdapterCard({ meta, iface, hasAdapter, silentSince, onBringUp, onNaviga
           <p className="font-medium text-sm leading-none">{meta.label}</p>
           <p className="font-mono text-[10px] text-gray-500 mt-0.5">{meta.name}</p>
         </div>
+        {!isDown && (
+          <button
+            onClick={handleReset}
+            disabled={resetting}
+            title="Cycle ip link down → up (daemon restarts socket on next reboot)"
+            className="text-[10px] px-2 py-0.5 rounded border border-surface-3 text-gray-500 hover:text-gray-300 hover:border-gray-500 transition-colors disabled:opacity-40 whitespace-nowrap mr-1"
+          >
+            {resetting ? '…' : 'Reset'}
+          </button>
+        )}
         <span className={`text-xs font-mono font-medium ${COLOR_TEXT[color]}`}>
           {iface?.state ?? 'UNKNOWN'}
         </span>
