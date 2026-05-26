@@ -213,27 +213,15 @@ export default function Dashboard({ onOpenMotor }) {
             <EmptyState />
           ) : (
             <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
-              {joints.map((joint) => {
-                const gearWarning = joint.joint_name === 'left_hip_roll_joint' && joint.gear_ratio > 0
-                return (
-                  <div key={joint.joint_name} className="relative">
-                    {gearWarning && (
-                      <span
-                        title="gear_ratio is +15.0 (all others -15.0) — verify physical direction before enabling"
-                        className="absolute top-1 right-1 z-10 px-1.5 py-0.5 rounded text-[9px] font-mono font-semibold bg-warn/20 text-warn border border-warn/40 cursor-help"
-                      >
-                        DIR?
-                      </span>
-                    )}
-                    <MotorCard
-                      joint={joint}
-                      state={states[joint.joint_name]}
-                      passiveState={passiveTelemetry[joint.joint_name] ?? null}
-                      onClick={() => onOpenMotor(joint.can_id, joint.joint_name)}
-                    />
-                  </div>
-                )
-              })}
+              {joints.map((joint) => (
+                <MotorCard
+                  key={joint.joint_name}
+                  joint={joint}
+                  state={states[joint.joint_name]}
+                  passiveState={passiveTelemetry[joint.joint_name] ?? null}
+                  onClick={() => onOpenMotor(joint.can_id, joint.joint_name)}
+                />
+              ))}
             </div>
           )}
         </div>

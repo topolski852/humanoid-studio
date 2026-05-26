@@ -46,7 +46,7 @@ void Actuator::on_rx_frame(const can_frame& frame) {
         if (frame.can_dlc < 8) return;
         float wire_pos = get_f32(frame.data);
         float vel      = get_f32(frame.data + 4);
-        state_.position = wire_pos - cfg_.position_offset;
+        state_.position = wire_pos;
         state_.velocity = vel;
         state_.updated_at = Clock::now();
         last_pdo4_received_ = Clock::now();
@@ -103,7 +103,7 @@ void Actuator::on_rx_frame(const can_frame& frame) {
             // PDO2 response: position + velocity.
             float wire_pos = get_f32(frame.data);
             float vel      = get_f32(frame.data + 4);
-            state_.position = wire_pos - cfg_.position_offset;
+            state_.position = wire_pos;
             state_.velocity = vel;
             state_.updated_at = Clock::now();
         }
@@ -119,8 +119,7 @@ void Actuator::send_pdo2(CanBusManager& bus, float display_pos, float vel_ff) {
         static_cast<uint8_t>(FuncCode::FUNC_RECEIVE_PDO_2),
         static_cast<uint8_t>(cfg_.device_id));
     frame.can_dlc = 8;
-    float wire_pos = display_pos + cfg_.position_offset;
-    put_f32(frame.data,     wire_pos);
+    put_f32(frame.data,     display_pos);
     put_f32(frame.data + 4, vel_ff);
     bus.send(cfg_.can_channel, frame);
 }

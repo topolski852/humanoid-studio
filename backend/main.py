@@ -76,14 +76,6 @@ async def lifespan(app: FastAPI):
         _TELEMETRY_HZ = config.telemetry_hz
         _log.info("Telemetry rate: %d Hz", _TELEMETRY_HZ)
 
-        lhr = config.joints.get("left_hip_roll_joint")
-        if lhr is not None and lhr.gear_ratio > 0:
-            _log.warning(
-                "WARNING: left_hip_roll_joint has gear_ratio=+%.1f "
-                "(all other joints use -15.0). "
-                "Verify physical direction before enabling this joint.",
-                lhr.gear_ratio,
-            )
     app.state.flash_manager = FlashManager()
     app.state.ws_clients: set[WebSocket] = set()
 
