@@ -523,24 +523,59 @@ class DaemonClient:
 
     def get_interface_stats(self) -> list:
         """
-        Return a list of interface-stat dicts built from the latest bus_health telemetry.
-        Matches the shape that routes_devices.py / the can_health WS message expects.
+        Return per-interface health dicts from daemon bus_health telemetry.
+
+        Shape matches what CanMonitor.jsx expects:
+          state, bus_error_state, rx_packets, tx_packets, rx_errors, tx_errors,
+          rx_dropped, message_rate, rate_history, joints_online (int), joints_total,
+          joints [{name, can_id, status, position_rad, velocity_rads, last_seen_ms}],
+          usb_path
         """
         with self._tel_lock:
-            health = dict(self._bus_health)
+            health      = dict(self._bus_health)
+            joint_snap  = dict(self._joint_states)
+
+        # Build per-bus joint lists from config + latest telemetry snapshot
+        joints_by_bus: dict[str, list] = {}
+        if self.config:
+            for jname, jc in self.config.joints.items():
+                bus = jc.can_channel
+                if bus not in joints_by_bus:
+                    joints_by_bus[bus] = []
+                sd = joint_snap.get(jname, {})
+                js = sd.get("state", "OFFLINE")
+                status = "ONLINE" if js in ("IDLE", "ENABLED", "CALIBRATING") else "OFFLINE"
+                joints_by_bus[bus].append({
+                    "name":          jname,
+                    "can_id":        jc.can_id,
+                    "status":        status,
+                    "position_rad":  sd.get("position"),
+                    "velocity_rads": sd.get("velocity"),
+                    "last_seen_ms":  None,
+                })
 
         stats = []
         for ifname, bh in health.items():
+            is_open     = bh.get("open", False)
+            bus_joints  = joints_by_bus.get(ifname, [])
+            online_cnt  = sum(1 for j in bus_joints if j["status"] == "ONLINE")
             stats.append({
-                "name":          ifname,
-                "open":          bh.get("open", False),
-                "tx_dropped":    bh.get("tx_dropped", 0),
-                "rx_frames":     bh.get("rx_frames", 0),
-                # Fields CanMonitor tracked but daemon doesn't — zero-fill for compat
-                "tx_frames":     0,
-                "rx_errors":     0,
-                "tx_errors":     0,
-                "joints_online": [],
+                "name":             ifname,
+                "state":            "UP" if is_open else "DOWN",
+                "bus_error_state":  "ERROR-ACTIVE" if is_open else "DOWN",
+                "bitrate":          1_000_000,
+                "rx_packets":       bh.get("rx_frames", 0),
+                "tx_packets":       0,
+                "rx_errors":        0,
+                "tx_errors":        0,
+                "rx_dropped":       0,
+                "tx_dropped":       bh.get("tx_dropped", 0),
+                "message_rate":     0.0,
+                "rate_history":     [],
+                "joints_online":    online_cnt,
+                "joints_total":     len(bus_joints),
+                "joints":           bus_joints,
+                "usb_path":         "",
             })
         return stats
 
