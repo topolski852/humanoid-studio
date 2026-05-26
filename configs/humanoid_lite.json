@@ -11,7 +11,7 @@
       "can_channel": "can_left_leg",
       "can_id": 1,
       "phase_inverted": false,
-      "electrical_offset": -16.146448135375977,
+      "electrical_offset": -22.468942642211914,
       "gear_ratio": 15.0,
       "position_limits": {
         "min": -0.17453292519943295,
