@@ -372,7 +372,7 @@ std::string Robot::handle_command(const std::string& request) {
         }
         nlohmann::json resp;
         resp["type"]   = "CONFIG";
-        resp["id"]     = req.value("id", 0);
+        resp["id"]     = id;
         resp["config"] = cfg_j;
         return resp.dump();
     }
