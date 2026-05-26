@@ -2,16 +2,109 @@ const { app, BrowserWindow, dialog, shell } = require('electron')
 const path = require('path')
 const { spawn } = require('child_process')
 const http = require('http')
+const dgram = require('dgram')
 
 const IS_DEV = !app.isPackaged
 const BACKEND_PORT = 8765
+const DAEMON_CMD_PORT = 9001
+
 const BACKEND_DIR = IS_DEV
   ? path.resolve(__dirname, '../../backend')
   : path.join(process.resourcesPath, 'backend')
 
+const DAEMON_BINARY = IS_DEV
+  ? path.resolve(__dirname, '../../daemon/build/humanoid_daemon')
+  : path.join(process.resourcesPath, 'daemon/humanoid_daemon')
+
+const DAEMON_CONFIG = IS_DEV
+  ? path.resolve(__dirname, '../../configs/humanoid_lite.json')
+  : path.join(process.resourcesPath, 'configs/humanoid_lite.json')
+
 let mainWindow = null
 let backendProcess = null
+let daemonProcess = null
 app.isQuitting = false
+
+// ── Poll daemon port 9001 until a PING returns PONG ──────────────────────────
+function waitForDaemon(maxAttempts = 20) {
+  return new Promise((resolve, reject) => {
+    let attempt = 0
+
+    function check() {
+      attempt++
+      const sock = dgram.createSocket('udp4')
+      const msg = Buffer.from(JSON.stringify({ type: 'PING', id: 'startup' }))
+      let done = false
+
+      const timer = setTimeout(() => {
+        if (!done) { done = true; try { sock.close() } catch (_) {} }
+        if (attempt >= maxAttempts) {
+          reject(new Error('Daemon did not respond to PING within 10 s'))
+        } else {
+          setTimeout(check, 500)
+        }
+      }, 500)
+
+      sock.on('message', () => {
+        if (!done) {
+          done = true
+          clearTimeout(timer)
+          try { sock.close() } catch (_) {}
+          resolve()
+        }
+      })
+
+      sock.on('error', () => {
+        if (!done) {
+          done = true
+          clearTimeout(timer)
+          try { sock.close() } catch (_) {}
+          if (attempt >= maxAttempts) {
+            reject(new Error('Daemon UDP socket error'))
+          } else {
+            setTimeout(check, 500)
+          }
+        }
+      })
+
+      sock.bind(0, () => {
+        sock.send(msg, 0, msg.length, DAEMON_CMD_PORT, '127.0.0.1')
+      })
+    }
+
+    setTimeout(check, 500)
+  })
+}
+
+// ── Spawn the C++ daemon ──────────────────────────────────────────────────────
+function startDaemon() {
+  return new Promise((resolve, reject) => {
+    daemonProcess = spawn(DAEMON_BINARY, ['--config', DAEMON_CONFIG, '--rt-prio', '0'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    daemonProcess.stdout.on('data', (d) => process.stdout.write(`[daemon] ${d}`))
+    daemonProcess.stderr.on('data', (d) => process.stderr.write(`[daemon] ${d}`))
+
+    let started = false
+
+    daemonProcess.on('error', (err) => {
+      if (!started) reject(new Error(`Failed to launch daemon: ${err.message}`))
+    })
+
+    daemonProcess.on('exit', (code, signal) => {
+      if (!started) {
+        reject(new Error(`Daemon exited before PING (code ${code ?? signal})`))
+      } else if (!app.isQuitting) {
+        console.error(`[main] Daemon exited unexpectedly (code ${code ?? signal})`)
+      }
+    })
+
+    waitForDaemon()
+      .then(() => { started = true; resolve() })
+      .catch((err) => { if (!started) reject(err) })
+  })
+}
 
 // ── Poll until the backend is accepting HTTP connections ──────────────────────
 function waitForBackend(maxAttempts = 40) {
@@ -147,12 +240,14 @@ function createWindow() {
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 app.whenReady().then(async () => {
   try {
-    console.log('[main] Starting Python backend from', BACKEND_DIR)
+    console.log('[main] Starting C++ daemon from', DAEMON_BINARY)
+    await startDaemon()
+    console.log('[main] Daemon ready — starting Python backend from', BACKEND_DIR)
     await startBackend()
     console.log('[main] Backend ready — creating window')
     createWindow()
   } catch (err) {
-    dialog.showErrorBox('Failed to Start Backend', err.message)
+    dialog.showErrorBox('Failed to Start Humanoid Studio', err.message)
     app.quit()
   }
 })
@@ -166,6 +261,16 @@ app.on('before-quit', () => {
       if (backendProcess && !backendProcess.killed) {
         console.log('[main] Backend did not exit, sending SIGKILL')
         backendProcess.kill('SIGKILL')
+      }
+    }, 3000)
+  }
+  if (daemonProcess && !daemonProcess.killed) {
+    console.log('[main] Sending SIGTERM to daemon...')
+    daemonProcess.kill('SIGTERM')
+    setTimeout(() => {
+      if (daemonProcess && !daemonProcess.killed) {
+        console.log('[main] Daemon did not exit, sending SIGKILL')
+        daemonProcess.kill('SIGKILL')
       }
     }, 3000)
   }
