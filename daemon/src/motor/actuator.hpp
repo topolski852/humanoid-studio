@@ -11,6 +11,7 @@
 #include "can/can_bus_manager.hpp"
 #include "motor/recoil_protocol.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <limits>
@@ -104,11 +105,14 @@ private:
 
     // Slow-poll counter for periodic SDO telemetry reads (bus_voltage, current, torque).
     uint32_t slow_poll_counter_ = 0;
+    // Last param sent by slow-poll; used in on_rx_frame to route the 4-byte response.
+    std::atomic<uint16_t>   sdo_pending_param_{0};
+    // Set true while read_config_param() is in progress; pauses slow-poll to avoid crosstalk.
+    std::atomic<bool>       sdo_config_active_{false};
 
     // SDO read response mailbox: on_rx_frame() writes here; read_config_param() waits.
     std::mutex              sdo_rx_mutex_;
     std::condition_variable sdo_rx_cv_;
     bool                    sdo_rx_ready_  = false;
-    uint16_t                sdo_rx_param_  = 0;
     float                   sdo_rx_value_  = 0.0f;
 };

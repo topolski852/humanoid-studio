@@ -362,10 +362,11 @@ class DaemonClient:
     # Command send / receive                                               #
     # ------------------------------------------------------------------ #
 
-    def _send_command(self, msg: dict) -> dict:
+    def _send_command(self, msg: dict, timeout: float | None = None) -> dict:
         """
         Send a JSON command to the daemon and wait for a matching response.
         Thread-safe via _cmd_lock.  Raises on timeout or daemon error.
+        Pass timeout to override the default _cmd_timeout for slow commands.
         """
         if self._cmd_sock is None:
             raise DaemonNotRunningError("DaemonClient not started — call start() first")
@@ -374,16 +375,20 @@ class DaemonClient:
         payload = json.dumps(msg).encode()
 
         with self._cmd_lock:
+            effective_timeout = timeout if timeout is not None else self._cmd_timeout
             try:
+                self._cmd_sock.settimeout(effective_timeout)
                 self._cmd_sock.sendto(payload, (self._daemon_host, self._cmd_port))
                 raw, _ = self._cmd_sock.recvfrom(65535)
             except socket.timeout:
                 raise DaemonNotRunningError(
-                    f"Daemon did not respond within {self._cmd_timeout}s "
+                    f"Daemon did not respond within {effective_timeout}s "
                     f"(type={msg.get('type')})"
                 )
             except OSError as exc:
                 raise DaemonNotRunningError(f"Daemon socket error: {exc}") from exc
+            finally:
+                self._cmd_sock.settimeout(self._cmd_timeout)
 
         try:
             resp = json.loads(raw)
@@ -438,7 +443,8 @@ class DaemonClient:
         self._send_command({"type": "STORE_TO_FLASH", "joint_name": joint_name})
 
     def read_device_config(self, joint_name: str) -> dict:
-        resp = self._send_command({"type": "READ_CONFIG", "joint_name": joint_name})
+        # READ_CONFIG reads 23 params with up to 100ms each = ~2.3s; use a generous timeout.
+        resp = self._send_command({"type": "READ_CONFIG", "joint_name": joint_name}, timeout=30.0)
         if resp.get("type") != "CONFIG":
             raise DaemonError(f"READ_CONFIG failed: {resp}")
         return resp.get("config", {})
