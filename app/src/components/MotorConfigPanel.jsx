@@ -156,11 +156,19 @@ export default function MotorConfigPanel({ jointName, onLogError }) {
   }
 
   async function storeToFlash() {
+    if (!mergedConfig) return
     setApplying(true)
     setStatusMsg(null)
     try {
+      // 1. Write merged config to ESC RAM and save to app JSON config.
+      await api.applyMotorConfig(jointName, mergedConfig)
+      setStatusMsg({ type: 'ok', text: 'Applied to ESC RAM — writing flash…' })
+      // 2. Persist ESC RAM → flash.
       await api.storeMotorToFlash(jointName)
-      setStatusMsg({ type: 'ok', text: 'Config stored to ESC flash.' })
+      setStatusMsg({ type: 'ok', text: 'Flash written — pulling to confirm…' })
+      // 3. Auto-pull to confirm all three columns now match.
+      await pullBoth(true)
+      setStatusMsg({ type: 'ok', text: 'Stored to flash. ESC, App, and Manual all in sync.' })
     } catch (e) {
       const msg = `Store failed: ${e.message}`
       setStatusMsg({ type: 'err', text: msg })
