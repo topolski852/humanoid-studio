@@ -106,6 +106,7 @@ export default function Sidebar() {
       if (robotConnected) {
         await api.disconnectRobot()
       } else {
+        await window.electron?.ensureDaemon?.()
         await api.connectRobot()
       }
     } catch {

@@ -266,6 +266,26 @@ app.whenReady().then(async () => {
 
   ipcMain.on('app-quit', () => app.quit())
 
+  ipcMain.handle('ensure-daemon', async () => {
+    // PING first — only restart if the daemon is not responding.
+    const alive = await waitForDaemon(3).then(() => true).catch(() => false)
+    if (alive) return { ok: true, restarted: false }
+
+    if (daemonProcess) {
+      daemonProcess.removeAllListeners()
+      daemonProcess.stdout?.removeAllListeners()
+      daemonProcess.stderr?.removeAllListeners()
+      daemonProcess.kill('SIGKILL')
+      daemonProcess = null
+    }
+    try {
+      await startDaemon()
+      return { ok: true, restarted: true }
+    } catch (err) {
+      return { ok: false, error: err.message }
+    }
+  })
+
   try {
     console.log('[main] Starting C++ daemon from', DAEMON_BINARY)
     await startDaemon()

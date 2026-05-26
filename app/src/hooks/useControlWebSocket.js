@@ -13,56 +13,58 @@ const RECONNECT_DELAY_MS = 2000
  *   connected    — whether the WS is currently open
  */
 export function useControlWebSocket() {
-  const wsRef       = useRef(null)
-  const retryTimer  = useRef(null)
-  const mountedRef  = useRef(true)
+  const wsRef      = useRef(null)
+  const retryTimer = useRef(null)
 
   const [connected, setConnected]  = useState(false)
   const [lastAck,   setLastAck]    = useState(null)
   const [latencyMs, setLatencyMs]  = useState(null)
 
-  const connect = useCallback(() => {
-    if (!mountedRef.current) return
-    const ws = new WebSocket(WS_URL)
-    wsRef.current = ws
+  useEffect(() => {
+    let cancelled = false
 
-    ws.onopen = () => {
-      if (!mountedRef.current) { ws.close(); return }
-      setConnected(true)
+    function connect() {
+      if (cancelled) return
+      const ws = new WebSocket(WS_URL)
+      wsRef.current = ws
+
+      ws.onopen = () => setConnected(true)
+
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data)
+          if (msg.command_ack) {
+            setLastAck(msg)
+            if (msg.latency_ms != null) setLatencyMs(msg.latency_ms)
+          }
+        } catch { /* ignore parse errors */ }
+      }
+
+      ws.onclose = () => {
+        setConnected(false)
+        wsRef.current = null
+        if (!cancelled) retryTimer.current = setTimeout(connect, RECONNECT_DELAY_MS)
+      }
+
+      ws.onerror = () => ws.close()
     }
 
-    ws.onmessage = (evt) => {
-      try {
-        const msg = JSON.parse(evt.data)
-        if (msg.command_ack) {
-          setLastAck(msg)
-          if (msg.latency_ms != null) setLatencyMs(msg.latency_ms)
-        }
-      } catch { /* ignore parse errors */ }
-    }
+    connect()
 
-    ws.onclose = () => {
-      setConnected(false)
-      wsRef.current = null
-      if (mountedRef.current) {
-        retryTimer.current = setTimeout(connect, RECONNECT_DELAY_MS)
+    return () => {
+      cancelled = true
+      clearTimeout(retryTimer.current)
+      const ws = wsRef.current
+      if (!ws) return
+      ws.onclose = null
+      ws.onerror = null
+      if (ws.readyState === WebSocket.CONNECTING) {
+        ws.onopen = () => ws.close()
+      } else {
+        ws.close()
       }
     }
-
-    ws.onerror = () => {
-      ws.close()
-    }
   }, [])
-
-  useEffect(() => {
-    mountedRef.current = true
-    connect()
-    return () => {
-      mountedRef.current = false
-      clearTimeout(retryTimer.current)
-      wsRef.current?.close()
-    }
-  }, [connect])
 
   const sendPositionCommand = useCallback((jointName, posRad, options = {}) => {
     const ws = wsRef.current

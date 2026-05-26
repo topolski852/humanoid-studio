@@ -12,7 +12,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from humanoid.robot_config import RobotConfig
-from humanoid.daemon_client import DaemonClient
+from humanoid.daemon_client import DaemonClient, DaemonNotRunningError
 
 router = APIRouter(tags=["robot"])
 
@@ -52,6 +52,8 @@ async def connect_robot(request: Request) -> dict | JSONResponse:
         # apply_all_configs tells daemon to write config params to all device RAMs.
         await robot.apply_all_configs()
         return _ok({"message": "Connected", "joint_count": len(robot.config.joint_names())})
+    except DaemonNotRunningError:
+        return _err("Daemon not running — try disconnecting and reconnecting", 503)
     except Exception as exc:
         try:
             await robot.disconnect()
