@@ -295,7 +295,7 @@ class CANBus:
                     w.future.cancel()
             self._waiters.clear()
 
-        self._executor.shutdown(wait=False)
+        self._executor.shutdown(wait=True)
         _log.info("CANBus disconnected: %s", self.channel)
 
     async def __aenter__(self) -> "CANBus":
@@ -399,6 +399,32 @@ class CANBus:
     # Receive with filter & timeout
     # ------------------------------------------------------------------
 
+    async def pre_receive(
+        self,
+        filter_device_id: int | None = None,
+        filter_func: int | None = None,
+    ) -> "asyncio.Future[CANFrame]":
+        """Register a receive waiter and return its Future WITHOUT blocking.
+
+        Call this BEFORE transmitting the frame that triggers a response, then
+        ``await asyncio.wait_for(future, timeout=...)`` after transmitting.
+        This avoids the race where a fast firmware response arrives before
+        a subsequent ``receive()`` call can register its waiter.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[CANFrame] = loop.create_future()
+        waiter = _Waiter(filter_device_id, filter_func, future)
+        async with self._waiters_lock:
+            self._waiters.append(waiter)
+        return future
+
+    async def cancel_pre_receive(self, future: "asyncio.Future[CANFrame]") -> None:
+        """Remove a pre_receive future that was never consumed."""
+        async with self._waiters_lock:
+            self._waiters[:] = [w for w in self._waiters if w.future is not future]
+        if not future.done():
+            future.cancel()
+
     async def receive(
         self,
         filter_device_id: int | None = None,
@@ -477,19 +503,42 @@ class CANBus:
                 return None
 
     async def _sdo_write(self, device_id: int, param_id: int, raw: bytes) -> None:
-        """Send SDO write (fire-and-forget; no acknowledgement from firmware).
+        """Send SDO write and drain the firmware write ACK.
 
         Acquires the per-device SDO lock so writes do not interleave with
         concurrent reads (which would cause the read waiter to miss its response).
+
+        Firmware >= 0x20250226 sends a 1-byte 0x60 write-ACK on FUNC_TRANSMIT_SDO
+        immediately after receiving a write.  We register a waiter for it BEFORE
+        transmitting so the ACK is always consumed here and never leaks to a
+        subsequent _sdo_read() waiter (which expects 4-byte value data and would
+        raise struct.error on a 1-byte payload).  The 15 ms timeout is generous
+        enough to catch the sub-millisecond CAN round-trip while keeping writes
+        fast against older firmware that sends no ACK.
         """
         assert len(raw) == 4, "SDO value must be exactly 4 bytes"
         async with self._sdo_lock(device_id):
+            loop = asyncio.get_running_loop()
+            ack_future: asyncio.Future[CANFrame] = loop.create_future()
+            ack_waiter = _Waiter(device_id, Function.TRANSMIT_SDO, ack_future)
+            async with self._waiters_lock:
+                self._waiters.append(ack_waiter)
+
             frame = CANFrame(
                 device_id=device_id,
                 func_id=Function.RECEIVE_SDO,
                 data=struct.pack("<BHB", _SDO_CCS_WRITE, param_id, 0) + raw,
             )
             await self.transmit(frame)
+
+            try:
+                await asyncio.wait_for(ack_future, timeout=0.015)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                async with self._waiters_lock:
+                    try:
+                        self._waiters.remove(ack_waiter)
+                    except ValueError:
+                        pass
 
     # ------------------------------------------------------------------
     # Typed SDO helpers

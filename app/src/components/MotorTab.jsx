@@ -111,7 +111,17 @@ export default function MotorTab() {
         </div>
         <div className="ml-auto flex items-center gap-3 text-xs text-gray-500">
           {config?.gear_ratio != null && (
-            <span>Gear ratio: <span className="font-mono text-gray-300">{config.gear_ratio}</span></span>
+            <span className="flex items-center gap-1.5">
+              Gear ratio: <span className="font-mono text-gray-300">{config.gear_ratio}</span>
+              {decodedName === 'left_hip_roll_joint' && config.gear_ratio > 0 && (
+                <span
+                  title="gear_ratio=+15.0 (all others -15.0) — verify physical direction before enabling"
+                  className="px-1.5 py-0.5 rounded text-[9px] font-mono font-semibold bg-warn/20 text-warn border border-warn/40 cursor-help"
+                >
+                  DIR?
+                </span>
+              )}
+            </span>
           )}
           {config?.phase_inverted != null && (
             <span className={`px-2 py-0.5 rounded font-mono ${config.phase_inverted ? 'bg-warn/20 text-warn' : 'bg-surface-2 text-gray-400'}`}>

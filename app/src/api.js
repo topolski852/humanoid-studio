@@ -84,6 +84,7 @@ export const api = {
   flashReset:  () => request('/flash/reset', { method: 'POST' }),
   flashPowerCycled: () => request('/flash/power_cycled', { method: 'POST' }),
   flashCanConnected: () => request('/flash/can_connected', { method: 'POST' }),
+  flashCanPing: () => request('/flash/can_ping', { method: 'POST' }),
   flashConfirm: (correct) =>
     request('/flash/confirm_direction', {
       method: 'POST',

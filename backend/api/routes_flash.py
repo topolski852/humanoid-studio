@@ -141,6 +141,15 @@ async def flash_power_cycled(request: Request) -> dict | JSONResponse:
 async def flash_can_connected(request: Request) -> dict | JSONResponse:
     """Frontend calls this when user confirms motor + CAN + encoder are connected."""
     flash_manager = request.app.state.flash_manager
+
+    # The robot's telemetry loop hammers the shared SocketCAN TX queue (txqueuelen=10)
+    # with ~30 SDO frames/cycle, leaving no room for the flash wizard's socket.
+    # Disconnect the robot before the flash wizard opens its own socket so the queue
+    # is free. The user will reconnect from the sidebar after flashing completes.
+    robot = request.app.state.robot
+    if robot and robot.is_connected():
+        await robot.disconnect()
+
     try:
         await flash_manager.can_connected()
         return _ok({"message": "CAN connection confirmed"})
@@ -156,6 +165,21 @@ async def flash_confirm_direction(
     try:
         await flash_manager.confirm_direction(correct=body.correct)
         return _ok({"confirmed": body.correct})
+    except FlashError as exc:
+        return _err(str(exc), 409)
+
+
+@router.post("/flash/can_ping", response_model=None)
+async def flash_can_ping(request: Request) -> dict | JSONResponse:
+    """
+    Ping the target device CAN ID on the flash channel.
+    Returns {reachable: bool, detail: str}.
+    Only valid during WAITING_CAN_CONNECT.
+    """
+    flash_manager = request.app.state.flash_manager
+    try:
+        result = await flash_manager.can_ping()
+        return _ok(result)
     except FlashError as exc:
         return _err(str(exc), 409)
 

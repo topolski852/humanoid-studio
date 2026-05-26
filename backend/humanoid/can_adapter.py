@@ -32,7 +32,9 @@ _SAFE_LIMB = re.compile(r'^(left|right)_(leg|arm)$')
 # ---------------------------------------------------------------------------
 
 async def _run(*cmd: str, sudo: bool = False, timeout: float = 10.0) -> tuple[int, str, str]:
-    full = (['sudo'] if sudo else []) + list(cmd)
+    # -n (non-interactive): fail immediately instead of prompting for a password.
+    # Passwordless sudo is required — see /etc/sudoers.d/humanoid-can.
+    full = (['sudo', '-n'] if sudo else []) + list(cmd)
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -164,6 +166,21 @@ async def discover_adapters(config_path: Path) -> dict:
                     usb_serial = serial
                     break
         assigned_limb = assignments.get(usb_serial) if usb_serial else None
+
+        # Fallback: if the interface name already matches a known limb (e.g. can_left_leg),
+        # treat it as assigned even when can_assignments is empty or the serial lookup failed.
+        # This handles the case where the JSON entry was lost (e.g. overwritten by a config save)
+        # but the udev rule is still in place and the interface was auto-renamed on plug-in.
+        if assigned_limb is None:
+            for limb in LIMBS:
+                if name == f'can_{limb}':
+                    assigned_limb = limb
+                    # Re-sync: if we have the serial now, write it back so future lookups work
+                    if usb_serial and usb_serial not in assignments:
+                        assignments[usb_serial] = limb
+                        _save_assignments(config_path, assignments)
+                    break
+
         adapters.append({
             'current_name':  name,
             'state':         state,
@@ -196,7 +213,8 @@ def _build_udev_rule(usb_serial: str, limb: str) -> str:
         f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{serial}}=="{usb_serial}", '
         f'NAME="{name}", '
         f'RUN+="/bin/sh -c \'/usr/bin/ip link set {name} type can bitrate 1000000 && '
-        f'/usr/bin/ip link set {name} up\'"'
+        f'/usr/bin/ip link set {name} up && '
+        f'/usr/bin/ip link set {name} txqueuelen 1000\'"'
     )
 
 
@@ -238,6 +256,9 @@ async def assign_adapter(
     rc, _, err = await _run('ip', 'link', 'set', new_name, 'up', sudo=True)
     if rc != 0:
         raise RuntimeError(f'Bring up {new_name!r} failed: {err}')
+
+    # Step 4b: increase TX queue depth (default 10 is too small for concurrent sockets)
+    await _run('ip', 'link', 'set', new_name, 'txqueuelen', '1000', sudo=True)
 
     # Step 5: write udev rule
     existing = _UDEV_RULES_PATH.read_text() if _UDEV_RULES_PATH.exists() else ''

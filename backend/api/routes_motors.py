@@ -13,6 +13,7 @@ POST /motors/{joint_name}/store_to_flash
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Request
@@ -24,6 +25,8 @@ from humanoid.can_bus import Mode, Parameter
 from humanoid.robot_config import PositionLimits
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parents[3] / "configs" / "humanoid_lite.json"
+_log = logging.getLogger(__name__)
+_velocity_ff_warned = False
 
 router = APIRouter(tags=["motors"])
 
@@ -160,9 +163,16 @@ async def calibrate_motor(joint_name: str, request: Request) -> dict | JSONRespo
 async def set_motor_position(
     joint_name: str, body: PositionBody, request: Request
 ) -> dict | JSONResponse:
+    global _velocity_ff_warned
     actuator, error = _resolve_actuator(request, joint_name)
     if error:
         return error
+    if body.velocity_ff != 0.0 and not _velocity_ff_warned:
+        _velocity_ff_warned = True
+        _log.warning(
+            "velocity_ff is silently discarded in MODE_POSITION — "
+            "the firmware control law ignores velocity_target; use torque_ff for feed-forward"
+        )
     try:
         result = await actuator.set_position(
             body.position,

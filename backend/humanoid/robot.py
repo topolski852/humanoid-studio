@@ -129,10 +129,14 @@ class Robot:
     async def damp_all(self) -> None:
         await asyncio.gather(*[a.damp() for a in self._actuators.values()])
 
-    async def get_all_states(self) -> dict[str, ActuatorState | None]:
+    async def get_all_states(
+        self,
+        passive_kinematics: dict[str, tuple[float, float]] | None = None,
+    ) -> dict[str, ActuatorState | None]:
         async def _safe_state(name: str, actuator: Actuator) -> tuple[str, ActuatorState | None]:
             try:
-                return name, await actuator.get_state()
+                passive = (passive_kinematics or {}).get(name)
+                return name, await actuator.get_state(passive=passive)
             except Exception:
                 return name, None
 

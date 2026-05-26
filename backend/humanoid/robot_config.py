@@ -173,6 +173,10 @@ class RobotConfig(BaseModel):
     """Complete robot configuration — maps joint_name → JointConfig."""
 
     robot_name: str = "humanoid_lite"
+    telemetry_hz: int = 10  # SDO poll rate for ws_telemetry; default 10 Hz
+    # USB serial → limb name ("left_leg", "right_arm", …).  Written by can_adapter.
+    # Must survive to_json() so motor config saves don't clear CAN assignments.
+    can_assignments: dict[str, str] = Field(default_factory=dict)
     joints: dict[str, JointConfig] = Field(default_factory=dict)
 
     def __getitem__(self, joint_name: str) -> JointConfig:

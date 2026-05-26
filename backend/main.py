@@ -28,8 +28,11 @@ from api import devices_router, motors_router, flash_router, robot_router, debug
 
 logging.basicConfig(level=logging.INFO)
 _log = logging.getLogger(__name__)
-_TELEMETRY_HZ   = 20
-_HEALTH_EVERY_N = 4    # emit can_health every 200 ms (4 × 50 ms motor frames)
+# _TELEMETRY_HZ is overridden at startup from config["telemetry_hz"] (default 10 Hz).
+# At 10 Hz: 7 SDO reads × 22 joints × 10 Hz = 1540 frames/s — well within SocketCAN limits.
+# At 20 Hz: 3080 frames/s — approaches saturation; use only on a lightly loaded bus.
+_TELEMETRY_HZ   = 10
+_HEALTH_EVERY_N = 4    # emit can_health every N telemetry frames (≈200 ms at 20 Hz, ≈400 ms at 10 Hz)
 
 _VEL_ALPHA = 0.2    # EMA weight on newest velocity sample; at 20 Hz → ~225 ms time constant
 _smooth: dict[str, dict] = {}  # per-joint EMA state, persists across WS reconnects
@@ -68,6 +71,21 @@ async def lifespan(app: FastAPI):
     app.state.config      = config
     app.state.config_path = config_file
     app.state.robot       = Robot(config) if config else None
+    app.state.control_ws: WebSocket | None = None  # single control client
+
+    if config is not None:
+        global _TELEMETRY_HZ
+        _TELEMETRY_HZ = config.telemetry_hz
+        _log.info("Telemetry rate: %d Hz", _TELEMETRY_HZ)
+
+        lhr = config.joints.get("left_hip_roll_joint")
+        if lhr is not None and lhr.gear_ratio > 0:
+            _log.warning(
+                "WARNING: left_hip_roll_joint has gear_ratio=+%.1f "
+                "(all other joints use -15.0). "
+                "Verify physical direction before enabling this joint.",
+                lhr.gear_ratio,
+            )
     app.state.flash_manager = FlashManager()
     app.state.ws_clients: set[WebSocket] = set()
 
@@ -138,7 +156,8 @@ async def ws_telemetry(ws: WebSocket) -> None:
                 actuator_payload = {"connected": False, "actuators": {}}
                 online_joints: set[str] = set()
             else:
-                states = await robot.get_all_states()
+                passive = monitor.get_passive_kinematics()
+                states = await robot.get_all_states(passive_kinematics=passive)
                 await robot.feed_all_watchdogs()
                 online_joints = {n for n, s in states.items() if s is not None}
                 actuator_dicts: dict = {}
@@ -191,6 +210,86 @@ async def ws_telemetry(ws: WebSocket) -> None:
     finally:
         app.state.ws_clients.discard(ws)
         _log.info("Telemetry client disconnected (total=%d)", len(app.state.ws_clients))
+
+
+# ---------------------------------------------------------------------------
+# WebSocket control channel (200 Hz max, single client)
+# ---------------------------------------------------------------------------
+
+_CONTROL_MIN_INTERVAL = 1.0 / 200  # 200 Hz max rate limit
+
+@app.websocket("/ws/control")
+async def ws_control(ws: WebSocket) -> None:
+    await ws.accept()
+
+    # Reject if a control client is already connected
+    if app.state.control_ws is not None:
+        await ws.send_json({"error": "another control client is already connected"})
+        await ws.close(code=1008)
+        return
+
+    app.state.control_ws = ws
+    _log.info("Control WS client connected")
+
+    last_cmd_time = 0.0
+
+    try:
+        while True:
+            msg = await ws.receive_json()
+            joint_name = msg.get("joint_name")
+            position   = msg.get("position")
+            velocity_ff = float(msg.get("velocity_ff", 0.0))
+            torque_ff   = float(msg.get("torque_ff", 0.0))
+
+            if joint_name is None or position is None:
+                await ws.send_json({"error": "joint_name and position are required"})
+                continue
+
+            now = asyncio.get_event_loop().time()
+            if (now - last_cmd_time) < _CONTROL_MIN_INTERVAL:
+                await ws.send_json({"ack": "rate_limited", "joint_name": joint_name})
+                continue
+            last_cmd_time = now
+
+            robot: Robot | None = app.state.robot
+            if robot is None or not robot.is_connected():
+                await ws.send_json({"error": "robot not connected"})
+                continue
+
+            actuator = robot.get_actuator_by_name(joint_name)
+            if actuator is None:
+                await ws.send_json({"error": f"no joint '{joint_name}'"})
+                continue
+
+            t0 = asyncio.get_event_loop().time()
+            try:
+                result = await actuator.set_position(
+                    float(position), velocity_ff=velocity_ff, torque_ff=torque_ff
+                )
+            except Exception as exc:
+                await ws.send_json({"error": str(exc), "joint_name": joint_name})
+                continue
+
+            latency_ms = round((asyncio.get_event_loop().time() - t0) * 1000, 2)
+            ack: dict = {
+                "command_ack": True,
+                "joint_name": joint_name,
+                "position_target": float(position),
+                "latency_ms": latency_ms,
+            }
+            if result is not None:
+                pos_measured, vel_measured = result
+                ack["position_measured"] = pos_measured
+                ack["velocity_measured"] = vel_measured
+            await ws.send_json(ack)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        _log.debug("Control WS error: %s", exc)
+    finally:
+        app.state.control_ws = None
+        _log.info("Control WS client disconnected")
 
 
 # ---------------------------------------------------------------------------

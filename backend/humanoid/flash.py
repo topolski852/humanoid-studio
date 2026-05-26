@@ -344,6 +344,13 @@ class FlashManager:
         self._confirmed_correct: bool | None = None
         self._power_cycle_event: asyncio.Event | None = None
         self._can_connect_event: asyncio.Event | None = None
+        self._current_channel: str | None = None
+        self._current_can_id: int | None = None
+
+    @property
+    def current_channel(self) -> str | None:
+        """CAN channel being used by the active flash session, or None if idle."""
+        return self._current_channel
 
     def _log(self, msg: str, progress: int | None = None) -> None:
         self.status.messages.append(msg)
@@ -370,6 +377,8 @@ class FlashManager:
             config.profile_data()
 
             self.status = FlashStatus()
+            self._current_channel = config.can_channel
+            self._current_can_id = config.can_id
 
         self._task = asyncio.create_task(self._run_session(port, config))
 
@@ -380,6 +389,8 @@ class FlashManager:
                 self._task.cancel()
                 self._task = None
             self.status = FlashStatus()
+            self._current_channel = None
+            self._current_can_id = None
 
     async def power_cycled(self) -> None:
         """Called when the frontend has detected or the user confirms the ESC is back online."""
@@ -394,6 +405,36 @@ class FlashManager:
             raise FlashError("Not waiting for CAN connection confirmation")
         if self._can_connect_event is not None:
             self._can_connect_event.set()
+
+    async def can_ping(self) -> dict:
+        """
+        Open a temporary CAN socket and check whether the target device responds
+        to an SDO read.  Returns {reachable, detail}.
+        Safe to call while state == WAITING_CAN_CONNECT (bus is not open yet).
+        """
+        if self.status.state != FlashState.WAITING_CAN_CONNECT:
+            raise FlashError(
+                f"CAN ping only available during WAITING_CAN_CONNECT (current: {self.status.state})"
+            )
+        channel = self._current_channel
+        can_id = self._current_can_id
+        if not channel or can_id is None:
+            raise FlashError("No CAN channel or device ID configured")
+
+        bus = CANBus(channel=channel)
+        try:
+            await bus.connect()
+            version = await bus.read_parameter_u32(can_id, Parameter.FIRMWARE_VERSION, timeout=2.0)
+            if version is not None:
+                return {"reachable": True, "detail": f"firmware {version:#010x}"}
+            return {
+                "reachable": False,
+                "detail": f"no SDO response from device {can_id} on {channel} within 2 s",
+            }
+        except Exception as exc:
+            return {"reachable": False, "detail": str(exc)}
+        finally:
+            await bus.disconnect()
 
     async def confirm_direction(self, correct: bool) -> None:
         if self.status.state != FlashState.AWAITING_CONFIRMATION:

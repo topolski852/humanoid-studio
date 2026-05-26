@@ -112,8 +112,10 @@ function CalibrationProgress({ startedAt }) {
     const t = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 500)
     return () => clearInterval(t)
   }, [startedAt])
-  const est = 15
-  const pct = Math.min(100, Math.round((elapsed / est) * 100))
+  // Estimated total time matches the 90s Python timeout; cap visual at 95% so
+  // the bar never falsely shows "complete" while the firmware is still sweeping.
+  const est = 90
+  const pct = Math.min(95, Math.round((elapsed / est) * 100))
   return (
     <div className="flex items-center gap-3">
       <span className="w-3.5 h-3.5 rounded-full border-2 border-accent border-t-transparent animate-spin flex-shrink-0" />
@@ -125,7 +127,7 @@ function CalibrationProgress({ startedAt }) {
             style={{ width: `${pct}%` }}
           />
         </div>
-        <p className="text-[10px] text-gray-600 mt-0.5 font-mono">{elapsed}s elapsed (est. ~15s)</p>
+        <p className="text-[10px] text-gray-600 mt-0.5 font-mono">{elapsed}s elapsed (est. ~15–90s depending on motor)</p>
       </div>
     </div>
   )
@@ -171,6 +173,7 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
   const [startError, setStartError]   = useState(null)
   const [calStartedAt, setCalStartedAt] = useState(null)
   const [configSynced, setConfigSynced] = useState(false)
+  const [pingState, setPingState] = useState(null)   // null | 'pending' | {reachable, detail}
   const pollRef = useRef(null)
 
   // Reset backend state on mount so a fresh wizard never shows a previous session's data
@@ -228,6 +231,13 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
     syncConfig()
   }, [status?.state, status?.updated_config, jointName, configSynced])
 
+  // Reset ping result whenever we leave the WAITING_CAN_CONNECT step
+  useEffect(() => {
+    if (status?.state !== 'WAITING_CAN_CONNECT') {
+      setPingState(null)
+    }
+  }, [status?.state])
+
   async function handleStart() {
     setStartError(null)
     setStarted(true)
@@ -255,6 +265,16 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
 
   async function handleCanConnected() {
     try { await api.flashCanConnected() } catch (e) { console.error(e) }
+  }
+
+  async function handleCanPing() {
+    setPingState('pending')
+    try {
+      const result = await api.flashCanPing()
+      setPingState(result)
+    } catch (e) {
+      setPingState({ reachable: false, detail: e.message })
+    }
   }
 
   async function handleDone() {
@@ -428,12 +448,39 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
               <div>
                 <p className="text-sm font-medium">Connect motor, CAN bus, and encoder</p>
                 <ol className="mt-2 space-y-1 text-xs text-gray-400 list-decimal list-inside">
-                  <li>Connect the CAN bus cable to the ESC</li>
+                  <li>Connect the CAN bus cable to the ESC ({canChannel})</li>
                   <li>Connect the motor phase wires to the ESC</li>
                   <li>Connect the encoder cable to the ESC</li>
-                  <li>Power on the ESC</li>
+                  <li>Power on the ESC (apply motor bus voltage)</li>
                 </ol>
               </div>
+
+              {/* CAN connectivity test */}
+              <div className="flex items-center gap-3 flex-wrap">
+                <button
+                  onClick={handleCanPing}
+                  disabled={pingState === 'pending'}
+                  className="btn-ghost px-3 py-1.5 text-xs flex-shrink-0 disabled:opacity-50"
+                >
+                  {pingState === 'pending' ? (
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-3 h-3 rounded-full border-2 border-accent border-t-transparent animate-spin inline-block" />
+                      Testing…
+                    </span>
+                  ) : 'Test CAN'}
+                </button>
+                {pingState && pingState !== 'pending' && (
+                  <span className={`text-xs font-mono truncate ${pingState.reachable ? 'text-online' : 'text-danger'}`}>
+                    {pingState.reachable ? '✓ ' : '✗ '}{pingState.detail}
+                  </span>
+                )}
+              </div>
+              {pingState && pingState !== 'pending' && !pingState.reachable && (
+                <p className="text-xs text-warn">
+                  ESC not responding. Check: power is applied, CAN cable is connected to {canChannel}, CAN ID {canId} matches what was flashed.
+                </p>
+              )}
+
               <button onClick={handleCanConnected} className="btn-primary w-full">
                 Motor connected — Start Calibration
               </button>
@@ -491,6 +538,12 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
               <p className="text-sm text-danger flex-1">
                 {(status?.error ?? 'Flash failed — check log').split('\n')[0]}
               </p>
+              <button
+                onClick={handleReset}
+                className="btn-ghost px-4 py-2 flex-shrink-0 text-warn border-warn/30 hover:border-warn/60"
+              >
+                ↻ Reset
+              </button>
               <button onClick={onClose} className="btn-ghost px-4 py-2 flex-shrink-0">
                 Close
               </button>

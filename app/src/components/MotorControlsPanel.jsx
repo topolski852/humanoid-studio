@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { api } from '../api'
+import { useControlWebSocket } from '../hooks/useControlWebSocket'
 
 const DEG = Math.PI / 180
 const JOG_STEP_DEG = 1
@@ -17,6 +18,8 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
 
   const [busy,    setBusy]    = useState(false)
   const [clearing, setClearing] = useState(false)
+
+  const { sendPositionCommand, latencyMs, connected: wsConnected } = useControlWebSocket()
 
   // Position jog
   const [jogTargetDeg, setJogTargetDeg] = useState(0)
@@ -92,7 +95,8 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
     setRunTarget(targetRad)
     setJogError(null)
     try {
-      await api.setPosition(jointName, targetRad)
+      const sent = sendPositionCommand(jointName, targetRad)
+      if (!sent) await api.setPosition(jointName, targetRad)
     } catch (e) {
       setJogError(e.message)
       setIsRunning(false)
@@ -113,7 +117,8 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
     sineRef.current = setInterval(() => {
       const clampedAmp = Math.min(sineAmpDeg, Math.max(0, sineMaxAmpDeg - 0.1))
       const target = offsetRad + Math.sin(2 * Math.PI * sineFreq * (Date.now() / 1000)) * (clampedAmp * DEG)
-      api.setPosition(jointName, target).catch(() => {})
+      const sent = sendPositionCommand(jointName, target)
+      if (!sent) api.setPosition(jointName, target).catch(() => {})
     }, 100)
   }
 
@@ -121,7 +126,9 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
     clearInterval(sineRef.current)
     sineRef.current = null
     setSineRunning(false)
-    api.setPosition(jointName, sineOffsetDeg * DEG).catch(() => {})
+    const offsetRad = sineOffsetDeg * DEG
+    const sent = sendPositionCommand(jointName, offsetRad)
+    if (!sent) api.setPosition(jointName, offsetRad).catch(() => {})
   }
 
   useEffect(() => () => { if (sineRef.current) clearInterval(sineRef.current) }, [])
@@ -162,6 +169,15 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
           </div>
         </div>
       )}
+
+      {/* WS control channel status */}
+      <div className="mb-4 flex items-center gap-2 text-[10px] font-mono text-gray-500">
+        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${wsConnected ? 'bg-online' : 'bg-offline'}`} />
+        {wsConnected
+          ? <span>WS control {latencyMs != null ? <span className="text-gray-400">{latencyMs} ms</span> : null}</span>
+          : <span>WS offline — using HTTP (10 Hz)</span>
+        }
+      </div>
 
       {/* ── Power ── */}
       <div className="mb-6">

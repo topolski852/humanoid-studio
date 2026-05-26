@@ -54,12 +54,18 @@ function PillGroup({ options, value, onChange }) {
 }
 
 // ── Motor list for selected limb ──────────────────────────────────────────────
-function MotorList({ joints, onSelect }) {
+function MotorList({ joints, onSelect, stlinkConnected }) {
   if (joints.length === 0) {
     return <p className="text-xs text-gray-600">No motors found for this limb.</p>
   }
   return (
     <div className="space-y-1.5">
+      {!stlinkConnected && (
+        <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-warn/10 border border-warn/20 text-xs text-warn">
+          <span>⚠</span>
+          Connect an ST-LINK programmer before selecting a motor to flash.
+        </div>
+      )}
       {joints.map((j) => {
         const label = j.joint_name
           .replace(/_joint$/, '')
@@ -68,18 +74,23 @@ function MotorList({ joints, onSelect }) {
         return (
           <button
             key={j.joint_name}
-            onClick={() => onSelect(j.joint_name)}
-            className="w-full flex items-center gap-4 px-4 py-3 rounded-lg bg-surface-2 border border-surface-3 hover:border-accent/40 hover:bg-accent/5 transition-colors text-left group"
+            onClick={() => stlinkConnected && onSelect(j.joint_name)}
+            disabled={!stlinkConnected}
+            className={`w-full flex items-center gap-4 px-4 py-3 rounded-lg border transition-colors text-left group ${
+              stlinkConnected
+                ? 'bg-surface-2 border-surface-3 hover:border-accent/40 hover:bg-accent/5 cursor-pointer'
+                : 'bg-surface-2/50 border-surface-3/50 opacity-50 cursor-not-allowed'
+            }`}
           >
             <div className="flex-1">
-              <div className="text-sm text-gray-200 group-hover:text-white">{label}</div>
+              <div className={`text-sm ${stlinkConnected ? 'text-gray-200 group-hover:text-white' : 'text-gray-400'}`}>{label}</div>
               <div className="text-[10px] text-gray-600 font-mono mt-0.5">{j.joint_name}</div>
             </div>
             <div className="text-right flex-shrink-0">
               <div className="text-xs font-mono text-gray-400">CAN ID {j.can_id}</div>
               <div className="text-[10px] text-gray-600">{j.can_channel ?? 'can0'}</div>
             </div>
-            <svg className="w-4 h-4 text-gray-600 group-hover:text-accent flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <svg className={`w-4 h-4 flex-shrink-0 ${stlinkConnected ? 'text-gray-600 group-hover:text-accent' : 'text-gray-700'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
             </svg>
           </button>
@@ -136,6 +147,8 @@ export default function EscSetup() {
   function handleLimbType(t) {
     setLimbType(t)
   }
+
+  const hasStlink = usbDevices.some((d) => d.type === 'stlink')
 
   const filteredJoints = joints.filter((j) => {
     if (!side || !limbType) return false
@@ -208,7 +221,7 @@ export default function EscSetup() {
                     {side} {limbType}
                   </span>
                 </p>
-                <MotorList joints={filteredJoints} onSelect={setSelectedName} />
+                <MotorList joints={filteredJoints} onSelect={setSelectedName} stlinkConnected={hasStlink} />
               </div>
             )}
 

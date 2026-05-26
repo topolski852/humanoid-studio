@@ -263,6 +263,24 @@ class CanMonitor:
             'velocity_rads': t.get('velocity'),
         }
 
+    def get_passive_kinematics(self) -> dict[str, tuple[float, float]]:
+        """Return {joint_name: (pos_raw_rad, vel_rads)} for joints with fresh passive data.
+
+        pos_raw_rad is the raw output-shaft position (gear_ratio applied, position_offset NOT
+        subtracted) — same coordinate frame as POSITION_CONTROLLER_POSITION_MEASURED SDO.
+        Only joints seen within _JOINT_ONLINE_CUTOFF seconds are included.
+        """
+        now = time.time()
+        result: dict[str, tuple[float, float]] = {}
+        for key, jname in self._joint_lookup.items():
+            last_ts = self._joint_last_seen.get(key)
+            if last_ts is None or (now - last_ts) >= _JOINT_ONLINE_CUTOFF:
+                continue
+            t = self._joint_telemetry.get(key)
+            if t and 'position' in t and 'velocity' in t:
+                result[jname] = (t['position'], t['velocity'])
+        return result
+
     def get_interface_stats(self) -> list[dict]:
         now = time.time()
         result = []

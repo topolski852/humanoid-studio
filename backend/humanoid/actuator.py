@@ -133,7 +133,30 @@ class Actuator:
 
     async def enable(self, mode: Mode = Mode.POSITION) -> None:
         """Transition to an active control mode."""
+        if mode == Mode.POSITION:
+            # Read current calibrated position before switching modes.
+            # Without an immediate PDO2 after the NMT command, the firmware's
+            # position_target stays at 0.0 raw (from PositionController_reset),
+            # which maps to calibrated (0.0 - position_offset). With a nonzero
+            # position_offset this can be far from the actual joint angle, causing
+            # the motor to snap there and whine the moment POSITION mode is entered.
+            hold_pos = self._state.position
+            if hold_pos is None:
+                # No telemetry cached yet — fall back to a live SDO read.
+                state = await self.get_state()
+                hold_pos = state.position if state.position is not None else 0.0
+
         await self._bus.set_mode(self.device_id, mode)
+
+        if mode == Mode.POSITION:
+            # Fire-and-forget PDO2 with current position. Both this frame and the
+            # preceding NMT are queued back-to-back before the event loop yields,
+            # so the firmware receives them within one CAN frame period (~200 µs).
+            # hold_pos is in display-frame; firmware expects raw (display + offset).
+            await self._bus.send_pdo2(
+                self.device_id, hold_pos + self._config.position_offset, 0.0
+            )
+
         _log.debug("Actuator %s enabled in mode %s", self.name, mode.name)
 
     async def disable(self) -> None:
@@ -192,19 +215,27 @@ class Actuator:
     # State snapshot
     # ------------------------------------------------------------------
 
-    async def get_state(self) -> ActuatorState:
+    async def get_state(
+        self,
+        passive: tuple[float, float] | None = None,
+    ) -> ActuatorState:
         """
-        Read position, velocity, torque, mode, error, and bus voltage
-        via individual SDO reads.  Used for infrequent polling; for
-        real-time control use set_position() which returns measurements.
+        Read position, velocity, torque, mode, error, and bus voltage.
+
+        If passive=(pos_raw_rad, vel_rads) is supplied (from CanMonitor passive sniffing),
+        the position and velocity SDO reads are skipped, reducing CAN traffic from 7 to 5
+        reads per call.  pos_raw_rad must be in the same frame as
+        POSITION_CONTROLLER_POSITION_MEASURED (output-shaft, gear_ratio applied,
+        position_offset NOT subtracted).
         """
         async with self._state_lock:
             prev = self._state
 
-        _gr = self._config.gear_ratio
-
-        pos_raw  = await self._bus.read_parameter_f32(self.device_id, Parameter.POSITION_CONTROLLER_POSITION_MEASURED)
-        vel_raw  = await self._bus.read_parameter_f32(self.device_id, Parameter.POSITION_CONTROLLER_VELOCITY_MEASURED)
+        if passive is not None:
+            pos_raw, vel_raw = passive[0], passive[1]
+        else:
+            pos_raw  = await self._bus.read_parameter_f32(self.device_id, Parameter.POSITION_CONTROLLER_POSITION_MEASURED)
+            vel_raw  = await self._bus.read_parameter_f32(self.device_id, Parameter.POSITION_CONTROLLER_VELOCITY_MEASURED)
         trq_raw  = await self._bus.read_parameter_f32(self.device_id, Parameter.POSITION_CONTROLLER_TORQUE_MEASURED)
         iq_raw   = await self._bus.read_parameter_f32(self.device_id, Parameter.CURRENT_CONTROLLER_I_Q_MEASURED)
         mode_raw = await self._bus.read_parameter_u32(self.device_id, Parameter.MODE)
@@ -217,12 +248,9 @@ class Actuator:
         # without the offset, but gear_ratio is already divided in — so only offset needs correcting here.
         _pos_offset = self._config.position_offset
         pos = (pos_raw - _pos_offset) if pos_raw is not None else prev.position
-        if vel_raw is not None:
-            # POSITION_CONTROLLER_VELOCITY_MEASURED (0x054) is motor-shaft rad/s;
-            # divide by gear_ratio to get output-shaft velocity (matches POSITION_MEASURED units).
-            vel = vel_raw / _gr if _gr else vel_raw
-        else:
-            vel = prev.velocity
+        # POSITION_CONTROLLER_VELOCITY_MEASURED (0x054) is already output-shaft rad/s —
+        # the firmware divides Encoder_getVelocity() by gear_ratio in MotorController_update().
+        vel = vel_raw if vel_raw is not None else prev.velocity
         trq = trq_raw if trq_raw is not None else prev.torque
         iq  = iq_raw  if iq_raw  is not None else prev.current
         err = err_raw if err_raw is not None else prev.error
@@ -279,6 +307,11 @@ class Actuator:
 
         If torque_ff is non-zero it is written to TORQUE_TARGET via SDO before
         the PDO2 command (the firmware adds it as feed-forward in MODE_POSITION).
+
+        NOTE: velocity_ff is included in PDO2 bytes 4–7 per the Recoil protocol spec,
+        but the firmware MODE_POSITION control law computes velocity_error as
+        (0 - vel_measured) and never reads the velocity_target field.  Passing a
+        non-zero velocity_ff has no effect in POSITION mode.
         """
         if torque_ff != 0.0:
             await self._bus.write_parameter_f32(
@@ -288,13 +321,14 @@ class Actuator:
             )
 
         result = await self._bus.send_recv_pdo2(
-            self.device_id, position, velocity_ff, timeout=timeout
+            self.device_id, position + self._config.position_offset, velocity_ff, timeout=timeout
         )
 
         if result is not None:
             pos, vel = result
             async with self._state_lock:
-                self._state.position = pos
+                # Store display-frame position (consistent with get_state())
+                self._state.position = pos - self._config.position_offset
                 self._state.velocity = vel
                 self._state.timestamp = time.time()
 
@@ -345,29 +379,112 @@ class Actuator:
             if on_progress:
                 on_progress(msg)
 
-        # Log bus voltage as a diagnostic but don't block on a stale SDO read
-        vbus = await self.read_bus_voltage()
+        # ── Pre-calibration connectivity check (diagnostic only) ─────────────
+        # Use 2 s timeouts to give a freshly-booted ESC time to respond.
+        # This is NEVER a hard failure — we always attempt the NMT command
+        # regardless, matching the original committed behaviour.  The NMT is
+        # what triggers the firmware calibration sequence; blocking before it
+        # is sent means the motor never starts.  The poll loop's
+        # _MAX_CONSECUTIVE_TIMEOUTS limit (45 s) catches a truly offline device.
+        _log_progress("checking device connectivity…")
+        vbus = await self._bus.read_parameter_f32(
+            self.device_id, Parameter.POWERSTAGE_BUS_VOLTAGE_MEASURED, timeout=2.0
+        )
         if vbus is not None:
-            _log_progress(f"bus voltage = {vbus:.1f} V")
+            _log_progress(f"ESC online — bus voltage = {vbus:.1f} V")
+        else:
+            mode_raw = await self._bus.read_parameter_u32(
+                self.device_id, Parameter.MODE, timeout=2.0
+            )
+            if mode_raw is not None:
+                _log_progress(f"bus voltage unavailable; ESC online (mode=0x{mode_raw:02X})")
+            else:
+                # No SDO response — log a warning but proceed to send the NMT.
+                # If the device is truly offline the poll loop will catch it.
+                _log_progress(
+                    "WARNING: no SDO response from device — check CAN cable, "
+                    "ESC power (12 V motor bus required), and CAN ID. "
+                    "Attempting NMT calibration command anyway…"
+                )
 
-        _log_progress("starting calibration sequence")
+        # ── Send NMT MODE_CALIBRATION ─────────────────────────────────────────
+        # Firmware >= 0x20250226 sends a HEARTBEAT ACK within ~50 ms of the NMT.
+        # Pre-register the waiter BEFORE transmitting to avoid the race where the
+        # ACK arrives before receive() can register.  Fall back to SDO polling if
+        # no HEARTBEAT arrives (older firmware or transient drop).
+        _log_progress("sending NMT MODE_CALIBRATION")
+        hb_future = await self._bus.pre_receive(
+            filter_device_id=self.device_id,
+            filter_func=int(Function.HEARTBEAT),
+        )
         await self._bus.set_mode(self.device_id, Mode.CALIBRATION)
+
+        # ── Confirm mode via HEARTBEAT ACK (< 100 ms) or SDO fallback (500 ms) ──
+        try:
+            hb = await asyncio.wait_for(hb_future, timeout=1.5)
+            if len(hb.data) >= 1:
+                confirmed_mode = Mode(hb.data[0])
+                if confirmed_mode == Mode.CALIBRATION:
+                    _log_progress("firmware confirmed MODE_CALIBRATION — sweep started")
+                elif confirmed_mode == Mode.IDLE:
+                    # setMode returned early (e.g. invalid transition) — retry once
+                    _log_progress("HEARTBEAT shows IDLE after NMT — retrying")
+                    await self._bus.set_mode(self.device_id, Mode.CALIBRATION)
+                else:
+                    _log_progress(f"unexpected mode after NMT: {confirmed_mode.name}")
+            else:
+                _log_progress("HEARTBEAT received but no mode byte — proceeding")
+        except asyncio.TimeoutError:
+            # No HEARTBEAT — older firmware or frame lost; fall back to SDO poll
+            await self._bus.cancel_pre_receive(hb_future)
+            _log_progress("no HEARTBEAT response — falling back to SDO mode poll")
+            await asyncio.sleep(0.5)
+            try:
+                confirmed_mode = await self.read_mode()
+                if confirmed_mode == Mode.IDLE:
+                    _log_progress("mode still IDLE after 500 ms — retrying NMT CALIBRATION")
+                    await self._bus.set_mode(self.device_id, Mode.CALIBRATION)
+                    await asyncio.sleep(0.5)
+                elif confirmed_mode == Mode.CALIBRATION:
+                    _log_progress("firmware confirmed MODE_CALIBRATION — sweep started")
+            except ActuatorTimeoutError:
+                _log_progress("no SDO response after NMT — firmware may have started sweep")
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         t_start = loop.time()
         poll_interval = 1.0
         last_log_t = t_start
+        consecutive_timeouts = 0
+        # 45 consecutive SDO timeouts (~45 s) before declaring device offline.
+        # High pole-pair motors (14–21 poles) take 12–17 s to calibrate; SDO reads
+        # often timeout throughout that window because the firmware main loop is
+        # blocked in HAL_Delay during the sweep.  45 s gives enough headroom for
+        # the sweep to finish and mode to return to IDLE before we give up.
+        _MAX_CONSECUTIVE_TIMEOUTS = 45
 
         while loop.time() < deadline:
             await asyncio.sleep(poll_interval)
             try:
                 mode = await self.read_mode()
             except ActuatorTimeoutError:
-                _log_progress("poll timeout — device may still be calibrating")
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= _MAX_CONSECUTIVE_TIMEOUTS:
+                    raise ActuatorCalibrationError(
+                        f"{self.name}: device not responding after {consecutive_timeouts} "
+                        f"consecutive SDO timeouts — check CAN connection and ESC power"
+                    )
+                # Log once on first timeout, then every 5 to avoid log spam
+                if consecutive_timeouts == 1 or consecutive_timeouts % 5 == 0:
+                    _log_progress(
+                        f"no SDO response ({consecutive_timeouts}/{_MAX_CONSECUTIVE_TIMEOUTS}) "
+                        f"— device may still be calibrating"
+                    )
                 continue
 
+            consecutive_timeouts = 0
             elapsed = loop.time() - t_start
+
             if mode == Mode.IDLE:
                 err = await self.read_error()
                 flux_offset = await self.read_flux_offset()
