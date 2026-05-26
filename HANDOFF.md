@@ -1263,3 +1263,404 @@ NOTE: Push requires the SSH key to be added to GitHub account:
 
 Source wiki files live in /home/nse/humanoid-studio/wiki/ (tracked in main repo).
 The wiki repo at /home/nse/humanoid-studio-wiki/ is the publishing copy.
+
+---
+
+## Session 3 Audit — 2026-05-25
+
+### Phase 1 Findings Summary
+
+All files audited (full inventory in session 3 conversation). No protocol-level bugs found.
+CAN framing, SDO read/write, PDO2 format, NMT mode transitions all match Berkeley reference.
+Prior-session calibration bugs (iridescent-hopping-rabbit plan) already fixed.
+
+**Minor fixes applied:**
+- `actuator.py:get_state()` — removed dead `_gr = self._config.gear_ratio` variable
+- `actuator.py:set_position()` — position target now translated display→firmware-frame before PDO2 (`+ position_offset`); PDO2 response stored in display-frame (`- position_offset`)
+- `actuator.py:enable()` — hold-position PDO2 now correctly translates display-frame back to firmware-frame (`+ position_offset`)
+
+These three changes are coordinated. For all 21 joints with `position_offset = 0.0` the behavior is mathematically unchanged. For `left_hip_roll_joint` (position_offset = −0.0883 rad) they fix a ~5° snap-on-enable bug.
+
+**Major issues requiring human action:**
+
+| ID | Description | File(s) |
+|----|-------------|---------|
+| MAJ-001 | Active SDO polling 7 reads×22 joints×20 Hz may saturate CAN bus at full load | main.py, robot.py |
+| MAJ-002 | Frontend position commands limited to 10 Hz (HTTP) vs Berkeley's 200 Hz | MotorControlsPanel.jsx |
+| MAJ-003 | `left_hip_roll_joint` gear_ratio = +15.0 vs all others −15.0 and vs Berkeley −15.0 — verify physical direction on hardware | humanoid_lite.json |
+| MAJ-004 | `velocity_ff` in PDO2 silently discarded by firmware in MODE_POSITION — misleading API | actuator.py, routes_motors.py |
+| MAJ-005 | Arm joints position_kp=20.0 vs Berkeley 50.0; all joints velocity_kp=1.0 vs Berkeley 2.0 | humanoid_lite.json |
+
+---
+
+### Phase 2 — Position Control Specification
+
+#### Firmware Control Law (runs at 2 kHz)
+
+```c
+// position_controller.c — PositionController_update()
+float position_error = position_setpoint - position_measured;
+float velocity_error = 0.f - velocity_measured;   // velocity_target NOT USED
+float torque = position_kp * position_error
+             + velocity_kp * velocity_error
+             + position_integrator               // += ki * error / 2000 Hz
+             + controller->torque_target;        // feed-forward via SDO
+torque = clamp(torque, -torque_limit, +torque_limit);
+```
+
+`position_measured = (encoder_pos + encoder_position_offset) / gear_ratio` — raw output-shaft radians.
+`position_integrator` is effectively disabled (position_ki=0.0 in all current configs).
+`velocity_target` from PDO2 is stored in the struct but never read in POSITION mode.
+
+#### PDO2 Frame Contract
+
+- **arb_id:** `(0x6 << 7) | device_id`
+- **TX (host→ESC, 8 bytes):** `struct.pack("<ff", position_target_raw_rad, velocity_target_rad_s)`
+- **RX (ESC→host, 8 bytes):** `struct.pack("<ff", position_measured_raw_rad, velocity_measured_raw_rad)`
+- All values in **raw output-shaft radians** — gear_ratio applied, `position_offset` NOT applied
+- Also resets the 1000 ms watchdog
+
+#### Unit Conversion Chain
+
+```
+AS5600 count [0–4095]
+  ÷ cpr (4096)  → fractional turn
+  + n_rotations × 1 turn
+  × 2π          → encoder_pos (rad, motor-shaft, continuous)
+  + encoder_position_offset (0.0 all joints)
+  ÷ gear_ratio  → position_measured (rad, output-shaft, RAW FRAME)
+  ← PDO2 and SDO 0x060 return this value
+  − position_offset (JointConfig) → position_display (rad, output-shaft, DISPLAY FRAME)
+  × (180/π)     → degrees shown in UI
+
+UI command (degrees) → × (π/180) → target_display_rad
+  + position_offset  → target_raw_rad  (set_position() adds this internally since Session 3 fix)
+  → PDO2 position_target field
+```
+
+#### Berkeley vs Humanoid Studio — Key Differences
+
+| Parameter | Berkeley | Humanoid Studio | Action |
+|-----------|----------|-----------------|--------|
+| gear_ratio (written to FW) | −15.0 all joints | −15.0 (21 joints), +15.0 (left_hip_roll) | Verify on HW (MAJ-003) |
+| position_kp (arms) | 50.0 | 20.0 | Raise to 50.0 after HW validation (MAJ-005) |
+| velocity_kp (all) | 2.0 | 1.0 | Raise to 2.0 after HW validation (MAJ-005) |
+| torque_limit (leg joints) | 6.0 Nm | 2.0 Nm (except hip_roll=6.0) | Raise to 6.0 Nm (PC-003) |
+| command rate | 200 Hz | 10 Hz (frontend) | WebSocket stream planned (MAJ-002) |
+| position_offset | 0.0 always | varies; fix applied in Session 3 | ✓ |
+| velocity_ff effect | none (ignored) | none (ignored) | Document only (PC-004) |
+
+#### Verified Enable/Disable/Command Sequences
+
+**Enable (POSITION mode, correct after Session 3 fix):**
+1. Read current display-frame position from `_state.position` (or live SDO if state stale)
+2. `set_mode(device_id, MODE_POSITION)` — NMT frame `(0x0 << 7 | device_id)`, payload `[1, 0x13]`
+3. Immediately send PDO2: `position_target = hold_pos_display + position_offset` (raw frame)
+   — firmware receives target = current raw position → zero error → no snap
+
+**Disable (safe stop):**
+- `set_mode(device_id, MODE_IDLE)` — NMT `[1, 0x01]` — PWM off, motor coasts
+- Or `set_mode(device_id, MODE_DAMPING)` — NMT `[1, 0x02]` — regenerative braking
+
+**Position command:**
+```python
+# actuator.py set_position(target_display_rad)
+send PDO2: position = target_display_rad + config.position_offset  # raw frame
+receive PDO2: pos_raw, vel_raw
+_state.position = pos_raw - config.position_offset                 # display frame
+```
+
+**Watchdog feed (5 Hz background, separate from PDO2):**
+```python
+# can_bus.py feed_watchdog(device_id)
+transmit(FUNC_HEARTBEAT, device_id, payload=[])
+```
+
+---
+
+## Session 4 — 2026-05-25
+
+### Summary
+Implemented six fixes from the Phase 1/2 audit. All changes are in the humanoid-studio repo only — the Berkeley-Humanoid-Lite and Recoil-Motor-Controller-BESC repos were not touched.
+
+---
+
+### Fix 1 — Torque limits (PC-003, CRITICAL)
+
+**File:** `configs/humanoid_lite.json`
+
+Raised `torque_limit` from 2.0 → 6.0 Nm for all 12 leg joints:
+- `left_hip_yaw_joint`, `left_hip_pitch_joint`, `left_knee_pitch_joint`, `left_ankle_pitch_joint`, `left_ankle_roll_joint`
+- `right_hip_roll_joint`, `right_hip_yaw_joint`, `right_hip_pitch_joint`, `right_knee_pitch_joint`, `right_ankle_pitch_joint`, `right_ankle_roll_joint`
+- `left_hip_roll_joint` was already 6.0 — unchanged
+
+Arm joints remain at 2.0 Nm (not yet tested under load).
+
+**Why:** 2.0 Nm is physically insufficient for the robot to support its own weight. Berkeley reference uses 6.0 Nm for all leg joints.
+
+---
+
+### Fix 2 — Gains (MAJ-005)
+
+**File:** `configs/humanoid_lite.json`
+
+- `velocity_kp`: 1.0 → **2.0** for all 22 joints (matches Berkeley reference)
+- `position_kp`: 20.0 → **50.0** for all 10 arm joints only (matches Berkeley arm reference)
+- Leg joint `position_kp` stays at 20.0 (Berkeley leg value is also 20.0)
+
+---
+
+### Fix 3 — velocity_ff documentation (MAJ-004/PC-004)
+
+**Files:** `backend/humanoid/actuator.py`, `backend/api/routes_motors.py`
+
+- Added docstring NOTE to `Actuator.set_position()` explaining that `velocity_ff` is placed in PDO2 bytes 4–7 per spec but the firmware POSITION mode control law ignores the velocity_target field entirely. The parameter is silently a no-op.
+- Added one-time `WARNING` log in `set_motor_position()` route when `velocity_ff != 0.0` in POSITION mode.
+
+---
+
+### Fix 4 — gear_ratio anomaly warning (MAJ-003)
+
+**Files:** `backend/main.py`, `app/src/pages/Dashboard.jsx`, `app/src/components/MotorTab.jsx`
+
+- `main.py` lifespan now logs a `WARNING` at startup if `left_hip_roll_joint` has a positive `gear_ratio`.
+- Dashboard motor grid shows a yellow `DIR?` badge on the `left_hip_roll_joint` card when `gear_ratio > 0`.
+- MotorTab header shows the same `DIR?` badge next to the gear ratio readout.
+
+**The anomaly:** All 22 joints have `gear_ratio: -15.0` except `left_hip_roll_joint` which has `+15.0`. This was preserved as-is (do NOT auto-fix — physical direction on hardware must be verified first).
+
+---
+
+### Fix 5 — WebSocket control channel (MAJ-002)
+
+**Files:** `backend/main.py`, `app/src/hooks/useControlWebSocket.js` (NEW), `app/src/components/MotorControlsPanel.jsx`
+
+#### Backend (`/ws/control`)
+- New WebSocket endpoint at `ws://localhost:8765/ws/control`
+- Accepts one client at a time (rejects additional clients with code 1008)
+- Rate-limited to 200 Hz max per command (5 ms minimum interval)
+- Message format (client → server): `{"joint_name": str, "position": float, "velocity_ff": float, "torque_ff": float}`
+- Response format (server → client): `{"command_ack": true, "joint_name": str, "position_target": float, "latency_ms": float, "position_measured": float, "velocity_measured": float}`
+
+#### Frontend (`useControlWebSocket`)
+- Auto-connects to `ws://localhost:8765/ws/control` on mount
+- Auto-reconnects after 2 s on disconnect
+- `sendPositionCommand(jointName, posRad, options)` → returns `true` if sent, `false` if WS not open
+- Exposes `latencyMs`, `lastAck`, `connected`
+
+#### MotorControlsPanel
+- Uses `sendPositionCommand` for both jog and sine wave
+- Falls back to `api.setPosition()` (HTTP) when WS is not connected
+- Shows a WS status line (green dot + latency, or grey dot + "HTTP fallback" label)
+
+---
+
+### Fix 6 — Reduce CAN SDO polling (MAJ-001)
+
+**Files:** `configs/humanoid_lite.json`, `backend/humanoid/robot_config.py`, `backend/humanoid/can_monitor.py`, `backend/humanoid/actuator.py`, `backend/humanoid/robot.py`, `backend/main.py`
+
+#### Config-driven telemetry rate
+- Added `"telemetry_hz": 10` root field to `humanoid_lite.json` (was hard-coded at 20 Hz).
+- Added `telemetry_hz: int = 10` to `RobotConfig` Pydantic model.
+- `main.py` lifespan reads `config.telemetry_hz` and updates `_TELEMETRY_HZ` via `global`.
+- Comment in `main.py`: at 10 Hz × 7 SDO reads × 22 joints = 1540 frames/s (within SocketCAN budget).
+
+#### Passive PDO4 position/velocity
+- `CanMonitor.get_passive_kinematics()` returns `{joint_name: (pos_raw_rad, vel_rads)}` for joints with passive data seen within 2 s. Position is in raw frame (same as `POSITION_CONTROLLER_POSITION_MEASURED` SDO) — position_offset is NOT subtracted here.
+- `Actuator.get_state(passive=...)` accepts `passive: tuple[float, float] | None`. When provided, skips the two position/velocity SDO reads, reducing per-joint SDO traffic from 7 → 5 reads per poll cycle. The `pos_raw` from passive is converted to display-frame with `pos_raw - position_offset` as normal.
+- `Robot.get_all_states(passive_kinematics=...)` threads the passive dict through to each actuator.
+- `ws_telemetry` in main.py calls `monitor.get_passive_kinematics()` before `robot.get_all_states()`.
+
+**Net result:** Joints actively broadcasting PDO frames (100 Hz) use 5 SDO reads/cycle instead of 7. Joints that are offline or not broadcasting use the full 7-read path unchanged.
+
+---
+
+### Remaining Open Issues (not addressed in Session 4)
+
+| ID | Description | Status |
+|----|-------------|--------|
+| MAJ-003 | `left_hip_roll_joint` `gear_ratio=+15.0` anomaly — physical direction unverified on HW | WARNING added; fix requires HW test |
+| PC-003 | Leg joint torque_limit raised to 6.0 Nm — safe to enable legs for standing tests | ✅ Fixed |
+| MAJ-005 | Gains updated (velocity_kp 2.0, arm position_kp 50.0) | ✅ Fixed |
+| MAJ-004 | velocity_ff silently discarded in POSITION mode | ✅ Documented |
+| MAJ-002 | Frontend control channel upgraded to WS (200 Hz max) | ✅ Fixed |
+| MAJ-001 | SDO polling reduced 7→5 reads/joint via passive PDO4 data; rate made configurable | ✅ Fixed |
+
+---
+
+## Session 5: C++ Daemon Architecture (2026-05-25)
+
+### Architecture Decision
+
+The Python `python-can` transport layer is being replaced by a standalone C++ daemon
+(`humanoid-studio/daemon/`). The FastAPI backend keeps its HTTP and WebSocket interfaces
+but will communicate with the daemon exclusively via UDP on localhost. Python never opens a
+CAN socket after the migration is complete.
+
+**Full specification:** `humanoid-studio/DAEMON_SPEC.md`
+
+### Reference Material
+
+Berkeley Humanoid Lite C++ lowlevel source
+(`/home/nse/Berkeley-Humanoid-Lite/source/berkeley_humanoid_lite_lowlevel/csrc/`) was
+analyzed as READ-ONLY reference. No Berkeley code was copied into the daemon.
+
+Key patterns adopted from Berkeley (concept, not code):
+- `LoopFunc` real-time loop (SCHED_FIFO, CPU affinity, `high_resolution_clock` timing)
+- Two-stage graceful shutdown (DAMPING → IDLE → exit)
+- Single executable, CMake + FetchContent build system
+
+Key patterns NOT in Berkeley that the daemon must add:
+- epoll + per-bus reader threads (Berkeley uses blocking `select` on one socket)
+- Per-joint `JointState` enum with OFFLINE/FAULT states
+- Firmware HEARTBEAT, EMCY, PDO4, PDO3 frame handling
+- JSON-over-UDP RPC interface (Berkeley uses raw float arrays)
+- `nlohmann/json` config loading from `humanoid_lite.json`
+
+### Daemon Summary
+
+| Property | Value |
+|---|---|
+| Binary | `daemon/build/humanoid_daemon` |
+| Config arg | `--config ../configs/humanoid_lite.json` |
+| Command port | 9001 (Python → Daemon, request/response) |
+| Telemetry port | 9000 (Daemon → Python, push at configured Hz) |
+| Control loop | 200 Hz, SCHED_FIFO priority 80, CPU 0 |
+| Real-time cap | `sudo setcap cap_sys_nice+ep humanoid_daemon` |
+| CAN buses | 4 (can_left_leg, can_right_leg, can_left_arm, can_right_arm) |
+| C++ standard | C++17 |
+| Dependencies | `nlohmann/json` v3.11.3 (FetchContent), pthreads |
+
+### Migration Status
+
+| Phase | Description | Status |
+|---|---|---|
+| 1 | Daemon skeleton (config load, UDP server, signal handling) | Not started |
+| 2 | CAN layer (SocketCAN, SDO read/write, actuator state machine) | Not started |
+| 3 | Control loop + full command set + telemetry push | Not started |
+| 4 | Python migration (DaemonClient, DaemonProcess, delete old CAN files) | Not started |
+| 5 | Integration testing + performance validation | Not started |
+
+### Files to Delete in Phase 4
+
+- `backend/humanoid/can_bus.py`
+- `backend/humanoid/actuator.py`
+- `backend/humanoid/robot.py`
+- `backend/humanoid/can_monitor.py`
+- `backend/humanoid/recoil_protocol.py`
+
+### Files to Add in Phase 4
+
+- `backend/humanoid/daemon_client.py` — async UDP client (mirrors Robot/Actuator API)
+- `backend/humanoid/daemon_process.py` — subprocess lifecycle manager
+
+### Known Constraints
+
+- Daemon must start before FastAPI backend; `DaemonProcess.start()` in the lifespan handles this.
+- Flash Wizard (`backend/humanoid/flash.py`) is NOT affected — it uses OpenOCD directly.
+- `backend/humanoid/can_adapter.py` (interface discovery) is NOT deleted; daemon uses the
+  same interface name strings from the JSON config.
+- Position offset convention is unchanged: `wire = display + offset` in both Python and C++.
+- Old Python CAN stack remains fully operational through Phases 1–3 (dual-mode development).
+
+### Firmware Changes (from this session, for context)
+
+Six improvements were implemented and built in the Recoil firmware:
+
+| Improvement | CAN frame | Arb-ID formula |
+|---|---|---|
+| NMT mode ACK | HEARTBEAT (5 bytes: mode + uint32 error) | `(0xE << 7) \| device_id` |
+| Periodic heartbeat | HEARTBEAT (same) every 500 ms | `(0xE << 7) \| device_id` |
+| Calibration status | PDO3 (float32 voltage, float32 current/progress) | `(0x7 << 7) \| device_id` |
+| LUT linearization | No new frame; applied in `MotorController_update()` theta calc | — |
+| SDO write ACK | TRANSMIT_SDO (1 byte: `0x60`) | `(0xB << 7) \| device_id` |
+| EMCY on error | SYNC_EMCY (4 bytes: uint32 error code) | `(0x1 << 7) \| device_id` |
+
+Python fixes applied for these changes:
+- `can_bus.py`: `pre_receive()`, `cancel_pre_receive()`, `_sdo_write()` drains write ACK.
+- `actuator.py`: `calibrate_offset()` uses HEARTBEAT-based mode confirmation instead of
+  500 ms sleep + SDO poll.
+
+---
+
+## Session 6: C++ Daemon Implementation (2026-05-26)
+
+**Status:** Phases 1–3 (daemon skeleton → CAN layer → control loop) **COMPLETE**.
+Binary builds and runs. Standalone tests passed. Python CAN stack untouched.
+
+### Files Created
+
+All files under `daemon/`:
+
+| File | Step | Description |
+|---|---|---|
+| `Makefile` | 1 | g++ C++17 build, `-I src -I third_party`, `build/` output |
+| `third_party/json.hpp` | 1 | nlohmann/json v3.11.3 single header |
+| `src/motor/recoil_protocol.hpp` | 2 | CAN protocol constants: `FuncCode`, `MotorMode`, `ErrorCode`, `ParamId`, SDO helpers |
+| `src/can/socket_can.hpp/.cpp` | 3 | Non-blocking raw CAN socket (`O_NONBLOCK` via `fcntl` after bind) |
+| `src/can/can_bus_manager.hpp/.cpp` | 4 | Multi-bus manager; missing interfaces logged as non-fatal |
+| `src/config/config_loader.hpp/.cpp` | 5 | Parses `humanoid_lite.json` via nlohmann/json; null limits → ±100.0 rad |
+| `src/motor/actuator.hpp/.cpp` | 6 | Per-joint state machine (OFFLINE/IDLE/ENABLED/CALIBRATING/FAULT); tick() + on_rx_frame() + apply_config() |
+| `src/ipc/udp_broadcaster.hpp/.cpp` | 7 | Fire-and-forget `sendto()` for telemetry push (port 9000) |
+| `src/ipc/udp_server.hpp/.cpp` | 7 | Background recv thread, 100 ms timeout, JSON request/response (port 9001) |
+| `src/control/control_loop.hpp` | 8 | Header-only LoopFunc: SCHED_FIFO, CPU affinity, overrun logging |
+| `src/control/robot.hpp/.cpp` | 8 | Multi-joint coordinator: control tick, telemetry loop, command dispatch |
+| `src/main.cpp` | 9 | Entry point: argv parsing, SIGINT handler, `Robot::start()` + `pause()` |
+| `.gitignore` | 10 | Excludes `build/` |
+
+### Build Commands
+
+```bash
+cd humanoid-studio/daemon
+make -j$(nproc)          # builds build/humanoid_daemon
+make clean               # remove build/
+```
+
+For real-time scheduling without root:
+```bash
+sudo setcap cap_sys_nice+ep build/humanoid_daemon
+```
+
+### Run Commands
+
+```bash
+./build/humanoid_daemon [OPTIONS]
+  --config PATH     JSON config (default: ../configs/humanoid_lite.json)
+  --cmd-port PORT   UDP command port (default: 9001)
+  --tel-port PORT   UDP telemetry port (default: 9000)
+  --tel-hz HZ       Telemetry rate (default: 10)
+  --rt-prio PRIO    SCHED_FIFO priority, 0 = SCHED_OTHER (default: 80)
+  --cpu CPU         CPU affinity for control loop (default: 0)
+```
+
+### Standalone Test Results
+
+Run on dev machine (no CAN hardware):
+- PING → PONG (port 9001): **PASS**
+- Telemetry frame with 22 joints + 4 bus health keys (port 9000): **PASS**
+- SIGINT graceful shutdown (exit 0): **PASS**
+- Missing CAN interfaces: logged as `OFFLINE` (non-fatal): **PASS**
+
+### Deviations from DAEMON_SPEC.md
+
+| Item | DAEMON_SPEC says | Actual implementation | Reason |
+|---|---|---|---|
+| Namespace | `Recoil::` namespace for protocol symbols | Global namespace | `recoil_protocol.hpp` was written in step 2 without a namespace wrapper; callers use bare names |
+| SDO response bytes | "bytes 4–7" | bytes 0–3 (and 0+3 for position/velocity) | Python `can_bus.py` `_sdo_read()` reads `data[:4]`; Python is ground truth |
+| `RobotOptions` struct | `Robot::Options` nested struct | `RobotOptions` at namespace scope | GCC cannot use nested struct with in-class member initializers as a default argument in the same class body |
+| Telemetry position | `steady_clock` | `steady_clock::time_since_epoch()` | Used for the `timestamp_us` field; monotonic not wall-clock |
+| `ParamId` names | (implied no prefix) | `PARAM_` prefix required | Enum was defined with `PARAM_` prefix in step 2; no name collision issue |
+| epoll multi-socket | Described in spec | Not implemented | Drain loop (`recv()` until empty on each bus) is sufficient at 200 Hz with non-blocking sockets; epoll adds complexity without benefit at this scale |
+| Per-bus reader thread | Described in spec | Not implemented | Single-threaded drain in control loop tick is simpler and avoids lock-free ring buffer complexity; adequate for 4 buses at 200 Hz |
+| SDO write ACK wait | Described in spec | Blocking spin-wait (startup only) | apply_config() is called before the control loop starts; `drain_all` is called in the spin loop |
+
+### Next Steps (Phase 4 — Python Migration)
+
+1. Implement `backend/humanoid/daemon_client.py` — async UDP client mirroring `Robot`/`Actuator` public API
+2. Implement `backend/humanoid/daemon_process.py` — subprocess lifecycle manager
+3. Modify `backend/main.py` lifespan to spawn daemon and use `DaemonClient`
+4. Update all API routes to use `DaemonClient` instead of `Robot`/`Actuator`
+5. Update WebSocket telemetry endpoint to consume daemon telemetry push stream
+6. Delete `can_bus.py`, `actuator.py`, `robot.py`, `can_monitor.py`, `recoil_protocol.py`
+7. Remove `python-can` from `requirements.txt`
+
