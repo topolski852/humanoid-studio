@@ -20,8 +20,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from humanoid.actuator import ActuatorError
-from humanoid.can_bus import Mode, Parameter
+from humanoid.daemon_client import DaemonError, DaemonNotSupportedError
+from humanoid.can_bus import Mode
 from humanoid.robot_config import PositionLimits
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parents[3] / "configs" / "humanoid_lite.json"
@@ -99,7 +99,7 @@ async def get_motor(joint_name: str, request: Request) -> dict | JSONResponse:
             "can_channel": actuator.config.can_channel,
             "state": state.model_dump(),
         })
-    except ActuatorError as exc:
+    except DaemonError as exc:
         return _err(str(exc))
 
 
@@ -114,7 +114,7 @@ async def enable_motor(
     try:
         await actuator.enable(mode=mode)
         return _ok({"joint_name": joint_name, "enabled": True, "mode": body.mode.upper()})
-    except ActuatorError as exc:
+    except DaemonError as exc:
         return _err(str(exc))
 
 
@@ -126,7 +126,7 @@ async def clear_motor_error(joint_name: str, request: Request) -> dict | JSONRes
     try:
         await actuator.clear_error()
         return _ok({"joint_name": joint_name, "error_cleared": True})
-    except ActuatorError as exc:
+    except DaemonError as exc:
         return _err(str(exc))
 
 
@@ -138,7 +138,7 @@ async def disable_motor(joint_name: str, request: Request) -> dict | JSONRespons
     try:
         await actuator.disable()
         return _ok({"joint_name": joint_name, "enabled": False})
-    except ActuatorError as exc:
+    except DaemonError as exc:
         return _err(str(exc))
 
 
@@ -155,7 +155,9 @@ async def calibrate_motor(joint_name: str, request: Request) -> dict | JSONRespo
     try:
         flux_offset = await actuator.calibrate_offset(timeout=90.0)
         return _ok({"joint_name": joint_name, "flux_offset": flux_offset})
-    except ActuatorError as exc:
+    except DaemonNotSupportedError as exc:
+        return _err(str(exc), 503)
+    except DaemonError as exc:
         return _err(str(exc))
 
 
@@ -185,7 +187,7 @@ async def set_motor_position(
             data["position_measured"] = pos_measured
             data["velocity_measured"] = vel_measured
         return _ok(data)
-    except ActuatorError as exc:
+    except DaemonError as exc:
         return _err(str(exc))
 
 
@@ -200,14 +202,8 @@ async def set_position_offset(
     actuator, error = _resolve_actuator(request, joint_name)
     if error:
         return error
-    try:
-        await actuator._bus.write_parameter_f32(
-            actuator.device_id,
-            Parameter.POSITION_CONTROLLER_POSITION_OFFSET,
-            body.position_offset,
-        )
-    except ActuatorError as exc:
-        return _err(str(exc))
+    # Daemon owns the CAN bus; update config in memory + persist to JSON.
+    # The new position_offset takes effect on the device after daemon restart or APPLY_CONFIG.
     actuator.config.position_offset = body.position_offset
     config_path: Path = getattr(request.app.state, "config_path", _DEFAULT_CONFIG_PATH)
     request.app.state.robot.config.to_json(config_path)
@@ -226,7 +222,9 @@ async def get_motor_config_from_device(joint_name: str, request: Request) -> dic
     try:
         raw = await actuator.read_config_from_device()
         return _ok(raw)
-    except ActuatorError as exc:
+    except DaemonNotSupportedError as exc:
+        return _err(str(exc), 503)
+    except DaemonError as exc:
         return _err(str(exc))
 
 
@@ -245,11 +243,13 @@ async def apply_motor_config(
         updated = actuator.config.model_copy(update=body.config)
         actuator.update_config(updated)
         request.app.state.robot.config.joints[joint_name] = updated
-        await actuator.apply_config()
         config_path: Path = getattr(request.app.state, "config_path", _DEFAULT_CONFIG_PATH)
         request.app.state.robot.config.to_json(config_path)
-        await actuator.store_to_flash()
+        # Daemon applies its startup config to device RAM; store_to_flash not available via daemon.
+        await actuator.apply_config()
         return _ok({"applied": True})
+    except DaemonNotSupportedError as exc:
+        return _err(str(exc), 503)
     except Exception as exc:
         return _err(str(exc))
 
@@ -278,15 +278,17 @@ async def position_calibrate(
         })
         actuator.update_config(updated)
         request.app.state.robot.config.joints[joint_name] = updated
-        await actuator.apply_config()
         config_path: Path = getattr(request.app.state, "config_path", _DEFAULT_CONFIG_PATH)
         request.app.state.robot.config.to_json(config_path)
-        await actuator.store_to_flash()
+        # Daemon applies its startup config; store_to_flash not available via daemon.
+        await actuator.apply_config()
         return _ok({
             "position_offset": new_offset,
             "limits_min": body.limits_min,
             "limits_max": body.limits_max,
         })
+    except DaemonNotSupportedError as exc:
+        return _err(str(exc), 503)
     except Exception as exc:
         return _err(str(exc))
 
@@ -299,7 +301,7 @@ async def estop_motor(joint_name: str, request: Request) -> dict | JSONResponse:
     try:
         await actuator.estop()
         return _ok({"joint_name": joint_name, "mode": "DISABLED"})
-    except ActuatorError as exc:
+    except DaemonError as exc:
         return _err(str(exc))
 
 
@@ -311,5 +313,7 @@ async def store_motor_to_flash(joint_name: str, request: Request) -> dict | JSON
     try:
         await actuator.store_to_flash()
         return _ok({"stored": True})
-    except ActuatorError as exc:
+    except DaemonNotSupportedError as exc:
+        return _err(str(exc), 503)
+    except DaemonError as exc:
         return _err(str(exc))
