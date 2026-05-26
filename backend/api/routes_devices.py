@@ -23,10 +23,7 @@ from __future__ import annotations
 import asyncio
 import re
 import subprocess
-import time
 from pathlib import Path
-
-import can
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -208,144 +205,31 @@ async def dismiss_setup(request: Request) -> dict | JSONResponse:
 @router.post("/devices/can/{name}/scan", response_model=None)
 async def scan_bus(name: str, request: Request) -> dict | JSONResponse:
     """
-    Actively ping every CAN ID on a bus (IDs 1-20 plus any expected from config).
-
-    For each ID: sends RECEIVE_PDO_1 with magic byte 0xCA, waits up to 100ms
-    for TRANSMIT_PDO_1 echoing 0xCA back.  Returns which IDs responded, timing,
-    and whether each was expected per the robot config.
+    Active CAN bus scan.
+    Not available while the C++ daemon owns the CAN sockets.
+    Device reachability is visible via GET /devices/can/status (daemon telemetry).
     """
-    if not _SAFE_IFACE.match(name):
-        return _err(f"Invalid interface name: {name!r}")
-
-    if not (_SYSFS_NET / name).exists():
-        return _err(f"Interface {name!r} does not exist", status=404)
-
-    # Build expected-ID → joint_name lookup from loaded config
-    config = getattr(request.app.state, 'config', None)
-    expected: dict[int, str] = {}
-    if config is not None:
-        for joint in config.joints.values():
-            if joint.can_channel == name:
-                expected[joint.can_id] = joint.joint_name
-
-    scan_ids = sorted(set(expected.keys()) | set(range(1, 21)))
-
-    # RECEIVE_PDO_1 = 0x4, TRANSMIT_PDO_1 = 0x3
-    _RECV_PDO1_BASE = 0x4 << 7   # 0x200 — arb_id prefix we send to
-    _XMIT_PDO1_BASE = 0x3 << 7   # 0x180 — arb_id prefix we listen for
-
-    loop = asyncio.get_running_loop()
-
-    def _do_scan() -> list[dict]:
-        try:
-            bus = can.interface.Bus(interface='socketcan', channel=name)
-        except Exception as exc:
-            raise RuntimeError(str(exc))
-
-        results: list[dict] = []
-        try:
-            for device_id in scan_ids:
-                arb_tx = _RECV_PDO1_BASE | device_id
-                arb_rx = _XMIT_PDO1_BASE | device_id
-
-                t0 = time.perf_counter()
-                bus.send(can.Message(
-                    arbitration_id=arb_tx,
-                    is_extended_id=False,
-                    data=b'\xCA',
-                ))
-
-                deadline = time.perf_counter() + 0.1
-                responded = False
-                response_time_ms = None
-                raw_response = None
-
-                while time.perf_counter() < deadline:
-                    remaining = deadline - time.perf_counter()
-                    msg = bus.recv(timeout=max(0.0, remaining))
-                    if msg is None:
-                        break
-                    if msg.is_error_frame:
-                        continue
-                    if msg.arbitration_id == arb_rx and len(msg.data) >= 1 and msg.data[0] == 0xCA:
-                        response_time_ms = round((time.perf_counter() - t0) * 1000, 1)
-                        raw_response = ' '.join(f'{b:02X}' for b in msg.data)
-                        responded = True
-                        break
-                    # Non-matching frame (e.g. autonomous PDO4 broadcasts) — keep waiting
-
-                results.append({
-                    'can_id':          device_id,
-                    'joint_name':      expected.get(device_id),
-                    'expected':        device_id in expected,
-                    'responded':       responded,
-                    'response_time_ms': response_time_ms,
-                    'raw_response':    raw_response,
-                })
-        finally:
-            bus.shutdown()
-        return results
-
-    try:
-        t_start = loop.time()
-        results = await loop.run_in_executor(None, _do_scan)
-        scan_ms = round((loop.time() - t_start) * 1000)
-    except RuntimeError as exc:
-        return _err(str(exc), status=500)
-
-    expected_found    = sum(1 for r in results if r['expected'] and r['responded'])
-    expected_missing  = sum(1 for r in results if r['expected'] and not r['responded'])
-    unexpected_found  = sum(1 for r in results if not r['expected'] and r['responded'])
-
-    return _ok({
-        'bus':              name,
-        'scan_duration_ms': scan_ms,
-        'results':          results,
-        'summary': {
-            'expected_found':   expected_found,
-            'expected_missing': expected_missing,
-            'unexpected_found': unexpected_found,
-        },
-    })
+    return _err(
+        "Active bus scan requires direct CAN access; "
+        "the daemon currently owns all CAN sockets. "
+        "Use GET /devices/can/status to check device reachability.",
+        503,
+    )
 
 
 @router.post("/devices/can/{name}/ping", response_model=None)
 async def ping_bus(name: str) -> dict | JSONResponse:
     """
-    Passively listen on a CAN bus for 2 seconds and return all device IDs that
-    transmitted at least one frame.  Useful to verify an adapter is wired up.
+    Passive CAN bus listen.
+    Not available while the C++ daemon owns the CAN sockets.
+    Device reachability is visible via GET /devices/can/status (daemon telemetry).
     """
-    if not _SAFE_IFACE.match(name):
-        return _err(f"Invalid interface name: {name!r}")
-
-    if not (_SYSFS_NET / name).exists():
-        return _err(f"Interface {name!r} does not exist — assign and bring up first", status=404)
-
-    loop = asyncio.get_running_loop()
-
-    def _listen() -> list[int]:
-        try:
-            bus = can.interface.Bus(interface='socketcan', channel=name)
-        except Exception as exc:
-            raise RuntimeError(str(exc))
-        device_ids: set[int] = set()
-        deadline = time.monotonic() + 2.0
-        try:
-            while time.monotonic() < deadline:
-                remaining = deadline - time.monotonic()
-                msg = bus.recv(timeout=max(0.0, remaining))
-                if msg is None or msg.is_error_frame:
-                    continue
-                device_ids.add(msg.arbitration_id & 0x7F)
-        finally:
-            bus.shutdown()
-        return sorted(device_ids)
-
-    try:
-        device_ids = await loop.run_in_executor(None, _listen)
-        return _ok({"interface": name, "device_ids": device_ids, "count": len(device_ids)})
-    except RuntimeError as exc:
-        return _err(str(exc), status=500)
+    return _err(
+        "Passive bus listen requires direct CAN access; "
+        "the daemon currently owns all CAN sockets. "
+        "Use GET /devices/can/status to check device reachability.",
+        503,
+    )
 
 
 @router.post("/devices/can/{name}/up", response_model=None)
