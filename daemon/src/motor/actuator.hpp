@@ -12,6 +12,8 @@
 #include "motor/recoil_protocol.hpp"
 
 #include <chrono>
+#include <condition_variable>
+#include <limits>
 #include <mutex>
 #include <string>
 
@@ -71,6 +73,12 @@ public:
     // Returns false if any write fails or times out.
     bool apply_config(CanBusManager& bus, int timeout_ms = 500);
 
+    // Send FUNC_FLASH store command; blocks ~150 ms for flash write to complete.
+    void store_to_flash(CanBusManager& bus);
+
+    // Blocking SDO read for a single parameter. Returns NaN on timeout.
+    float read_config_param(CanBusManager& bus, uint16_t param, int timeout_ms = 300);
+
 private:
     // Build and send one PDO2. pos is display-frame; conversion to wire applied here.
     void send_pdo2(CanBusManager& bus, float display_pos, float vel_ff = 0.0f);
@@ -93,4 +101,14 @@ private:
 
     std::chrono::steady_clock::time_point last_heartbeat_sent_{};
     std::chrono::steady_clock::time_point last_pdo4_received_{};
+
+    // Slow-poll counter for periodic SDO telemetry reads (bus_voltage, current, torque).
+    uint32_t slow_poll_counter_ = 0;
+
+    // SDO read response mailbox: on_rx_frame() writes here; read_config_param() waits.
+    std::mutex              sdo_rx_mutex_;
+    std::condition_variable sdo_rx_cv_;
+    bool                    sdo_rx_ready_  = false;
+    uint16_t                sdo_rx_param_  = 0;
+    float                   sdo_rx_value_  = 0.0f;
 };

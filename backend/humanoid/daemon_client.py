@@ -194,10 +194,8 @@ class DaemonActuatorProxy:
         )
 
     async def store_to_flash(self) -> None:
-        raise DaemonNotSupportedError(
-            "store_to_flash requires direct CAN access; "
-            "the daemon owns the bus — stop the daemon first"
-        )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._client.store_joint_to_flash, self._name)
 
     async def load_from_flash(self) -> None:
         raise DaemonNotSupportedError(
@@ -206,10 +204,8 @@ class DaemonActuatorProxy:
         )
 
     async def read_config_from_device(self) -> dict:
-        raise DaemonNotSupportedError(
-            "read_config_from_device requires direct CAN access; "
-            "the daemon owns the bus — stop the daemon first"
-        )
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._client.read_device_config, self._name)
 
     def __repr__(self) -> str:
         return f"DaemonActuatorProxy(name={self._name!r}, can_id={self._can_id})"
@@ -437,6 +433,15 @@ class DaemonClient:
 
     def apply_all_configs(self) -> None:
         self._send_command({"type": "APPLY_ALL_CONFIGS"})
+
+    def store_joint_to_flash(self, joint_name: str) -> None:
+        self._send_command({"type": "STORE_TO_FLASH", "joint_name": joint_name})
+
+    def read_device_config(self, joint_name: str) -> dict:
+        resp = self._send_command({"type": "READ_CONFIG", "joint_name": joint_name})
+        if resp.get("type") != "CONFIG":
+            raise DaemonError(f"READ_CONFIG failed: {resp}")
+        return resp.get("config", {})
 
     def daemon_shutdown(self) -> None:
         """Ask the daemon to shut itself down gracefully."""

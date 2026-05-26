@@ -1,5 +1,6 @@
 #include "control/robot.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
@@ -322,6 +323,58 @@ std::string Robot::handle_command(const std::string& request) {
                 fprintf(stderr, "[Robot] apply_config failed for %s\n", a->name().c_str());
         }
         return ack();
+    }
+
+    if (type == "STORE_TO_FLASH") {
+        std::string name = req.value("joint_name", "");
+        auto it = actuator_by_name_.find(name);
+        if (it == actuator_by_name_.end()) return error("unknown joint: " + name);
+        it->second->store_to_flash(*bus_mgr_);
+        return ack();
+    }
+
+    if (type == "READ_CONFIG") {
+        std::string name = req.value("joint_name", "");
+        auto it = actuator_by_name_.find(name);
+        if (it == actuator_by_name_.end()) return error("unknown joint: " + name);
+
+        using P = ParamId;
+        static const std::vector<std::pair<std::string, uint16_t>> PARAMS = {
+            {"gear_ratio",               static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_GEAR_RATIO)},
+            {"position_kp",              static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_KP)},
+            {"position_ki",              static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_KI)},
+            {"velocity_kp",              static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_KP)},
+            {"velocity_ki",              static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_KI)},
+            {"torque_limit",             static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_LIMIT)},
+            {"velocity_limit",           static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_LIMIT)},
+            {"position_limit_lower",     static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_LOWER)},
+            {"position_limit_upper",     static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_UPPER)},
+            {"position_offset",          static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_OFFSET)},
+            {"torque_filter_alpha",      static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_FILTER_ALPHA)},
+            {"current_limit",            static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_LIMIT)},
+            {"current_kp",               static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_KP)},
+            {"current_ki",               static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_KI)},
+            {"undervoltage_threshold",   static_cast<uint16_t>(P::PARAM_POWERSTAGE_UNDERVOLTAGE_THRESHOLD)},
+            {"overvoltage_threshold",    static_cast<uint16_t>(P::PARAM_POWERSTAGE_OVERVOLTAGE_THRESHOLD)},
+            {"bus_voltage_filter_alpha", static_cast<uint16_t>(P::PARAM_POWERSTAGE_BUS_VOLTAGE_FILTER_ALPHA)},
+            {"torque_constant",          static_cast<uint16_t>(P::PARAM_MOTOR_TORQUE_CONSTANT)},
+            {"encoder_position_offset",  static_cast<uint16_t>(P::PARAM_ENCODER_POSITION_OFFSET)},
+            {"velocity_filter_alpha",    static_cast<uint16_t>(P::PARAM_ENCODER_VELOCITY_FILTER_ALPHA)},
+            {"electrical_offset",        static_cast<uint16_t>(P::PARAM_ENCODER_FLUX_OFFSET)},
+            {"fast_frame_frequency",     static_cast<uint16_t>(P::PARAM_FAST_FRAME_FREQUENCY)},
+            {"watchdog_timeout",         static_cast<uint16_t>(P::PARAM_WATCHDOG_TIMEOUT)},
+        };
+
+        nlohmann::json cfg_j;
+        for (auto& [key, param_id] : PARAMS) {
+            float v = it->second->read_config_param(*bus_mgr_, param_id, 300);
+            cfg_j[key] = std::isnan(v) ? nlohmann::json(nullptr) : nlohmann::json(v);
+        }
+        nlohmann::json resp;
+        resp["type"]   = "CONFIG";
+        resp["id"]     = req.value("id", 0);
+        resp["config"] = cfg_j;
+        return resp.dump();
     }
 
     if (type == "SHUTDOWN") {

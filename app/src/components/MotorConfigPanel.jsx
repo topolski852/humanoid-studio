@@ -146,9 +146,23 @@ export default function MotorConfigPanel({ jointName, onLogError }) {
       await api.applyMotorConfig(jointName, mergedConfig)
       setStatusMsg({ type: 'ok', text: 'Applied — pulling updated values…' })
       await pullBoth(true)
-      setStatusMsg({ type: 'ok', text: 'Applied to ESC, saved config, stored to flash.' })
+      setStatusMsg({ type: 'ok', text: 'Applied to ESC RAM and saved config.' })
     } catch (e) {
       const msg = `Apply failed: ${e.message}`
+      setStatusMsg({ type: 'err', text: msg })
+      onLogError?.(msg, 'Tune')
+    }
+    setApplying(false)
+  }
+
+  async function storeToFlash() {
+    setApplying(true)
+    setStatusMsg(null)
+    try {
+      await api.storeMotorToFlash(jointName)
+      setStatusMsg({ type: 'ok', text: 'Config stored to ESC flash.' })
+    } catch (e) {
+      const msg = `Store failed: ${e.message}`
       setStatusMsg({ type: 'err', text: msg })
       onLogError?.(msg, 'Tune')
     }
@@ -200,6 +214,14 @@ export default function MotorConfigPanel({ jointName, onLogError }) {
                 border border-accent/30 hover:bg-accent/30 disabled:opacity-40 transition-colors"
             >
               {applying ? 'Applying…' : 'Apply'}
+            </button>
+            <button
+              onClick={storeToFlash}
+              disabled={applying}
+              className="w-full py-1.5 rounded-lg text-xs font-medium bg-surface-2 text-gray-300
+                border border-surface-3 hover:border-accent/40 hover:text-accent disabled:opacity-40 transition-colors"
+            >
+              Store to Flash
             </button>
           </>
         )}

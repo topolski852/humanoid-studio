@@ -93,14 +93,43 @@ void Actuator::on_rx_frame(const can_frame& frame) {
         }
 
     } else if (func == static_cast<int>(FuncCode::FUNC_TRANSMIT_SDO)) {  // NOLINT
-        // PDO2 response: bytes 0-3 = wire position, bytes 4-7 = velocity.
-        // Also used as SDO read response and SDO write ACK (0x60).
+        // Carries: SDO write ACK (0x60), SDO read response (0x43), or PDO2 pos+vel.
         if (frame.can_dlc >= 1 && frame.data[0] == SDO_WRITE_ACK) {
             // ACK for an SDO write — no state update needed; apply_config handles this.
             return;
         }
+        if (frame.can_dlc >= 8 && frame.data[0] == 0x43) {
+            // SDO read response: byte0=0x43, bytes1-2=param_id LE, bytes4-7=value.
+            uint16_t param_id;
+            memcpy(&param_id, frame.data + 1, 2);
+            float value;
+            memcpy(&value, frame.data + 4, 4);
+            using P = ParamId;
+            switch (static_cast<P>(param_id)) {
+                case P::PARAM_POWERSTAGE_BUS_VOLTAGE_MEASURED:
+                    state_.bus_voltage = (value >= 0.0f && value < 100.0f) ? value : -1.0f;
+                    break;
+                case P::PARAM_CURRENT_CONTROLLER_I_Q_MEASURED:
+                    state_.current = value;
+                    break;
+                case P::PARAM_POSITION_CONTROLLER_TORQUE_MEASURED:
+                    state_.torque = value;
+                    break;
+                default:
+                    // Config-read response — wake read_config_param() if it's waiting.
+                    {
+                        std::lock_guard<std::mutex> mlk(sdo_rx_mutex_);
+                        sdo_rx_param_ = param_id;
+                        sdo_rx_value_ = value;
+                        sdo_rx_ready_ = true;
+                    }
+                    sdo_rx_cv_.notify_one();
+                    break;
+            }
+            return;
+        }
         if (frame.can_dlc >= 8) {
-            // PDO2 response: position + velocity.
+            // PDO2 response: position + velocity (first byte is float, not 0x43/0x60).
             float wire_pos = get_f32(frame.data);
             float vel      = get_f32(frame.data + 4);
             state_.position = wire_pos;
@@ -112,6 +141,19 @@ void Actuator::on_rx_frame(const can_frame& frame) {
 }
 
 // ── Control loop tick ───────────────────────────────────────────────────────
+
+static void send_sdo_read(CanBusManager& bus, const std::string& channel,
+                           uint8_t device_id, uint16_t param)
+{
+    can_frame f{};
+    f.can_id  = make_arb_id(static_cast<uint8_t>(FuncCode::FUNC_RECEIVE_SDO), device_id);
+    f.can_dlc = 8;
+    f.data[0] = SDO_CMD_READ;       // 0x40
+    f.data[1] = static_cast<uint8_t>(param & 0xFF);
+    f.data[2] = static_cast<uint8_t>((param >> 8) & 0xFF);
+    // bytes 3-7 stay 0
+    bus.send(channel, f);
+}
 
 void Actuator::send_pdo2(CanBusManager& bus, float display_pos, float vel_ff) {
     can_frame frame{};
@@ -198,6 +240,28 @@ void Actuator::tick(CanBusManager& bus) {
         }
     }
     // OFFLINE, CALIBRATING, FAULT: no outbound frames from tick().
+
+    // Slow-poll telemetry via SDO reads (~3 Hz per field, one per 60 ticks at 200 Hz).
+    if (current_state == JointState::ENABLED || current_state == JointState::IDLE) {
+        using P = ParamId;
+        slow_poll_counter_++;
+        switch (slow_poll_counter_ % 60) {
+            case 0:
+                send_sdo_read(bus, cfg_.can_channel, cfg_.device_id,
+                    static_cast<uint16_t>(P::PARAM_POWERSTAGE_BUS_VOLTAGE_MEASURED));
+                break;
+            case 20:
+                send_sdo_read(bus, cfg_.can_channel, cfg_.device_id,
+                    static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_Q_MEASURED));
+                break;
+            case 40:
+                send_sdo_read(bus, cfg_.can_channel, cfg_.device_id,
+                    static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_MEASURED));
+                break;
+            default:
+                break;
+        }
+    }
 }
 
 // ── Setters (UDP thread) ────────────────────────────────────────────────────
@@ -356,4 +420,32 @@ bool Actuator::apply_config(CanBusManager& bus, int timeout_ms) {
 
     fprintf(stderr, "[Actuator] Config applied: %s (id=%d)\n", cfg_.name.c_str(), d);
     return true;
+}
+
+// ── store_to_flash ───────────────────────────────────────────────────────────
+
+void Actuator::store_to_flash(CanBusManager& bus) {
+    can_frame f{};
+    f.can_id  = make_arb_id(static_cast<uint8_t>(FuncCode::FUNC_FLASH),
+                             static_cast<uint8_t>(cfg_.device_id));
+    f.can_dlc = 1;
+    f.data[0] = 0x01;  // store to flash
+    bus.send(cfg_.can_channel, f);
+    // Flash write takes up to ~100 ms; sleep before returning so caller can rely on completion.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    fprintf(stderr, "[Actuator] Stored to flash: %s\n", cfg_.name.c_str());
+}
+
+// ── read_config_param ────────────────────────────────────────────────────────
+
+float Actuator::read_config_param(CanBusManager& bus, uint16_t param, int timeout_ms) {
+    {
+        std::lock_guard<std::mutex> lk(sdo_rx_mutex_);
+        sdo_rx_ready_ = false;
+    }
+    send_sdo_read(bus, cfg_.can_channel, cfg_.device_id, param);
+    std::unique_lock<std::mutex> lk(sdo_rx_mutex_);
+    bool ok = sdo_rx_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+        [this, param]{ return sdo_rx_ready_ && sdo_rx_param_ == param; });
+    return ok ? sdo_rx_value_ : std::numeric_limits<float>::quiet_NaN();
 }
