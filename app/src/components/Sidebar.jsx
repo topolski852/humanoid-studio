@@ -55,6 +55,14 @@ function SettingsIcon() {
   )
 }
 
+function PowerIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5.636 5.636a9 9 0 1012.728 0M12 3v9" />
+    </svg>
+  )
+}
+
 // ── Nav link ──────────────────────────────────────────────────────────────────
 function SidebarLink({ to, icon, label }) {
   return (
@@ -168,9 +176,16 @@ export default function Sidebar() {
         <SidebarLink to="/robot-config" icon={<ConfigIcon />} label="Robot Config" />
       </nav>
 
-      {/* ── Settings ── */}
-      <div className="px-2 py-3 border-t border-surface-3">
+      {/* ── Settings + Quit ── */}
+      <div className="px-2 py-3 border-t border-surface-3 space-y-0.5">
         <SidebarLink to="/settings" icon={<SettingsIcon />} label="Settings" />
+        <button
+          onClick={() => window.electron?.quit()}
+          className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-400 hover:text-red-400 hover:bg-red-400/10 transition-colors"
+        >
+          <PowerIcon />
+          Quit App
+        </button>
       </div>
     </aside>
   )

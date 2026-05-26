@@ -107,6 +107,21 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    # Bring all CAN interfaces DOWN on clean exit so the next session starts fresh.
+    if config is not None:
+        channels = sorted({jc.can_channel for jc in config.joints.values()})
+        for ch in channels:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    '/sbin/ip', 'link', 'set', ch, 'down',
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+                _log.info("CAN interface %s set DOWN", ch)
+            except Exception:
+                pass
+
     await client.stop()
 
 

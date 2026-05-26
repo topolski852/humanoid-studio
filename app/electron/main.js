@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, shell, session } = require('electron')
+const { app, BrowserWindow, dialog, shell, session, ipcMain } = require('electron')
 const path = require('path')
 const { spawn } = require('child_process')
 const http = require('http')
@@ -263,6 +263,8 @@ app.whenReady().then(async () => {
       }
     )
   }
+
+  ipcMain.on('app-quit', () => app.quit())
 
   try {
     console.log('[main] Starting C++ daemon from', DAEMON_BINARY)

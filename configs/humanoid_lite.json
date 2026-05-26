@@ -1,6 +1,9 @@
 {
   "robot_name": "humanoid_lite",
   "telemetry_hz": 10,
+  "can_assignments": {
+    "0032004A5043570120323339": "left_leg"
+  },
   "joints": {
     "left_hip_roll_joint": {
       "joint_name": "left_hip_roll_joint",
@@ -8,7 +11,7 @@
       "can_channel": "can_left_leg",
       "can_id": 1,
       "phase_inverted": false,
-      "electrical_offset": -3.562267780303955,
+      "electrical_offset": -16.146448135375977,
       "gear_ratio": 15.0,
       "position_limits": {
         "min": -0.17453292519943295,
@@ -772,8 +775,5 @@
       "watchdog_timeout": 1000,
       "fast_frame_frequency": 100
     }
-  },
-  "can_assignments": {
-    "0032004A5043570120323339": "left_leg"
   }
 }

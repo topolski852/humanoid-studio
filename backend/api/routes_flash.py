@@ -31,6 +31,29 @@ _DEFAULT_FIRMWARE_DIR = (
 )
 
 
+async def _bounce_can_interface(channel: str) -> None:
+    """Bring the CAN interface down then up to flush the kernel TX queue."""
+    async def _run(cmd: list[str]) -> None:
+        p = await asyncio.create_subprocess_exec(
+            'sudo', '-n', *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(p.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    await _run(['/sbin/ip', 'link', 'set', channel, 'down'])
+    await asyncio.sleep(0.1)
+    await _run(['/sbin/ip', 'link', 'set', channel, 'type', 'can', 'bitrate', '1000000'])
+    await _run(['/sbin/ip', 'link', 'set', channel, 'txqueuelen', '1000'])
+    await _run(['/sbin/ip', 'link', 'set', channel, 'up'])
+
+
 def _ok(data: object) -> dict:
     return {"success": True, "data": data, "error": None}
 
@@ -144,13 +167,18 @@ async def flash_can_connected(request: Request) -> dict | JSONResponse:
     """Frontend calls this when user confirms motor + CAN + encoder are connected."""
     flash_manager = request.app.state.flash_manager
 
-    # The daemon's 200 Hz control loop fills the shared SocketCAN TX queue (txqueuelen=10),
-    # leaving no room for the flash wizard's socket.  Shut the daemon down before the flash
-    # wizard opens its own CAN socket.  The user reconnects from the sidebar after flashing.
+    # Shut the daemon down before the flash wizard opens its own CAN socket.
+    # The daemon ACKs SHUTDOWN immediately but stops asynchronously, so we
+    # wait 0.3 s then bounce the interface to flush any pending kernel TX frames.
     client: DaemonClient | None = request.app.state.can_monitor
     if client is not None and client.is_running():
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, client.daemon_shutdown)
+        await asyncio.sleep(0.3)
+
+    channel = flash_manager.current_channel
+    if channel:
+        await _bounce_can_interface(channel)
 
     try:
         await flash_manager.can_connected()
