@@ -1656,11 +1656,93 @@ Run on dev machine (no CAN hardware):
 
 ### Next Steps (Phase 4 — Python Migration)
 
-1. Implement `backend/humanoid/daemon_client.py` — async UDP client mirroring `Robot`/`Actuator` public API
-2. Implement `backend/humanoid/daemon_process.py` — subprocess lifecycle manager
-3. Modify `backend/main.py` lifespan to spawn daemon and use `DaemonClient`
-4. Update all API routes to use `DaemonClient` instead of `Robot`/`Actuator`
-5. Update WebSocket telemetry endpoint to consume daemon telemetry push stream
-6. Delete `can_bus.py`, `actuator.py`, `robot.py`, `can_monitor.py`, `recoil_protocol.py`
-7. Remove `python-can` from `requirements.txt`
+**Phase 4 is complete as of Session 6 (2026-05-26). See below.**
+
+---
+
+## Session 6: Python Backend Migration to DaemonClient (2026-05-26)
+
+**What changed:** All FastAPI routes now communicate with the C++ daemon via UDP. Python no longer opens any CAN sockets directly (except `flash.py` for the flash wizard, which stops the daemon first).
+
+### Architecture After Migration
+
+```
+Electron → startDaemon() → humanoid_daemon (port 9001 cmd, port 9000 tel)
+Electron → startBackend() → FastAPI on :8765
+FastAPI → DaemonClient → daemon UDP
+Flash Wizard → daemon_shutdown() → flash.py opens own CAN socket → restart daemon via Electron
+```
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `backend/humanoid/daemon_client.py` | **NEW** — sole Python ↔ daemon UDP interface. Replaces Robot + CanMonitor. |
+| `backend/main.py` | DaemonClient replaces Robot + CanMonitor in lifespan |
+| `backend/api/routes_motors.py` | Uses DaemonActuatorProxy; unsupported ops return 503 |
+| `backend/api/routes_devices.py` | `import can` removed; scan/ping return 503 (daemon owns bus) |
+| `backend/api/routes_robot.py` | PUT /robot/config updates DaemonClient in-place |
+| `backend/api/routes_flash.py` | Calls `daemon_shutdown()` before flash wizard opens CAN socket |
+| `backend/humanoid/__init__.py` | Replaced `Robot` export with `DaemonClient` |
+| `app/electron/main.js` | `startDaemon()` spawns daemon; SIGTERM on quit |
+
+### Files Deleted
+
+| File | Reason |
+|---|---|
+| `backend/humanoid/robot.py` | All functionality replaced by DaemonClient |
+| `backend/humanoid/can_monitor.py` | Bus health now comes from daemon telemetry |
+
+### Files Kept (still used by flash.py)
+
+| File | Why kept |
+|---|---|
+| `backend/humanoid/can_bus.py` | `flash.py` imports CANBus + Parameter for calibration |
+| `backend/humanoid/actuator.py` | `flash.py` imports Actuator; also provides ActuatorState used by DaemonClient |
+| `requirements.txt` python-can | `can_bus.py` (used by flash.py) depends on it |
+
+### Endpoint Behavior Changes
+
+| Endpoint | Before | After |
+|---|---|---|
+| POST /motors/{j}/calibrate | 90s SDO calibration | 503 (daemon owns bus) |
+| GET /motors/{j}/config_from_device | SDO reads all params | 503 (daemon owns bus) |
+| POST /motors/{j}/store_to_flash | SDO flash persist | 503 (daemon owns bus) |
+| POST /motors/{j}/position_offset | SDO write immediately | Updates JSON only (device sees it after daemon restart or APPLY_CONFIG) |
+| POST /devices/can/{name}/scan | Active python-can scan | 503 (daemon owns bus) |
+| POST /devices/can/{name}/ping | Passive python-can listen | 503 (daemon owns bus) |
+| POST /motors/{j}/estop | NMT MODE_DISABLED | NMT MODE_IDLE (daemon maps DISABLED→IDLE) |
+| All other motor/robot/telemetry endpoints | Direct CAN | Via daemon UDP |
+
+### Known Limitations
+
+- `calibrate_offset`, `store_to_flash`, `read_config_from_device` require direct CAN access and are not available while daemon runs. The flash wizard workflow (which stops the daemon) is the path for reflashing and re-calibrating.
+- `set_position` no longer returns measured feedback (`position_measured`, `velocity_measured`). The daemon ACKs without echoing sensor data. Control WS ack messages will lack these optional fields.
+- Position offset changes (`POST /motors/{j}/position_offset`) are saved to JSON but take effect only after daemon restart or `POST /robot/connect` (which triggers APPLY_ALL_CONFIGS).
+
+### Startup Sequence
+
+```
+Electron main.js:
+  1. startDaemon() → spawns daemon/build/humanoid_daemon --config --rt-prio 0
+     → polls PING on :9001 (500ms intervals, 20 attempts = 10s max)
+  2. startBackend() → spawns python3 main.py
+     → polls GET /devices on :8765 (500ms intervals, 40 attempts = 20s max)
+  3. createWindow()
+
+On quit (before-quit):
+  → SIGTERM → backend → (3s SIGKILL if needed)
+  → SIGTERM → daemon  → (3s SIGKILL if needed)
+```
+
+### Testing Verified (2026-05-26)
+
+- Daemon starts, loads 22 joints, responds to PING ✓
+- DaemonClient `is_running()` = True after receiving telemetry ✓
+- `get_all_states()` returns 22 joints with real state from daemon ✓
+- `get_interface_stats()` returns 4 buses from daemon bus_health ✓
+- `GET /robot/config` → 22 joints ✓
+- `GET /devices/can/status` → 4 interfaces from daemon telemetry ✓
+- `GET /motors/left_ankle_pitch_joint` → state DISABLED (joint OFFLINE, no CAN) ✓
+- Backend startup/shutdown clean ✓
 
