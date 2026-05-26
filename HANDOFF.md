@@ -1817,3 +1817,106 @@ modifying daemon/src/.
 - Flash wizard daemon_shutdown → flash → reconnect (requires ST-LINK + motor)
 - Right leg, both arms (CAN interfaces not available in test environment)
 
+
+---
+
+## Session E: Cleanup and Wiki Update (2026-05-26)
+
+**Goal:** Dead code removal, dependency audit, CAN Monitor verification, wiki update,
+final state verification.
+
+### Step 1 — Dead code cleanup
+
+Removed stale python-can-era re-exports from `backend/humanoid/__init__.py`.
+These symbols (`CANBus`, `CANFrame`, `Function`, `Mode`, `ErrorCode`, `Parameter`,
+`Actuator`, `ActuatorState`, `ActuatorError`, `ActuatorTimeoutError`,
+`ActuatorCalibrationError`) were in `__all__` and re-exported at the package level,
+but nothing imports them via `from humanoid import X`. All callers use direct module
+imports (`from humanoid.can_bus import Mode`, `from humanoid.actuator import ActuatorState`).
+The files themselves are kept — flash.py still needs them.
+
+**Commit:** `cleanup: remove dead python-can-era exports from __init__.py`
+
+### Step 2 — Dependency audit
+
+All five `requirements.txt` entries are legitimately used:
+- `fastapi` / `uvicorn` / `pydantic` / `websockets`: normal app operation
+- `python-can` (`import can` in `can_bus.py`): retained for flash.py only
+
+All frontend `package.json` dependencies are used (recharts, react-router-dom, @fontsource/*).
+
+No removals made.
+
+### Step 3 — CAN Monitor verification
+
+`get_interface_stats()` returns `[]` when daemon has sent no telemetry, which is the
+correct graceful-degradation behaviour. The CanMonitor.jsx handles an empty interfaces
+array with a "No interfaces" placeholder. No changes needed.
+
+### Steps 4–5 — Hardware tests
+
+Hardware not available in this session. Documented as skipped.
+
+### Step 6 — Wiki update
+
+Updated four wiki files to reflect the daemon architecture:
+
+**Codebase-Architecture.md** — major rewrite:
+- Repository structure now includes `daemon/` directory
+- Added "Process architecture" section with three-process diagram (Electron → daemon → Python)
+- Backend architecture section now describes DaemonClient, flash CAN bypass pattern
+- Added C++ daemon architecture section (threading model, actuator state machine)
+- Data flow now shows daemon control loop → telemetry push → DaemonClient → WS broadcast
+
+**Installation.md:**
+- Added cmake/build-essential to prerequisites
+- Added daemon build section (cmake, make, optional setcap for RT scheduling)
+- Updated dev-mode instructions to show Electron spawns daemon automatically
+- Added VS Code ELECTRON_RUN_AS_NODE note
+- Added daemon PING to verify steps
+
+**Troubleshooting.md:**
+- Added "Daemon fails to start" section before backend section
+- Replaced Python asyncio watchdog entry with daemon watchdog entry
+- Added "CAN Monitor shows all buses as UNKNOWN" entry
+
+**Roadmap.md:**
+- CAN communication bullet updated to describe daemon architecture
+- Phase 2 notes daemon makes 22-joint concurrency safe
+- Phase 4 notes policy runner can talk to daemon directly (bypass HTTP)
+
+**Commit:** `docs: update wiki for C++ daemon architecture`
+
+### Step 7 — Final state verification
+
+- All Python files parse without syntax errors (verified via ast.parse)
+- Daemon binary present at `daemon/build/humanoid_daemon` (346K, Release)
+- No orphaned `from humanoid import Robot/CanMonitor/Mode` etc. anywhere
+- `app.state.robot` and `app.state.can_monitor` both point to DaemonClient (expected)
+- `git status` clean, working tree matches origin/main
+
+### Final architecture state
+
+```
+Process ownership:
+  humanoid_daemon  — all 4 SocketCAN interfaces; 200 Hz SCHED_FIFO control loop
+  python/main.py   — FastAPI 8765; WebSocket telemetry; REST API; flash wizard
+  Electron         — window; spawns both children; SIGTERM on quit
+
+Python CAN files retained (flash.py only):
+  can_bus.py, actuator.py  — opened by flash.py after daemon_shutdown()
+  python-can package        — required for the above
+
+Python CAN files removed from public API (__init__.py):
+  CANBus, CANFrame, Function, Mode, ErrorCode, Parameter (can_bus.py symbols)
+  Actuator, ActuatorState, ActuatorError, etc. (actuator.py symbols)
+
+No python-can imports anywhere except can_bus.py (single `import can` line).
+```
+
+### Session E commits
+
+| Hash | Message |
+|---|---|
+| 9e2860a | cleanup: remove dead python-can-era exports from __init__.py |
+| a966995 | docs: update wiki for C++ daemon architecture |
