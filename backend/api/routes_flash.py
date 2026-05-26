@@ -12,6 +12,7 @@ POST /flash/reset              — force state back to IDLE, cancels any in-prog
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, Request
@@ -19,6 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from humanoid.flash import FlashConfig, FlashError, MOTOR_PROFILES
+from humanoid.daemon_client import DaemonClient
 
 router = APIRouter(tags=["flash"])
 
@@ -142,13 +144,13 @@ async def flash_can_connected(request: Request) -> dict | JSONResponse:
     """Frontend calls this when user confirms motor + CAN + encoder are connected."""
     flash_manager = request.app.state.flash_manager
 
-    # The robot's telemetry loop hammers the shared SocketCAN TX queue (txqueuelen=10)
-    # with ~30 SDO frames/cycle, leaving no room for the flash wizard's socket.
-    # Disconnect the robot before the flash wizard opens its own socket so the queue
-    # is free. The user will reconnect from the sidebar after flashing completes.
-    robot = request.app.state.robot
-    if robot and robot.is_connected():
-        await robot.disconnect()
+    # The daemon's 200 Hz control loop fills the shared SocketCAN TX queue (txqueuelen=10),
+    # leaving no room for the flash wizard's socket.  Shut the daemon down before the flash
+    # wizard opens its own CAN socket.  The user reconnects from the sidebar after flashing.
+    client: DaemonClient | None = request.app.state.can_monitor
+    if client is not None and client.is_running():
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, client.daemon_shutdown)
 
     try:
         await flash_manager.can_connected()
