@@ -6,6 +6,32 @@ Organized by symptom. Every issue listed here was encountered during actual deve
 
 ## App won't start
 
+### Daemon fails to start
+
+Electron spawns the daemon before the Python backend. If the daemon binary is missing or fails, Electron will report "Failed to Start Backend" even though Python is fine.
+
+1. **Daemon not built:** Build it first:
+   ```bash
+   cd humanoid-studio/daemon
+   mkdir -p build && cd build
+   cmake .. -DCMAKE_BUILD_TYPE=Release
+   make -j$(nproc)
+   ```
+
+2. **Daemon binary not found:** Electron looks for `daemon/build/humanoid_daemon` relative to the project root. Confirm:
+   ```bash
+   ls -lh humanoid-studio/daemon/build/humanoid_daemon
+   ```
+
+3. **Daemon ports already in use:** A previous daemon did not exit cleanly. Free the ports:
+   ```bash
+   pkill -9 humanoid_daemon 2>/dev/null
+   fuser -k 9000/udp 2>/dev/null
+   fuser -k 9001/udp 2>/dev/null
+   ```
+
+4. **SocketCAN interfaces not up:** The daemon tries to open the CAN interfaces listed in `humanoid_lite.json`. Missing interfaces are logged as warnings and those joints are marked OFFLINE — the daemon still starts. If the daemon exits immediately, check its stderr output for a fatal error (e.g., invalid config JSON).
+
 ### Backend fails to start — "Failed to Start Backend"
 
 The Electron window shows an error dialog saying the backend failed to start. Check:
@@ -20,7 +46,7 @@ The Electron window shows an error dialog saying the backend failed to start. Ch
 2. **Missing Python dependencies:** The backend imports `fastapi`, `uvicorn`, `can`, `pydantic`, and `websockets`. A missing package causes the process to exit immediately with a traceback. Install:
    ```bash
    cd humanoid-studio/backend
-   pip install fastapi "uvicorn[standard]" python-can "pydantic>=2.7.0" websockets
+   pip install -r requirements.txt
    ```
 
 3. **Port 8765 already in use:** A previous backend process did not exit cleanly and is still holding the port. Find and kill it:
@@ -137,11 +163,19 @@ Reassign it: open the CAN Setup page, click Unassign, then Assign with the corre
 
 The firmware safety watchdog timer has a 1000 ms timeout. If no PDO2 command or HEARTBEAT frame arrives within 1 second, the firmware transitions the motor to DAMPING mode and sets the `WATCHDOG_TIMEOUT` error bit.
 
-The backend feeds the watchdog automatically at 5 Hz (every 200 ms) via a background asyncio task that runs regardless of whether any WebSocket client is connected. If you are seeing watchdog timeouts:
+The **daemon** feeds the watchdog at 5 Hz (every 200 ms) from its 200 Hz control loop. It sends HEARTBEAT frames for all IDLE joints and PDO2 commands for all ENABLED joints. If you are seeing watchdog timeouts:
 
-1. **Backend not running:** Make sure `python3 main.py` is running in the backend directory.
-2. **Robot not connected:** The watchdog task only runs when the robot is connected. Click Connect in the sidebar.
-3. **Bus errors interrupting heartbeat:** If the CAN bus is in a bad state, HEARTBEAT frames may not be delivered. Check the CAN Monitor for error counts.
+1. **Daemon not running:** Check with `pgrep humanoid_daemon`. If it is not running, start the app or spawn the daemon manually.
+2. **Robot not connected:** The daemon feeds the watchdog for joints in IDLE or ENABLED state. Joints remain OFFLINE until a HEARTBEAT is received from the ESC, which requires the motor to be powered. Click Connect in the sidebar to trigger `apply_config` and move joints from OFFLINE to IDLE.
+3. **Bus errors interrupting heartbeat:** If the CAN bus is in a bad state, HEARTBEAT frames may not be delivered. Check the CAN Monitor for error counts or run `candump can_left_leg` to confirm daemon traffic is visible.
+
+### CAN Monitor shows all buses as UNKNOWN or grey
+
+The CAN Monitor reads bus health from daemon telemetry. If the daemon has not sent any telemetry yet (e.g., robot not connected), `get_interface_stats()` returns an empty list and the monitor shows "No interfaces".
+
+1. **Daemon not running:** Check `pgrep humanoid_daemon`. Restart the app if the daemon is not present.
+2. **Telemetry not flowing:** The daemon pushes telemetry at 10 Hz. If no `TELEMETRY` messages arrive on port 9000, check whether the daemon is in a fault state (run it manually from a terminal to see its stderr).
+3. **Config not applied:** Connect the robot via the sidebar to trigger `APPLY_ALL_CONFIGS`, which causes the daemon to begin cycling the state machines and sending telemetry even for unpowered joints.
 
 ### Random garbage error values (historical — now fixed)
 

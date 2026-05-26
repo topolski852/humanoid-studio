@@ -8,11 +8,11 @@ This page describes the current state of the project, what is actively being wor
 
 These features are functional and have been tested with physical hardware.
 
-**CAN communication**
-- All four SocketCAN buses (`can_left_leg`, `can_right_leg`, `can_left_arm`, `can_right_arm`) open and receive traffic
-- CAN Monitor displays live message rates, per-ID traffic tables, and drop log
-- Per-device SDO lock prevents the race condition that caused garbage error values in concurrent reads
-- HEARTBEAT watchdog feeding at 5 Hz keeps motors alive without a WebSocket client
+**CAN communication — C++ daemon architecture**
+- All four SocketCAN buses (`can_left_leg`, `can_right_leg`, `can_left_arm`, `can_right_arm`) owned by `humanoid_daemon`; 200 Hz control loop; SCHED_FIFO real-time scheduling
+- CAN Monitor displays bus state, joints per bus, online/total counts from daemon telemetry
+- HEARTBEAT watchdog feeding at 5 Hz from daemon control loop (independent of Python GC and asyncio)
+- Python backend is a thin UDP proxy; no CAN sockets opened by Python during normal operation
 
 **Motor control — left leg**
 - All six left leg joints connect, respond to SDO reads, and report telemetry at 20 Hz
@@ -62,13 +62,13 @@ All joints except `left_hip_roll_joint` show `null` position limits in the confi
 
 ## Phase 2 — multi-limb operation
 
-Phase 2 covers extending reliable single-joint operation to all 22 joints simultaneously.
+Phase 2 covers extending reliable single-joint operation to all 22 joints simultaneously. The daemon architecture makes concurrent 22-joint operation safe — the control loop handles all joints in parallel; the bottleneck is no longer Python.
 
 **Multi-motor position control**
 
-The backend already supports concurrent operations across different joints (per-device SDO lock). The missing piece is a frontend control surface for commanding multiple joints at once. Planned additions:
+The daemon supports concurrent `SET_POSITION` for all 22 joints. The missing piece is a frontend control surface for commanding multiple joints at once. Planned additions:
 - Limb enable/disable: single button to enable or idle all joints on one CAN bus
-- Hold position: command all joints to hold their current position (read position, send it back as target)
+- Hold position: command all joints to hold their current position
 - Joint group presets: save and recall positions for common poses (e.g., stand, crouch, zero)
 
 **Full arm calibration**
@@ -113,18 +113,20 @@ The 3D view will show numeric joint angle readouts positioned near each joint. A
 
 ## Phase 4 — locomotion and policy
 
-Phase 4 integrates Humanoid Studio with the reinforcement learning stack.
+Phase 4 integrates Humanoid Studio with the reinforcement learning stack. The daemon architecture is the foundation: the daemon already owns a 200 Hz control loop and can accept position targets at up to 200 Hz from a policy runner without going through the HTTP layer.
 
 **RL policy runner**
 
 The Berkeley Humanoid Lite project includes trained locomotion policies. Phase 4 adds a "Policy" page that:
 - Loads a policy checkpoint (ONNX or TorchScript format)
 - Reads IMU + joint state observations at the correct frequency
-- Runs inference and sends joint position targets
+- Runs inference and sends joint position targets directly to the daemon via UDP
+
+The daemon's UDP command interface (`SET_POSITION` at 9001, `TELEMETRY` push at 9000) is designed for this use case. A policy runner can bypass the Python + HTTP layers entirely.
 
 **Locomotion controller**
 
-A PD impedance controller running in the backend will sit between the policy output and the raw position commands, allowing safe operation with configurable gains and velocity limits.
+A PD impedance controller running in the daemon will sit between the policy output and the raw position commands, allowing safe operation with configurable gains and velocity limits.
 
 **Teleoperation**
 

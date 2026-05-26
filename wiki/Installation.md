@@ -40,6 +40,12 @@ Install CAN utilities and the sudo tools used by the CAN adapter setup:
 sudo apt-get install can-utils iproute2
 ```
 
+Install the C++ build tools for the daemon:
+
+```bash
+sudo apt-get install cmake build-essential
+```
+
 For the Flash Wizard (optional — only needed if reflashing ESC firmware):
 
 ```bash
@@ -57,14 +63,47 @@ cd humanoid-studio
 
 ---
 
+## Build the C++ daemon
+
+The daemon is a standalone C++ binary that owns all SocketCAN interfaces. It must be built before running the app.
+
+```bash
+cd daemon
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+```
+
+The first build fetches `nlohmann/json` via CMake's FetchContent (requires internet access). Subsequent builds use the cached download.
+
+Expected output ends with:
+```
+[100%] Linking CXX executable humanoid_daemon
+[100%] Built target humanoid_daemon
+```
+
+The binary is placed at `daemon/build/humanoid_daemon`.
+
+### Real-time scheduling (optional)
+
+The daemon uses SCHED_FIFO for its control loop. On most Linux systems this requires either running as root or setting the `cap_sys_nice` capability on the binary:
+
+```bash
+sudo setcap cap_sys_nice+ep daemon/build/humanoid_daemon
+```
+
+Without this, the daemon falls back to SCHED_OTHER, which is sufficient for development but may introduce jitter under system load.
+
+---
+
 ## Install Python dependencies
 
 ```bash
 cd backend
-pip install fastapi "uvicorn[standard]" python-can "pydantic>=2.7.0" websockets
+pip install -r requirements.txt
 ```
 
-All five packages are required. `uvicorn[standard]` includes the WebSocket support and the uvloop event loop. `python-can` provides the SocketCAN interface used on Linux.
+All five packages are required. `uvicorn[standard]` includes WebSocket support and the uvloop event loop. `python-can` is retained for the Flash Wizard's direct CAN socket access.
 
 Verify:
 
@@ -87,40 +126,40 @@ This installs Electron, React, Vite, Tailwind, and all other frontend dependenci
 
 ## Run in development mode
 
-Development mode runs the React UI on Vite's dev server (port 5173) and spawns the Python backend from `backend/main.py`. Both are started by a single command.
+Development mode runs the React UI on Vite's dev server (port 5173). The Electron process spawns the daemon and the Python backend automatically.
 
-Open two terminals:
-
-**Terminal 1 — backend:**
-```bash
-cd humanoid-studio/backend
-python3 main.py
-```
-
-Expected output:
-```
-INFO:     Started server process [...]
-INFO:     Waiting for application startup.
-INFO:humanoid.can_monitor:CanMonitor started
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://localhost:8765 (Press CTRL+C to quit)
-```
-
-**Terminal 2 — frontend:**
 ```bash
 cd humanoid-studio/app
 npm run dev
 ```
 
-Electron opens automatically. It polls `http://localhost:8765/devices` every 500 ms and waits up to 20 seconds for the backend to respond before showing the window.
+Electron starts and:
+1. Spawns `daemon/build/humanoid_daemon --config configs/humanoid_lite.json`
+2. Waits for the daemon to respond to PING on port 9001 (up to 10 s)
+3. Spawns `python3 main.py` from the `backend/` directory
+4. Polls `http://localhost:8765/devices` every 500 ms (up to 20 s)
+5. Opens the app window
+
+Expected backend log:
+```
+INFO:     Started server process [...]
+INFO:     Waiting for application startup.
+INFO:humanoid.daemon_client:DaemonClient: connected to daemon v1.0
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://localhost:8765 (Press CTRL+C to quit)
+```
 
 In dev mode, the Chrome DevTools panel opens automatically in a detached window. Close it if you do not need it.
+
+### Launching from a VS Code terminal
+
+VS Code sets `ELECTRON_RUN_AS_NODE=1` in its integrated terminal. The `npm run dev` script includes `ELECTRON_RUN_AS_NODE=` in its `cross-env` call to clear this variable. No action needed — this is already handled.
 
 ---
 
 ## Run in production mode
 
-The production build packages the React app into static files and bundles them inside the Electron AppImage. The backend is spawned automatically from within the package — you do not need a separate terminal.
+The production build packages the React app into static files and bundles them inside the Electron AppImage. The backend and daemon are spawned automatically from within the package.
 
 Build:
 
@@ -137,7 +176,7 @@ Run:
 ./release/"Humanoid Studio-0.1.0.AppImage"
 ```
 
-The AppImage is self-contained. It embeds the frontend assets and the Python backend source. Python and all Python packages must still be installed on the host system — they are not bundled inside the AppImage.
+The AppImage is self-contained. It embeds the frontend assets and the Python backend source. Python, all Python packages, and the compiled daemon binary must still be present on the host system — they are not bundled inside the AppImage.
 
 ---
 
@@ -171,9 +210,12 @@ nvm use 20
 
 ## Verify the installation
 
-With the backend running, confirm each layer:
+With the daemon and backend running, confirm each layer:
 
 ```bash
+# Daemon is alive
+echo '{"type":"PING","id":"test"}' | nc -u -w1 127.0.0.1 9001
+
 # Backend is responding
 curl http://localhost:8765/devices
 
