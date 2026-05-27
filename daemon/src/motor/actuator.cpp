@@ -98,7 +98,12 @@ void Actuator::on_rx_frame(const can_frame& frame) {
         //   DLC=4             → SDO read response (value in bytes 0-3, no param echo)
         //   DLC=8             → PDO2 position+velocity response
         if (frame.can_dlc >= 1 && frame.data[0] == SDO_WRITE_ACK) {
-            return;  // write ACK — apply_config handles this via its own wait loop
+            {
+                std::lock_guard<std::mutex> alk(sdo_ack_mutex_);
+                sdo_ack_received_ = true;
+            }
+            sdo_ack_cv_.notify_one();
+            return;
         }
         if (frame.can_dlc == 4) {
             // Recoil firmware SDO read response: raw float in bytes 0-3, no param_id echo.
@@ -283,33 +288,6 @@ void Actuator::clear_fault() {
 
 // ── Blocking SDO write helpers ──────────────────────────────────────────────
 
-// Wait for an SDO write ACK (0x60 on TRANSMIT_SDO) or a PDO2 response that
-// confirms the write. Drains the named bus until ACK or timeout.
-static bool wait_for_sdo_ack(CanBusManager& bus, const std::string& channel,
-                              int device_id, int timeout_ms)
-{
-    auto deadline = Clock::now() + ms(timeout_ms);
-    while (Clock::now() < deadline) {
-        // drain_all with a lambda; spin-read is acceptable only at startup.
-        bool got = false;
-        bus.drain_all([&](const std::string& ifname, const can_frame& f) {
-            if (ifname != channel) return;
-            uint32_t arb  = f.can_id & CAN_EFF_MASK;
-            int func      = static_cast<int>(get_func_id(arb));
-            int dev       = static_cast<int>(get_device_id(arb));
-            if (dev != device_id) return;
-            if (func == static_cast<int>(FuncCode::FUNC_TRANSMIT_SDO) &&
-                f.can_dlc >= 1 && f.data[0] == SDO_WRITE_ACK)
-            {
-                got = true;
-            }
-        });
-        if (got) return true;
-        std::this_thread::sleep_for(std::chrono::microseconds(500));
-    }
-    return false;
-}
-
 static can_frame make_sdo_write(int device_id, uint16_t param, uint8_t cmd,
                                 const uint8_t* data4)
 {
@@ -329,25 +307,34 @@ static can_frame make_sdo_write(int device_id, uint16_t param, uint8_t cmd,
 bool Actuator::sdo_write_f32(CanBusManager& bus, uint16_t param, float val, int timeout_ms) {
     uint8_t raw[4];
     memcpy(raw, &val, 4);
+    { std::lock_guard<std::mutex> lk(sdo_ack_mutex_); sdo_ack_received_ = false; }
     auto frame = make_sdo_write(cfg_.device_id, param, SDO_CMD_WRITE, raw);
     bus.send(cfg_.can_channel, frame);
-    return wait_for_sdo_ack(bus, cfg_.can_channel, cfg_.device_id, timeout_ms);
+    std::unique_lock<std::mutex> lk(sdo_ack_mutex_);
+    return sdo_ack_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+        [this]{ return sdo_ack_received_; });
 }
 
 bool Actuator::sdo_write_u32(CanBusManager& bus, uint16_t param, uint32_t val, int timeout_ms) {
     uint8_t raw[4];
     memcpy(raw, &val, 4);
+    { std::lock_guard<std::mutex> lk(sdo_ack_mutex_); sdo_ack_received_ = false; }
     auto frame = make_sdo_write(cfg_.device_id, param, SDO_CMD_WRITE, raw);
     bus.send(cfg_.can_channel, frame);
-    return wait_for_sdo_ack(bus, cfg_.can_channel, cfg_.device_id, timeout_ms);
+    std::unique_lock<std::mutex> lk(sdo_ack_mutex_);
+    return sdo_ack_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+        [this]{ return sdo_ack_received_; });
 }
 
 bool Actuator::sdo_write_i32(CanBusManager& bus, uint16_t param, int32_t val, int timeout_ms) {
     uint8_t raw[4];
     memcpy(raw, &val, 4);
+    { std::lock_guard<std::mutex> lk(sdo_ack_mutex_); sdo_ack_received_ = false; }
     auto frame = make_sdo_write(cfg_.device_id, param, SDO_CMD_WRITE, raw);
     bus.send(cfg_.can_channel, frame);
-    return wait_for_sdo_ack(bus, cfg_.can_channel, cfg_.device_id, timeout_ms);
+    std::unique_lock<std::mutex> lk(sdo_ack_mutex_);
+    return sdo_ack_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+        [this]{ return sdo_ack_received_; });
 }
 
 // ── apply_config ────────────────────────────────────────────────────────────
