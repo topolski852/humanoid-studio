@@ -114,9 +114,8 @@ class DaemonActuatorProxy:
     routes_motors.py calls ``await actuator.get_state()``, ``await actuator.enable()``,
     etc.  This proxy translates those calls into daemon UDP commands.
 
-    Operations not supported by the daemon (calibrate_offset, store_to_flash,
-    read_config_from_device, load_from_flash) raise DaemonNotSupportedError so
-    callers can return a meaningful HTTP 503.
+    Operations not supported by the daemon (load_from_flash) raise
+    DaemonNotSupportedError so callers can return a meaningful HTTP 503.
     """
 
     def __init__(
@@ -207,10 +206,38 @@ class DaemonActuatorProxy:
         timeout: float = 90.0,
         on_progress: Callable[[str], None] | None = None,
     ) -> float:
-        raise DaemonNotSupportedError(
-            "calibrate_offset requires direct CAN access; "
-            "the daemon owns the bus — stop the daemon first"
+        """Run flux-offset calibration via the daemon's CALIBRATE_DEVICE command."""
+        loop = asyncio.get_running_loop()
+        timeout_ms = int(timeout * 1000)
+
+        result = await loop.run_in_executor(
+            None, self._client.calibrate_device,
+            self._can_channel, self._can_id, timeout_ms,
         )
+        if result["status"] == "TIMEOUT":
+            raise DaemonError(
+                f"{self._name}: calibration timed out after {timeout:.0f} s"
+            )
+        if result["status"] == "ERROR":
+            raise DaemonError(
+                f"{self._name}: calibration failed "
+                f"(firmware error=0x{result['error_code']:04X})"
+            )
+
+        # Read back the measured flux offset from device RAM.
+        _PARAM_ENCODER_FLUX_OFFSET = 0x13C
+        sdo = await loop.run_in_executor(
+            None, self._client.generic_sdo_read,
+            self._can_channel, self._can_id, _PARAM_ENCODER_FLUX_OFFSET,
+        )
+        if sdo is None:
+            raise DaemonError(
+                f"{self._name}: calibration succeeded but flux offset read timed out"
+            )
+
+        flux_offset: float = sdo["value_f32"]
+        self._config = self._config.with_electrical_offset(flux_offset)
+        return flux_offset
 
     async def store_to_flash(self) -> None:
         loop = asyncio.get_running_loop()
