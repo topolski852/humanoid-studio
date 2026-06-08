@@ -52,12 +52,18 @@ from .daemon_client import DaemonClient
 
 _PARAM_DEVICE_ID              = 0x000
 _PARAM_WATCHDOG_TIMEOUT       = 0x008
+_PARAM_FAST_FRAME_FREQUENCY   = 0x00C
 _PARAM_MODE                   = 0x010
 _PARAM_ERROR                  = 0x014
-_PARAM_FAST_FRAME_FREQUENCY   = 0x00C
+_PARAM_POSITION_GEAR_RATIO    = 0x01C
+_PARAM_CURRENT_I_LIMIT        = 0x074
 _PARAM_CURRENT_I_KP           = 0x078
 _PARAM_CURRENT_I_KI           = 0x07C
+_PARAM_MOTOR_POLE_PAIRS       = 0x104
+_PARAM_MOTOR_TORQUE_CONSTANT  = 0x108
 _PARAM_MOTOR_PHASE_ORDER      = 0x10C
+_PARAM_MOTOR_MAX_CALIBRATION  = 0x110
+_PARAM_ENCODER_CPR            = 0x120
 _PARAM_ENCODER_FLUX_OFFSET    = 0x13C
 
 _MODE_NAMES: dict[int, str] = {
@@ -282,17 +288,13 @@ def _make_commissioning_config_page(
     """
     Build a 2 KB valid STM32G431 flash config page for the production ELF.
 
-    Without this, a plain page erase leaves all 0xFF bytes.  Every float field
-    then reads as NaN, MotorController_loadConfig returns HAL_ERROR on the first
-    NaN check, and the firmware enters an infinite UART error loop — no CAN
-    response at all.
+    The firmware's storeConfig/loadConfig copies the entire MotorController
+    struct to/from flash verbatim.  Byte offsets here MUST match the Parameter
+    enum values in motor_controller.h (which equal the struct field byte offsets).
 
-    The production ELF uses CAN_init(filter=0, mask=0) = accept-all FDCAN
-    hardware filter.  It reads ALL configuration from this page via loadConfig
-    and routes received CAN frames by device_id in software.  Therefore the
-    ESC boots at target_device_id and accepts SDO writes at that ID.
-
-    Layout is determined from MotorController_storeConfig disassembly.
+    Without this, a plain erase (all 0xFF = NaN) causes loadConfig to return
+    HAL_ERROR on the first NaN check and the firmware enters an infinite error
+    loop with no CAN response.
     """
     page = bytearray(_FLASH_CONFIG_SIZE)  # 2048 bytes, all 0x00
 
@@ -304,32 +306,47 @@ def _make_commissioning_config_page(
     i_ki               = float(profile["i_ki"])
     phase_order        = -1 if invert_phase else 1
 
-    # Header
-    struct.pack_into('<I', page,  0, 0xDEAD6431)       # magic
-    struct.pack_into('<I', page,  4, 0)
-    struct.pack_into('<I', page,  8, target_device_id)  # ESC boots at this CAN ID
-    struct.pack_into('<I', page, 12, 30000)             # watchdog_timeout (ms) — 30 s to survive power-cycle connection window
+    # All offsets = Parameter enum values = MotorController struct byte offsets.
+    struct.pack_into('<I', page, 0x000, target_device_id)    # device_id (uint8_t + 3B pad)
+    # 0x004: firmware_version — 0x0 (firmware uses its compiled-in value, not this)
+    struct.pack_into('<I', page, 0x008, 30000)                # watchdog_timeout (ms) — 30 s
+    struct.pack_into('<I', page, 0x00C, 0)                    # fast_frame_frequency (set via SDO after boot)
+    # 0x010: mode — 0x00 DISABLED; firmware transitions to IDLE after init
+    # 0x014: error — 0 (no error)
+    # 0x018: position_controller.update_counter — 0
 
-    # Position controller — 0.0 passes NaN check everywhere.
-    # gear_ratio=1.0 avoids any potential divide-by-zero during boot.
-    struct.pack_into('<f', page, 20, 1.0)               # gear_ratio
-    # offsets 24-60: torque_filter_alpha, kp/ki, limits, offset all remain 0.0
+    struct.pack_into('<f', page, 0x01C, 1.0)                  # gear_ratio = 1.0 (direct drive)
+    # 0x020-0x06C: position PID gains, limits, integrators — 0.0 fine
 
-    # Current controller
-    # i_limit must be non-zero so the calibration sweep current can flow.
-    struct.pack_into('<f', page, 64, max_calib_current * 2.0)   # i_limit
-    struct.pack_into('<f', page, 68, i_kp)                       # current PI kp
-    struct.pack_into('<f', page, 72, i_ki)                       # current PI ki
+    struct.pack_into('<f', page, 0x070, 0.1)                  # torque_filter_alpha
 
-    # Powerstage — 0.0 disables under/over-voltage faults (matches deployed config)
+    # i_limit MUST be non-zero — calibration sweep cannot flow current otherwise
+    struct.pack_into('<f', page, 0x074, max_calib_current * 2.0)   # i_limit
+    struct.pack_into('<f', page, 0x078, i_kp)                       # i_kp
+    struct.pack_into('<f', page, 0x07C, i_ki)                       # i_ki
+    # 0x080-0x0D4: current controller measured/setpoint values — 0.0 fine
+    # 0x0D8-0x0EC: HAL handles/ADC buffers — 0 fine (HAL reinitialises at boot)
 
-    # Motor parameters — motor-specific values required for calibration sweep
-    struct.pack_into('<I', page, 88, pole_pairs)
-    struct.pack_into('<f', page, 92, torque_constant)
-    struct.pack_into('<b', page, 96, phase_order)        # -1 = inverted, +1 = normal
-    struct.pack_into('<f', page, 100, max_calib_current)
-    struct.pack_into('<I', page, 104, cpr)
-    # offset 108 (encoder_position_offset or flux_offset) remains 0.0
+    # 0x0F4: undervoltage_threshold — 0.0 disables undervoltage fault
+    # 0x0F8: overvoltage_threshold  — 0.0 disables overvoltage fault
+    struct.pack_into('<f', page, 0x0FC, 0.01)                 # bus_voltage_filter_alpha
+    # 0x100: bus_voltage_measured — 0.0 fine
+
+    struct.pack_into('<I', page, 0x104, pole_pairs)            # motor.pole_pairs
+    struct.pack_into('<f', page, 0x108, torque_constant)       # motor.torque_constant
+    struct.pack_into('<i', page, 0x10C, phase_order)           # motor.phase_order (int32)
+    struct.pack_into('<f', page, 0x110, max_calib_current)     # motor.max_calibration_current
+
+    # 0x114: encoder.hi2c  — HAL handle, set at boot; 0 fine
+    # 0x118-0x11B: encoder.i2c_buffer — 0 fine
+    # 0x11C: encoder.i2c_update_counter — 0
+
+    struct.pack_into('<I', page, 0x120, cpr)                   # encoder.cpr
+    # 0x124: encoder.position_offset — 0.0 (set after calibration)
+    # 0x128: encoder.velocity_filter_alpha — 0.0 fine
+    # 0x12C-0x138: encoder runtime values — 0.0 fine
+    # 0x13C: encoder.flux_offset — 0.0 (written by calibration sequence)
+    # 0x140+: flux offset lookup table — 0.0 fine
 
     return bytes(page)
 
@@ -969,30 +986,29 @@ class FlashManager:
             f"i_kp={profile['i_kp']:.4f}, i_ki={profile['i_ki']:.3f}",
             progress=45)
 
-        # Write motor parameters. Values are already correct from the config page,
-        # but SDO writes allow in-memory override and update fast_frame_frequency.
-        # DEVICE_ID must go last (changes the software device_id filter).
+        # Write all critical motor parameters via SDO.
+        # These match what the config page contains, but SDO writes ensure correctness
+        # even when skip_flash=True (no fresh config page) or if the page was corrupt.
+        # DEVICE_ID must go last (changes the software device_id routing filter).
         phase_val = -1 if invert_phase else +1
-        ack_phase = await loop.run_in_executor(
-            None, dc.generic_sdo_write,
-            config.can_channel, active_id, _PARAM_MOTOR_PHASE_ORDER, "i32", phase_val)
-        self._log(
-            f"  SDO[ID {active_id}] phase_order={phase_val:+d} → "
-            f"{'ACK' if ack_phase else 'NO_ACK'}")
+        i_limit_val = float(profile["max_calibration_current"]) * 2.0
 
-        ack_kp = await loop.run_in_executor(
-            None, dc.generic_sdo_write,
-            config.can_channel, active_id, _PARAM_CURRENT_I_KP, "f32", profile["i_kp"])
-        self._log(
-            f"  SDO[ID {active_id}] i_kp={profile['i_kp']:.4f} → "
-            f"{'ACK' if ack_kp else 'NO_ACK'}")
-
-        ack_ki = await loop.run_in_executor(
-            None, dc.generic_sdo_write,
-            config.can_channel, active_id, _PARAM_CURRENT_I_KI, "f32", profile["i_ki"])
-        self._log(
-            f"  SDO[ID {active_id}] i_ki={profile['i_ki']:.3f} → "
-            f"{'ACK' if ack_ki else 'NO_ACK'}")
+        sdo_writes = [
+            (_PARAM_POSITION_GEAR_RATIO,   "f32", 1.0,                          "gear_ratio=1.0"),
+            (_PARAM_CURRENT_I_LIMIT,       "f32", i_limit_val,                  f"i_limit={i_limit_val:.2f}"),
+            (_PARAM_CURRENT_I_KP,          "f32", profile["i_kp"],              f"i_kp={profile['i_kp']:.4f}"),
+            (_PARAM_CURRENT_I_KI,          "f32", profile["i_ki"],              f"i_ki={profile['i_ki']:.3f}"),
+            (_PARAM_MOTOR_POLE_PAIRS,      "u32", int(profile.get("pole_pairs", 14)), f"pole_pairs={profile.get('pole_pairs', 14)}"),
+            (_PARAM_MOTOR_TORQUE_CONSTANT, "f32", profile["torque_constant"],   f"torque_constant={profile['torque_constant']:.5f}"),
+            (_PARAM_MOTOR_PHASE_ORDER,     "i32", phase_val,                    f"phase_order={phase_val:+d}"),
+            (_PARAM_MOTOR_MAX_CALIBRATION, "f32", float(profile["max_calibration_current"]), f"max_calib_current={profile['max_calibration_current']:.1f}"),
+            (_PARAM_ENCODER_CPR,           "u32", int(profile.get("cpr", 4096)), f"cpr={profile.get('cpr', 4096)}"),
+        ]
+        for param, dtype, value, label in sdo_writes:
+            ack = await loop.run_in_executor(
+                None, dc.generic_sdo_write,
+                config.can_channel, active_id, param, dtype, value)
+            self._log(f"  SDO[ID {active_id}] {label} → {'ACK' if ack else 'NO_ACK'}")
 
         if active_id != config.can_id:
             ack_id = await loop.run_in_executor(

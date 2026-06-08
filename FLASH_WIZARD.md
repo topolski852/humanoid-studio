@@ -520,3 +520,134 @@ handles all motor profiles.
 3. SDO writes to `target_id` are ACKed — `GENERIC_SDO_WRITE` returns `{status:"OK"}`
 4. NMT `MODE_CALIBRATION` to `target_id` triggers calibration
 5. `SEND_FLASH_STORE` to `target_id` persists config to flash
+
+---
+
+## BUG-010 — Watchdog fed to commissioning ID 127 instead of target CAN ID
+
+**Symptom:** ESC boots at target CAN ID (e.g., ID 1) from config page, but receives no
+watchdog feed. After `watchdog_timeout` ms the ESC enters WATCHDOG_TIMEOUT error state →
+DAMPING mode. Heartbeat shows `error=WATCHDOG_TIMEOUT | INVALID_MODE`.
+
+**Log output:**
+```
+Sniff result: ID 1:[EMCY×993 PDO2×7]
+  ↳ ID 1 (target): EMCY — error=INVALID_MODE | WATCHDOG_TIMEOUT | ENCODER_FAULT
+```
+
+**Root cause:** The watchdog feed code computed `feed_id = comm_id if not skip_flash
+else config.can_id`. With `skip_flash=False` (the normal full-flash path), this always
+fed ID 127 — the old commissioning ELF ID. With `production.elf` the ESC boots at
+`config.can_id` (encoded in the config page), so ID 127 receives no CAN traffic from
+the ESC and the feed is ignored. The target ESC times out.
+
+---
+
+### FIX-010-a — Always feed watchdog to target CAN ID [UNTESTED]
+
+Changed `feed_id` assignment in `flash.py::_do_session()`:
+
+```python
+# Before (wrong — always 127 on flash+commission path)
+feed_id = comm_id if not skip_flash else config.can_id
+
+# After (correct — always the ID the ESC actually boots at)
+feed_id = config.can_id
+```
+
+---
+
+## BUG-011 — `_make_commissioning_config_page` uses completely wrong byte offsets
+
+**Symptom:** ESC boots at the wrong CAN ID (e.g., ID 49 instead of target ID 1),
+fires WATCHDOG_TIMEOUT immediately, and calibration is physically impossible even if
+mode could be set. Multiple errors: `ENCODER_FAULT | WATCHDOG_TIMEOUT | INVALID_MODE`.
+
+**Log output:**
+```
+Sniff result: ID 49:[EMCY×993]
+  ↳ ID 49 (unexpected): EMCY — error=INVALID_MODE | WATCHDOG_TIMEOUT | ENCODER_FAULT
+    (ESC has stale device_id=49 from prior commissioning; will re-commission...)
+Pre-calibration: mode=DAMPING error=GENERAL | INITIALIZATION_ERROR | POWERSTAGE_ERROR
+  | INVALID_MODE | WATCHDOG_TIMEOUT | OVER_CURRENT | CAN_RX_FAULT
+SWD diagnostic: mode=DAMPING, error=INVALID_MODE | WATCHDOG_TIMEOUT | ENCODER_FAULT
+```
+
+**Root cause:** `_make_commissioning_config_page()` wrote fields at incorrect byte offsets.
+The firmware's `storeConfig` / `loadConfig` copies the **entire `MotorController` struct**
+verbatim to/from flash. The byte offset of each field in the config page equals the field's
+`Parameter` enum value in `motor_controller.h`. The old function used a hand-crafted
+"magic header" layout (0xDEAD6431 at offset 0) that bears no relation to the actual struct:
+
+| What we wrote at offset | What firmware reads it as |
+|---|---|
+| 0 `0xDEAD6431` (magic) | `device_id = 0x31 = 49` (wrong ID!) |
+| 8 `target_device_id` (e.g., 1) | `watchdog_timeout = 1 ms` (fires immediately!) |
+| 12 `30000` | `fast_frame_frequency = 30000 Hz` (invalid!) |
+| 64 `i_limit` value | `position_controller.position_setpoint` (wrong field!) |
+| 88 `pole_pairs` | `position_controller.i_b_measured` (wrong field!) |
+| 96 `phase_order` | `position_controller.v_a_setpoint` (wrong field!) |
+| 100 `max_calib_current` | `position_controller.v_b_setpoint` (wrong field!) |
+| 104 `cpr` | `position_controller.v_c_setpoint` (wrong field!) |
+
+**Critical missing fields (all read as 0.0f by firmware):**
+- `i_limit = 0.0` → calibration current sweep can't flow (hardware-limited to zero)
+- `max_calibration_current = 0.0` → `while (phase_current < 0.0)` never executes
+- `pole_pairs = 0` → divide-by-zero / wrong electrical angle
+- `torque_constant = 0.0` → torque estimation broken
+- `cpr = 0` → encoder reads all positions as zero
+
+Even if mode could be set to CALIBRATION, the calibration sequence would be impossible
+because no current can flow and the encoder reports nothing meaningful.
+
+---
+
+### FIX-011-a — Rewrite config page with correct Parameter enum offsets [UNTESTED]
+
+Rewrote `_make_commissioning_config_page()` in `backend/humanoid/flash.py` to use the
+Parameter enum byte values as offsets, matching the actual MotorController struct layout.
+
+**Added missing constants:**
+```python
+_PARAM_POSITION_GEAR_RATIO    = 0x01C
+_PARAM_CURRENT_I_LIMIT        = 0x074
+_PARAM_MOTOR_POLE_PAIRS       = 0x104
+_PARAM_MOTOR_TORQUE_CONSTANT  = 0x108
+_PARAM_MOTOR_MAX_CALIBRATION  = 0x110
+_PARAM_ENCODER_CPR            = 0x120
+```
+
+**Correct config page layout:**
+```
+0x000  device_id             = target_device_id (uint32, ESC boots at this ID)
+0x008  watchdog_timeout      = 30000 (ms)
+0x00C  fast_frame_frequency  = 0 (set via SDO after boot)
+0x01C  gear_ratio            = 1.0 (direct drive)
+0x070  torque_filter_alpha   = 0.1
+0x074  i_limit               = max_calib_current × 2.0 (must be non-zero for calibration)
+0x078  i_kp                  = profile["i_kp"]
+0x07C  i_ki                  = profile["i_ki"]
+0x0FC  bus_voltage_filter_α  = 0.01
+0x104  motor.pole_pairs      = profile["pole_pairs"]
+0x108  motor.torque_constant = profile["torque_constant"]
+0x10C  motor.phase_order     = +1 or -1 (int32)
+0x110  motor.max_calib_curr  = profile["max_calibration_current"]
+0x120  encoder.cpr           = profile["cpr"]
+```
+
+All other fields remain 0x00 (0.0f for floats, 0 for integers), which passes all NaN
+checks in `loadConfig` and is safe for fields not used during commissioning.
+
+### FIX-011-b — Add SDO writes for all critical motor parameters [UNTESTED]
+
+Extended the SDO commissioning sequence in `_do_session()` to write all motor parameters
+that were previously missing. Previously only `phase_order`, `i_kp`, `i_ki` were written
+via SDO; now the full set is written:
+
+```
+gear_ratio, i_limit, i_kp, i_ki, pole_pairs, torque_constant,
+phase_order, max_calibration_current, cpr
+```
+
+This ensures correct parameters even when `skip_flash=True` (commission-only mode, no
+fresh config page) or if the config page on the ESC is from a previous broken run.
