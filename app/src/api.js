@@ -74,10 +74,10 @@ export const api = {
 
   // ── Flash wizard ───────────────────────────────────────────────────────────
   flashProfiles: () => request('/flash/profiles'),
-  flashStart: (can_id, invert_phase, motor_profile, port = 'SWD', can_channel = 'can0') =>
+  flashStart: (can_id, invert_phase, motor_profile, port = 'SWD', can_channel = 'can0', skip_flash = false) =>
     request('/flash/start', {
       method: 'POST',
-      body: JSON.stringify({ can_id, invert_phase, motor_profile, port, can_channel }),
+      body: JSON.stringify({ can_id, invert_phase, motor_profile, port, can_channel, skip_flash }),
     }),
   flashStatus: () => request('/flash/status'),
   flashStep:   () => request('/flash/step'),

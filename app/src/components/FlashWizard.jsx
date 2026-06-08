@@ -5,8 +5,8 @@ import { api } from '../api'
 const STEP_LABELS = [
   'Configure',    // 0 — pre-start
   'Flash',        // 1 — FLASHING
-  'Commission',   // 2 — COMMISSIONING
-  'Connect',      // 3 — WAITING_CAN_CONNECT
+  'Connect',      // 2 — WAITING_CAN_CONNECT
+  'Commission',   // 3 — COMMISSIONING
   'Calibrate',    // 4 — CALIBRATING / AWAITING_CONFIRMATION
   'Done',         // 5 — COMPLETE
 ]
@@ -135,7 +135,7 @@ function LogPane({ messages }) {
 
 
 // ── Main component ────────────────────────────────────────────────────────────
-export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
+export default function FlashWizard({ canId, canChannel, jointName, onClose, commissionOnly = false }) {
   const [status, setStatus]           = useState(null)
   const [stepInfo, setStepInfo]       = useState({ step_index: 0, total_steps: 6 })
   const [profiles, setProfiles]       = useState([])
@@ -214,7 +214,7 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
     setStartError(null)
     setStarted(true)
     try {
-      await api.flashStart(canId, invertPhase, motorProfile, 'SWD', canChannel ?? 'can0')
+      await api.flashStart(canId, invertPhase, motorProfile, 'SWD', canChannel ?? 'can0', commissionOnly)
     } catch (e) {
       setStartError(e.message)
       setStarted(false)
@@ -284,7 +284,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
         {/* ── Header ── */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-surface-3 flex-shrink-0">
           <div>
-            <h2 className="font-semibold text-base">ESC Flash Wizard</h2>
+            <h2 className="font-semibold text-base">
+              {commissionOnly ? 'ESC Commission Wizard' : 'ESC Flash Wizard'}
+            </h2>
             <p className="text-xs text-gray-500 font-mono">
               {jointName} · {canChannel} · CAN ID {canId}
             </p>
@@ -378,11 +380,13 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
                   />
                   Invert Phase
                 </label>
-                <span className="text-xs text-gray-600 font-mono px-2 py-1 rounded bg-surface-2 border border-surface-3">
-                  ST-LINK · SWD
-                </span>
+                {!commissionOnly && (
+                  <span className="text-xs text-gray-600 font-mono px-2 py-1 rounded bg-surface-2 border border-surface-3">
+                    ST-LINK · SWD
+                  </span>
+                )}
                 <button onClick={handleStart} className="btn-primary ml-auto px-5">
-                  Start Flash
+                  {commissionOnly ? 'Commission Motor' : 'Flash + Commission Motor'}
                 </button>
               </div>
 
@@ -408,7 +412,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
               )}
 
               <p className="text-[10px] text-gray-600">
-                Flashes pre-compiled firmware via ST-LINK, commissions the ESC over CAN (sets ID + gains), then runs encoder calibration. No compile step — estimated time: ~2 min.
+                {commissionOnly
+                  ? 'Commissions the ESC over CAN (sets ID + gains), then runs encoder calibration. Firmware must already be on the ESC at commissioning ID 127. Estimated time: ~1 min.'
+                  : 'Flashes pre-compiled firmware via ST-LINK, commissions the ESC over CAN (sets ID + gains), then runs encoder calibration. No compile step — estimated time: ~2 min.'}
               </p>
             </div>
           )}
@@ -417,16 +423,40 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
           {awaitingCanConnect && (
             <div className="space-y-3">
               <div>
-                <p className="text-sm font-medium">Connect motor, CAN bus, and encoder</p>
-                <ol className="mt-2 space-y-1 text-xs text-gray-400 list-decimal list-inside">
-                  <li>Connect the CAN bus cable to the ESC ({canChannel})</li>
-                  <li>Connect the motor phase wires to the ESC</li>
-                  <li>Connect the encoder cable to the ESC</li>
-                  <li>Power on the ESC (apply motor bus voltage)</li>
-                </ol>
+                {commissionOnly ? (
+                  <>
+                    <p className="text-sm font-medium">Power cycle, then connect hardware</p>
+                    <ol className="mt-2 space-y-1 text-xs text-gray-400 list-decimal list-inside">
+                      <li>Power cycle the ESC — disconnect then reconnect its power supply</li>
+                      <li>Connect the CAN bus cable to the ESC ({canChannel})</li>
+                      <li>Connect the motor phase wires to the ESC</li>
+                      <li>Connect the encoder cable to the ESC</li>
+                    </ol>
+                    <p className="mt-2 text-[11px] text-gray-500">
+                      Power cycling resets the CAN controller to a clean state.
+                      The ESC must have commissioning firmware and will boot at ID 127.
+                      Commissioning (setting CAN ID {canId}) runs automatically after you click below.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-sm font-medium">Power cycle, then connect hardware</p>
+                    <ol className="mt-2 space-y-1 text-xs text-gray-400 list-decimal list-inside">
+                      <li>Power cycle the ESC — disconnect then reconnect its power supply</li>
+                      <li>Connect the CAN bus cable to the ESC ({canChannel})</li>
+                      <li>Connect the motor phase wires to the ESC</li>
+                      <li>Connect the encoder cable to the ESC</li>
+                    </ol>
+                    <p className="mt-2 text-[11px] text-gray-500">
+                      A power cycle is required after SWD flash so the CAN peripheral initialises
+                      from a clean hardware reset. Commissioning (setting CAN ID {canId}) runs
+                      automatically after you click below.
+                    </p>
+                  </>
+                )}
               </div>
 
-              {/* CAN connectivity test */}
+              {/* CAN connectivity test — pings at commissioning ID 127 */}
               <div className="flex items-center gap-3 flex-wrap">
                 <button
                   onClick={handleCanPing}
@@ -448,12 +478,12 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
               </div>
               {pingState && pingState !== 'pending' && !pingState.reachable && (
                 <p className="text-xs text-warn">
-                  ESC not responding. Check: power is applied, CAN cable is connected to {canChannel}, CAN ID {canId} matches what was flashed.
+                  ESC not responding. Check: {commissionOnly ? 'ESC was power-cycled and has commissioning firmware (boots at ID 127)' : 'ESC was power-cycled after flashing'}, CAN cable is connected to {canChannel}, 120 Ω termination on both ends of the CAN bus.
                 </p>
               )}
 
               <button onClick={handleCanConnected} className="btn-primary w-full">
-                Motor connected — Start Calibration
+                Hardware connected — Start Commissioning
               </button>
             </div>
           )}

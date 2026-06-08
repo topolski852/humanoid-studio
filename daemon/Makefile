@@ -6,6 +6,7 @@ LDFLAGS  := -pthread
 SRC := src/main.cpp \
        src/can/socket_can.cpp \
        src/can/can_bus_manager.cpp \
+       src/can/generic_listener.cpp \
        src/config/config_loader.cpp \
        src/motor/actuator.cpp \
        src/ipc/udp_broadcaster.cpp \

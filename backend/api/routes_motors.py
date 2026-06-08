@@ -20,8 +20,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from humanoid.daemon_client import DaemonError, DaemonNotSupportedError
-from humanoid.can_bus import Mode
+from humanoid.daemon_client import DaemonError, DaemonNotSupportedError, Mode
 from humanoid.robot_config import PositionLimits
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parents[3] / "configs" / "humanoid_lite.json"

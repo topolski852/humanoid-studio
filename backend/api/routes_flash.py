@@ -20,7 +20,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from humanoid.flash import FlashConfig, FlashError, MOTOR_PROFILES
-from humanoid.daemon_client import DaemonClient
 
 router = APIRouter(tags=["flash"])
 
@@ -73,6 +72,7 @@ class FlashStartBody(BaseModel):
     can_channel: str = "can0"
     port: str = "SWD"
     firmware_dir: str | None = None
+    skip_flash: bool = False
 
 
 class ConfirmDirectionBody(BaseModel):
@@ -114,6 +114,7 @@ async def flash_start(body: FlashStartBody, request: Request) -> dict | JSONResp
         can_id=body.can_id,
         invert_phase=body.invert_phase,
         motor_profile=body.motor_profile,
+        skip_flash=body.skip_flash,
     )
     try:
         await flash_manager.start(port=body.port, config=config)
@@ -156,20 +157,6 @@ async def flash_power_cycled(request: Request) -> dict | JSONResponse:
 async def flash_can_connected(request: Request) -> dict | JSONResponse:
     """Frontend calls this when user confirms motor + CAN + encoder are connected."""
     flash_manager = request.app.state.flash_manager
-
-    # Shut the daemon down before the flash wizard opens its own CAN socket.
-    # The daemon ACKs SHUTDOWN immediately but stops asynchronously, so we
-    # wait 0.3 s then bounce the interface to flush any pending kernel TX frames.
-    client: DaemonClient | None = request.app.state.can_monitor
-    if client is not None and client.is_running():
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, client.daemon_shutdown)
-        await asyncio.sleep(0.3)
-
-    channel = flash_manager.current_channel
-    if channel:
-        await _bounce_can_interface(channel)
-
     try:
         await flash_manager.can_connected()
         return _ok({"message": "CAN connection confirmed"})

@@ -4,12 +4,13 @@ Flash wizard state machine for B-G431B-ESC1 boards.
 Single-pass firmware procedure:
 
   1. FLASHING:
-     Flash a pre-compiled .elf (one per motor profile) via openocd/ST-LINK.
-     Device boots at commissioning CAN ID 127 (no valid flash config yet).
+     Flash a pre-compiled .elf (one per motor profile) via openocd/ST-LINK,
+     then write a valid commissioning config page so loadConfig succeeds.
+     Device boots at commissioning CAN ID 127.
 
   2. COMMISSIONING:
-     Send CAN SDO writes to ID 127: set device CAN ID, phase order, current gains,
-     then SAVE_CONFIG + REBOOT.  Device reboots at its assigned CAN ID.
+     Send CAN SDO writes to ID 127: set phase order and current gains, then set
+     device CAN ID (last), then store config via FUNC_FLASH at the new ID.
 
   3. CALIBRATING:
      At the real CAN ID: run encoder flux offset calibration.
@@ -24,16 +25,49 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import shutil
+import struct
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
 from pydantic import BaseModel
 
-from .can_bus import CANBus, Parameter
-from .actuator import Actuator
-from .robot_config import JointConfig
+from .daemon_client import DaemonClient
+
+
+# ---------------------------------------------------------------------------
+# Recoil protocol constants (subset needed by flash wizard)
+# ---------------------------------------------------------------------------
+
+_PARAM_DEVICE_ID              = 0x000
+_PARAM_FAST_FRAME_FREQUENCY   = 0x00C
+_PARAM_CURRENT_I_KP           = 0x078
+_PARAM_CURRENT_I_KI           = 0x07C
+_PARAM_MOTOR_PHASE_ORDER      = 0x10C
+_PARAM_ENCODER_FLUX_OFFSET    = 0x13C
+
+_MODE_NAMES: dict[int, str] = {
+    0x00: "DISABLED", 0x01: "IDLE", 0x02: "DAMPING",
+    0x05: "CALIBRATION", 0x10: "CURRENT", 0x11: "TORQUE",
+    0x12: "VELOCITY", 0x13: "POSITION", 0x80: "DEBUG",
+}
+_ERROR_BITS: dict[int, str] = {
+    0x0001: "GENERAL", 0x0002: "ESTOP", 0x0004: "INITIALIZATION_ERROR",
+    0x0008: "CALIBRATION_ERROR", 0x0010: "POWERSTAGE_ERROR",
+    0x0020: "INVALID_MODE", 0x0040: "WATCHDOG_TIMEOUT",
+    0x0080: "OVER_VOLTAGE", 0x0100: "OVER_CURRENT",
+    0x0200: "OVER_TEMPERATURE", 0x0400: "CAN_RX_FAULT",
+    0x0800: "CAN_TX_FAULT", 0x1000: "I2C_FAULT", 0x2000: "ENCODER_FAULT",
+}
+
+def _mode_name(byte: int) -> str:
+    return _MODE_NAMES.get(byte, f"0x{byte:02X}")
+
+def _error_str(bits: int) -> str:
+    names = [n for bit, n in _ERROR_BITS.items() if bits & bit]
+    return " | ".join(names) if names else "NO_ERROR"
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +87,8 @@ MOTOR_PROFILES: dict[str, dict] = {
         "max_calibration_current": 5,
         "i_kp":                   _gains(0.13793, 3.039166e-5)[0],
         "i_ki":                   _gains(0.13793, 3.039166e-5)[1],
+        "pole_pairs":             14,
+        "cpr":                    4096,
     },
     "MAD_5010_110KV": {
         "torque_constant":        0.1176,
@@ -61,6 +97,8 @@ MOTOR_PROFILES: dict[str, dict] = {
         "max_calibration_current": 3,
         "i_kp":                   _gains(0.6193, 8.50e-5)[0],
         "i_ki":                   _gains(0.6193, 8.50e-5)[1],
+        "pole_pairs":             14,
+        "cpr":                    4096,
     },
     "MAD_5010_200KV": {
         "torque_constant":        0.06588,
@@ -69,6 +107,8 @@ MOTOR_PROFILES: dict[str, dict] = {
         "max_calibration_current": 3,
         "i_kp":                   _gains(0.15227, 2.649166e-5)[0],
         "i_ki":                   _gains(0.15227, 2.649166e-5)[1],
+        "pole_pairs":             14,
+        "cpr":                    4096,
     },
     "MAD_5010_310KV": {
         "torque_constant":        0.04212,
@@ -77,6 +117,8 @@ MOTOR_PROFILES: dict[str, dict] = {
         "max_calibration_current": 5,
         "i_kp":                   _gains(0.05735, 3.3256e-5)[0],
         "i_ki":                   _gains(0.05735, 3.3256e-5)[1],
+        "pole_pairs":             14,
+        "cpr":                    4096,
     },
     "MAD_5010_370KV": {
         "torque_constant":        0.03529,
@@ -85,6 +127,8 @@ MOTOR_PROFILES: dict[str, dict] = {
         "max_calibration_current": 5,
         "i_kp":                   _gains(0.03000, 1.0717e-5)[0],
         "i_ki":                   _gains(0.03000, 1.0717e-5)[1],
+        "pole_pairs":             14,
+        "cpr":                    4096,
     },
 }
 
@@ -114,8 +158,8 @@ class FlashState(str, Enum):
         _map = {
             FlashState.IDLE:                  0,
             FlashState.FLASHING:              1,
-            FlashState.COMMISSIONING:         2,
-            FlashState.WAITING_CAN_CONNECT:   3,
+            FlashState.WAITING_CAN_CONNECT:   2,
+            FlashState.COMMISSIONING:         3,
             FlashState.CALIBRATING:           4,
             FlashState.AWAITING_CONFIRMATION: 4,
             FlashState.COMPLETE:              5,
@@ -133,6 +177,7 @@ class FlashConfig(BaseModel):
     can_id: int
     invert_phase: bool = False
     motor_profile: str = "MAD_5010_200KV"
+    skip_flash: bool = False
 
     def profile_data(self) -> dict:
         key = self.motor_profile
@@ -176,20 +221,225 @@ async def _run_subprocess(cmd: list[str], cwd: Path) -> tuple[int, str]:
     return proc.returncode, stdout.decode(errors="replace")
 
 
-async def _flash_prebuilt(elf_path: Path, firmware_dir: Path, log_fn) -> None:
-    log_fn(f"Flashing {elf_path.name} via ST-LINK (openocd)...")
+async def _bounce_can_interface(channel: str) -> None:
+    """Bring the CAN interface down then up to clear bus-off state and flush the kernel TX queue."""
+    async def _run(cmd: list[str]) -> None:
+        p = await asyncio.create_subprocess_exec(
+            'sudo', '-n', *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(p.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    await _run(['/sbin/ip', 'link', 'set', channel, 'down'])
+    await asyncio.sleep(0.1)
+    await _run(['/sbin/ip', 'link', 'set', channel, 'type', 'can', 'bitrate', '1000000'])
+    await _run(['/sbin/ip', 'link', 'set', channel, 'txqueuelen', '1000'])
+    await _run(['/sbin/ip', 'link', 'set', channel, 'up'])
+
+
+_FLASH_CONFIG_ADDRESS = 0x0801F800   # STM32G431CB Bank1 page 63 — MotorController config
+_FLASH_CONFIG_SIZE    = 0x800        # 2 KB (one page)
+
+# RAM address of the `controller` global (MotorController struct).
+# Offsets match the Parameter enum byte offsets (DEVICE_ID=0x000, MODE=0x010, ERROR=0x014).
+_CONTROLLER_BASE = 0x20000228
+
+_COMMISSIONING_CONFIG_PATH = Path("/tmp/esc_commissioning_config.bin")
+
+
+def _make_commissioning_config_page(
+    profile: dict,
+    target_device_id: int = 127,
+    invert_phase: bool = False,
+) -> bytes:
+    """
+    Build a 2 KB valid STM32G431 flash config page for the commissioning ELF.
+
+    Without this, a plain page erase leaves all 0xFF bytes.  Every float field
+    then reads as NaN, MotorController_loadConfig returns HAL_ERROR on the first
+    NaN check, and the firmware enters an infinite UART error loop — no CAN
+    response at all.
+
+    The commissioning ELF does NOT process SDO writes — it ignores all SDO
+    frames without sending an ACK.  Therefore ALL persistent configuration must
+    be encoded in this page before flashing.  The ESC will boot at
+    target_device_id using the i_kp, i_ki, and phase_order encoded here.
+
+    Layout is determined from MotorController_storeConfig disassembly.
+    """
+    page = bytearray(_FLASH_CONFIG_SIZE)  # 2048 bytes, all 0x00
+
+    torque_constant    = profile["torque_constant"]
+    max_calib_current  = float(profile["max_calibration_current"])
+    pole_pairs         = int(profile.get("pole_pairs", 14))
+    cpr                = int(profile.get("cpr", 4096))
+    i_kp               = float(profile["i_kp"])
+    i_ki               = float(profile["i_ki"])
+    phase_order        = -1 if invert_phase else 1
+
+    # Header
+    struct.pack_into('<I', page,  0, 0xDEAD6431)       # magic
+    struct.pack_into('<I', page,  4, 0)
+    struct.pack_into('<I', page,  8, target_device_id)  # ESC boots at this CAN ID
+    struct.pack_into('<I', page, 12, 1000)              # watchdog_timeout (ms)
+
+    # Position controller — 0.0 passes NaN check everywhere.
+    # gear_ratio=1.0 avoids any potential divide-by-zero during boot.
+    struct.pack_into('<f', page, 20, 1.0)               # gear_ratio
+    # offsets 24-60: torque_filter_alpha, kp/ki, limits, offset all remain 0.0
+
+    # Current controller
+    # i_limit must be non-zero so the calibration sweep current can flow.
+    struct.pack_into('<f', page, 64, max_calib_current * 2.0)   # i_limit
+    struct.pack_into('<f', page, 68, i_kp)                       # current PI kp
+    struct.pack_into('<f', page, 72, i_ki)                       # current PI ki
+
+    # Powerstage — 0.0 disables under/over-voltage faults (matches deployed config)
+
+    # Motor parameters — motor-specific values required for calibration sweep
+    struct.pack_into('<I', page, 88, pole_pairs)
+    struct.pack_into('<f', page, 92, torque_constant)
+    struct.pack_into('<b', page, 96, phase_order)        # -1 = inverted, +1 = normal
+    struct.pack_into('<f', page, 100, max_calib_current)
+    struct.pack_into('<I', page, 104, cpr)
+    # offset 108 (encoder_position_offset or flux_offset) remains 0.0
+
+    return bytes(page)
+
+
+async def _flash_prebuilt(
+    elf_path: Path,
+    firmware_dir: Path,
+    log_fn,
+    profile: dict,
+    target_device_id: int = 127,
+    invert_phase: bool = False,
+) -> None:
+    phase_str = "inverted (-1)" if invert_phase else "normal (+1)"
+    log_fn(
+        f"Flashing {elf_path.name} via ST-LINK (openocd)... "
+        f"Config page: device_id={target_device_id}, phase_order={phase_str}, "
+        f"i_kp={profile['i_kp']:.4f}, i_ki={profile['i_ki']:.3f}")
+
+    config_page = _make_commissioning_config_page(
+        profile, target_device_id=target_device_id, invert_phase=invert_phase)
+    _COMMISSIONING_CONFIG_PATH.write_bytes(config_page)
+
+    # Three-step openocd sequence:
+    #   1. Program the ELF (code pages only — does NOT touch the config page).
+    #   2. Write a valid commissioning config page at 0x0801F800 so loadConfig
+    #      succeeds at boot.  A plain erase (all 0xFF = NaN) causes loadConfig
+    #      to return HAL_ERROR, which puts the firmware into an infinite UART
+    #      loop with no CAN response.
+    #   3. Verify the config page write to catch any silent flash failures.
     rc, out = await _run_subprocess(
         [
             "openocd",
             "-f", "interface/stlink.cfg",
             "-f", "target/stm32g4x.cfg",
-            "-c", f"program {elf_path} verify reset exit",
+            "-c", f"program {elf_path} verify",
+            "-c", "halt",
+            "-c", (
+                f"flash write_image erase {_COMMISSIONING_CONFIG_PATH} "
+                f"{_FLASH_CONFIG_ADDRESS:#010x} bin"
+            ),
+            "-c", (
+                f"verify_image {_COMMISSIONING_CONFIG_PATH} "
+                f"{_FLASH_CONFIG_ADDRESS:#010x} bin"
+            ),
+            "-c", "reset run",
+            "-c", "shutdown",
+        ],
+        cwd=firmware_dir,
+    )
+    # Always log openocd output so flash write and verify steps are visible
+    _openocd_summary = "\n".join(
+        l for l in out.splitlines()
+        if any(kw in l.lower() for kw in ("wrote", "verified", "error", "warn", "failed", "verify"))
+    ) or out[-500:]
+    log_fn(f"openocd output:\n{_openocd_summary}")
+    if rc != 0:
+        raise FlashError(f"Flash failed:\n{out[-3000:]}")
+    log_fn("Flash written, commissioning config page verified — device is resetting.")
+
+
+async def _read_controller_state_via_swd(firmware_dir: Path) -> dict | None:
+    """
+    Halt the ESC via SWD/ST-LINK and read controller struct fields from SRAM
+    plus FDCAN1 hardware registers.  Returns a dict or None if openocd fails.
+
+    SRAM fields (6 words at _CONTROLLER_BASE):
+      device_id, firmware_version, watchdog_timeout, fast_frame_freq, mode, error
+
+    FDCAN1 peripheral registers (STM32G431, base 0x40006400):
+      ECR (0x40006440): TEC [7:0], REC [14:8]
+      PSR (0x40006444): EP [5], EW [6], BO [7]
+    """
+    rc, out = await _run_subprocess(
+        [
+            "openocd",
+            "-f", "interface/stlink.cfg",
+            "-f", "target/stm32g4x.cfg",
+            "-c", "init",
+            "-c", "halt",
+            "-c", f"mdw {_CONTROLLER_BASE:#010x} 6",
+            "-c", "mdw 0x40006440 2",   # FDCAN1 ECR then PSR
+            "-c", "resume",
+            "-c", "shutdown",
         ],
         cwd=firmware_dir,
     )
     if rc != 0:
-        raise FlashError(f"Flash failed:\n{out[-3000:]}")
-    log_fn("Flash written — device is resetting.")
+        return None
+
+    m = re.search(r'0x20000228:\s+([0-9a-fA-F ]+)', out)
+    if not m:
+        return None
+    words_str = m.group(1).split()[:6]
+    if len(words_str) < 6:
+        return None
+    words = [int(w, 16) for w in words_str]
+    result: dict = {
+        "device_id":        words[0],
+        "firmware_version": words[1],
+        "watchdog_timeout": words[2],
+        "fast_frame_freq":  words[3],
+        "mode":             words[4],
+        "error":            words[5],
+    }
+
+    m2 = re.search(r'0x40006440:\s+([0-9a-fA-F ]+)', out)
+    if m2:
+        fdcan = m2.group(1).split()[:2]
+        if len(fdcan) >= 2:
+            ecr, psr = int(fdcan[0], 16), int(fdcan[1], 16)
+            result["can_tec"] = ecr & 0xFF
+            result["can_rec"] = (ecr >> 8) & 0x7F
+            result["can_ep"]  = bool((psr >> 5) & 1)
+            result["can_ew"]  = bool((psr >> 6) & 1)
+            result["can_bo"]  = bool((psr >> 7) & 1)
+
+    return result
+
+
+def _format_fdcan_state(swd: dict) -> str:
+    """Return a short CAN hardware state string from SWD diagnostic dict, or ''."""
+    if "can_bo" not in swd:
+        return ""
+    if swd["can_bo"]:
+        return f"BUS_OFF (TEC={swd['can_tec']})"
+    if swd["can_ep"]:
+        return f"ERROR_PASSIVE (TEC={swd['can_tec']}, REC={swd['can_rec']})"
+    if swd["can_ew"]:
+        return f"ERROR_WARNING (TEC={swd['can_tec']}, REC={swd['can_rec']})"
+    return f"OK (TEC={swd['can_tec']}, REC={swd['can_rec']})"
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +449,8 @@ async def _flash_prebuilt(elf_path: Path, firmware_dir: Path, log_fn) -> None:
 class FlashManager:
     """Drives the flash wizard through its state machine."""
 
-    def __init__(self) -> None:
+    def __init__(self, daemon_client: DaemonClient) -> None:
+        self._daemon_client = daemon_client
         self.status = FlashStatus()
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
@@ -208,6 +459,7 @@ class FlashManager:
         self._can_connect_event: asyncio.Event | None = None
         self._current_channel: str | None = None
         self._current_can_id: int | None = None
+        self._current_firmware_dir: Path | None = None
 
     @property
     def current_channel(self) -> str | None:
@@ -227,22 +479,23 @@ class FlashManager:
             ):
                 raise FlashError("Flash session already in progress")
 
-            missing = _check_tools()
-            if missing:
-                raise FlashError(
-                    f"Required tool not found on PATH: {', '.join(missing)}. "
-                    "Install openocd and ensure it is on PATH."
-                )
+            if not config.skip_flash:
+                missing = _check_tools()
+                if missing:
+                    raise FlashError(
+                        f"Required tool not found on PATH: {', '.join(missing)}. "
+                        "Install openocd and ensure it is on PATH."
+                    )
+                elf_path = config.firmware_dir / "prebuilt" / f"commissioning_{config.motor_profile}.elf"
+                if not elf_path.exists():
+                    raise FlashError(f"Pre-compiled binary not found: {elf_path}")
 
             config.profile_data()
-
-            elf_path = config.firmware_dir / "prebuilt" / f"commissioning_{config.motor_profile}.elf"
-            if not elf_path.exists():
-                raise FlashError(f"Pre-compiled binary not found: {elf_path}")
 
             self.status = FlashStatus()
             self._current_channel = config.can_channel
             self._current_can_id = config.can_id
+            self._current_firmware_dir = config.firmware_dir
 
         self._task = asyncio.create_task(self._run_session(port, config))
 
@@ -254,6 +507,7 @@ class FlashManager:
             self.status = FlashStatus()
             self._current_channel = None
             self._current_can_id = None
+            self._current_firmware_dir = None
 
     async def can_connected(self) -> None:
         if self.status.state != FlashState.WAITING_CAN_CONNECT:
@@ -267,24 +521,66 @@ class FlashManager:
                 f"CAN ping only available during WAITING_CAN_CONNECT (current: {self.status.state})"
             )
         channel = self._current_channel
-        can_id = self._current_can_id
-        if not channel or can_id is None:
-            raise FlashError("No CAN channel or device ID configured")
+        if not channel:
+            raise FlashError("No CAN channel configured")
 
-        bus = CANBus(channel=channel)
+        target_id = self._current_can_id
+        dc = self._daemon_client
+        loop = asyncio.get_running_loop()
+
         try:
-            await bus.connect()
-            version = await bus.read_parameter_u32(can_id, Parameter.FIRMWARE_VERSION, timeout=2.0)
-            if version is not None:
-                return {"reachable": True, "detail": f"firmware {version:#010x}"}
+            # Check commissioning ID (127) via heartbeat.
+            hb = await loop.run_in_executor(
+                None, dc.wait_heartbeat, channel, _COMMISSIONING_CAN_ID, 2000)
+            if hb is not None:
+                return {
+                    "reachable": True,
+                    "detail": (
+                        f"ESC at commissioning ID {_COMMISSIONING_CAN_ID}: "
+                        f"mode={_mode_name(hb['mode'])}, "
+                        f"error={_error_str(hb['error'])}"
+                    ),
+                }
+
+            # Check target ID as fallback (previously commissioned ESC).
+            if target_id is not None and target_id != _COMMISSIONING_CAN_ID:
+                hb2 = await loop.run_in_executor(
+                    None, dc.wait_heartbeat, channel, target_id, 2000)
+                if hb2 is not None:
+                    return {
+                        "reachable": True,
+                        "detail": (
+                            f"ESC at target ID {target_id} (prior commission): "
+                            f"mode={_mode_name(hb2['mode'])}, "
+                            f"error={_error_str(hb2['error'])}"
+                        ),
+                    }
+
+            # No heartbeat — try SWD diagnostic while ST-LINK may be connected.
+            swd_detail = ""
+            fw_dir = self._current_firmware_dir
+            if fw_dir is not None:
+                swd = await _read_controller_state_via_swd(fw_dir)
+                if swd is not None:
+                    can_state = _format_fdcan_state(swd)
+                    swd_detail = (
+                        f" SWD: device_id={swd['device_id']}, "
+                        f"firmware={swd['firmware_version']:#010x}, "
+                        f"mode={_mode_name(swd['mode'])}, "
+                        f"error={_error_str(swd['error'])}"
+                        + (f", CAN={can_state}" if can_state else "")
+                    )
             return {
                 "reachable": False,
-                "detail": f"no SDO response from device {can_id} on {channel} within 2 s",
+                "detail": (
+                    f"no heartbeat from ESC at ID {_COMMISSIONING_CAN_ID}"
+                    + (f" or {target_id}" if target_id else "")
+                    + f" on {channel} within 2 s"
+                    + swd_detail
+                ),
             }
         except Exception as exc:
             return {"reachable": False, "detail": str(exc)}
-        finally:
-            await bus.disconnect()
 
     async def confirm_direction(self, correct: bool) -> None:
         if self.status.state != FlashState.AWAITING_CONFIRMATION:
@@ -325,118 +621,328 @@ class FlashManager:
         firmware_dir = config.firmware_dir
         invert_phase = config.invert_phase
 
-        # ── 1. Flash pre-compiled binary ─────────────────────────────────────
-        self.status.state = FlashState.FLASHING
-        elf_path = firmware_dir / "prebuilt" / f"commissioning_{config.motor_profile}.elf"
-        self._log(f"Flashing firmware for {config.motor_profile}...", progress=5)
-        await _flash_prebuilt(elf_path, firmware_dir, self._log)
-        self._log("Firmware flashed. Device booting at commissioning ID 127...", progress=20)
+        if not config.skip_flash:
+            # ── 1. Flash pre-compiled binary ──────────────────────────────────
+            self.status.state = FlashState.FLASHING
+            elf_path = firmware_dir / "prebuilt" / f"commissioning_{config.motor_profile}.elf"
+            self._log(f"Flashing firmware for {config.motor_profile}...", progress=5)
+            await _flash_prebuilt(
+                elf_path, firmware_dir, self._log, profile,
+                target_device_id=config.can_id,
+                invert_phase=invert_phase,
+            )
+            self._log("Firmware flashed. Device booting at commissioning ID 127...", progress=20)
+            # Bounce the CAN interface NOW while the ESC is not yet connected.
+            # Doing this here (rather than when the user clicks the button) avoids
+            # disrupting the ESC after it is live on the bus — a late bounce can
+            # drive the FDCAN error counter past ERROR_PASSIVE and silence the ESC.
+            self._log("Preparing CAN interface...", progress=22)
+            await _bounce_can_interface(config.can_channel)
+        else:
+            self._log(
+                "Skipping flash step — using firmware already on the ESC.",
+                progress=20,
+            )
 
-        # ── 2. Commission over CAN at ID 127 ─────────────────────────────────
-        self.status.state = FlashState.COMMISSIONING
-        self._log("Waiting for ESC to boot...", progress=22)
-        await asyncio.sleep(3.0)
-
-        self._log(
-            f"Commissioning: setting CAN ID={config.can_id}, "
-            f"phase_order={'inverted' if invert_phase else 'normal'}, "
-            f"i_kp={profile['i_kp']:.4f}, i_ki={profile['i_ki']:.3f}...",
-            progress=25,
-        )
-        bus = CANBus(channel=config.can_channel)
-        await bus.connect()
-        try:
-            comm_id = _COMMISSIONING_CAN_ID
-            await bus.write_parameter_u32(comm_id, Parameter.DEVICE_ID, config.can_id)
-            await bus.write_parameter_i32(comm_id, Parameter.MOTOR_PHASE_ORDER, -1 if invert_phase else +1)
-            await bus.write_parameter_f32(comm_id, Parameter.CURRENT_CONTROLLER_I_KP, profile["i_kp"])
-            await bus.write_parameter_f32(comm_id, Parameter.CURRENT_CONTROLLER_I_KI, profile["i_ki"])
-            await bus.write_parameter_u32(comm_id, Parameter.SAVE_CONFIG, 1)
-            self._log("Config saved to flash. Rebooting device...", progress=30)
-            await bus.write_parameter_u32(comm_id, Parameter.REBOOT, 1)
-        finally:
-            await bus.disconnect()
-
-        self._log("Waiting for ESC to reboot at its assigned CAN ID...", progress=32)
-        await asyncio.sleep(3.0)
-        self._log(
-            f"ESC rebooted. Now connect motor, CAN bus, and encoder, then click 'Motor Connected'.",
-            progress=35,
-        )
-
-        # ── 3. Wait for motor + CAN hardware connection ───────────────────────
+        # ── 2. Wait for motor + CAN hardware connection ───────────────────────
+        if not config.skip_flash:
+            # After SWD flash a full power-on reset (POR) is required so the
+            # FDCAN peripheral initialises cleanly.  `openocd reset run` only
+            # resets the CPU core via the debug interface and does not guarantee
+            # the same peripheral state as POR.
+            self._log(
+                "Firmware flashed. Power cycle the ESC (disconnect then reconnect its "
+                "power supply), then connect the CAN bus cable, motor phase wires, and "
+                "encoder cable. Click 'Hardware connected' when ready.",
+                progress=25,
+            )
+        else:
+            self._log(
+                "Power cycle the ESC (disconnect then reconnect its power supply), "
+                "then connect the CAN bus cable, motor phase wires, and encoder cable. "
+                "Click 'Hardware connected' when ready.",
+                progress=25,
+            )
         self.status.state = FlashState.WAITING_CAN_CONNECT
         self._can_connect_event = asyncio.Event()
         self._log(
             "Waiting for motor + CAN + encoder connection. (600 s timeout)",
-            progress=37,
+            progress=27,
         )
         await asyncio.wait_for(self._can_connect_event.wait(), timeout=600.0)
-        self._log("Connection confirmed. Connecting to CAN bus...", progress=40)
+        self._log("Connection confirmed. Commissioning ESC over CAN...", progress=40)
 
-        bus = CANBus(channel=config.can_channel)
-        await bus.connect()
-        self._log("Waiting for CAN bus to settle...", progress=42)
+        # ── 3. Commission over CAN ───────────────────────────────────────────
+        self.status.state = FlashState.COMMISSIONING
+        loop = asyncio.get_running_loop()
+        comm_id = _COMMISSIONING_CAN_ID
+        dc = self._daemon_client
+
+        # Feed watchdog so the ESC doesn't timeout before we start talking to it.
+        self._log(
+            f"Sending watchdog feed to ID {comm_id} on {config.can_channel} "
+            f"(prevents WATCHDOG_TIMEOUT error state)...", progress=41)
+        await loop.run_in_executor(
+            None, dc.feed_watchdog_generic, config.can_channel, comm_id)
+        await asyncio.sleep(0.5)
+
+        # Passive sniff: collect all CAN frames for 3 s.
+        self._log(f"Sniffing CAN bus on {config.can_channel} for 3 s...", progress=42)
+        raw_frames = await loop.run_in_executor(
+            None, dc.sniff_bus, config.can_channel, 3000)
+
+        _sniff_saw_comm_id = False
+        _sniff_saw_target_id = False
+        _hb_count_comm = 0
+        _hb_last_mode: int | None = None
+        _hb_last_error: int | None = None
+        _frame_counts: dict[tuple[int, int], int] = {}
+        for fr in raw_frames:
+            dev  = fr.get("device_id", -1)
+            func = fr.get("func_id", -1)
+            _frame_counts[(dev, func)] = _frame_counts.get((dev, func), 0) + 1
+            if dev == comm_id and func == 0xE:
+                _sniff_saw_comm_id = True
+                _hb_count_comm += 1
+                if _hb_last_mode is None:
+                    data_hex = fr.get("data", "")
+                    if len(data_hex) >= 10:
+                        try:
+                            raw_bytes = bytes.fromhex(data_hex)
+                            _hb_last_mode = raw_bytes[0]
+                            _hb_last_error = struct.unpack_from("<I", raw_bytes, 1)[0]
+                        except Exception:
+                            pass
+            if dev == config.can_id and func == 0xE and config.can_id != comm_id:
+                _sniff_saw_target_id = True
+
+        if raw_frames:
+            _FUNC_NAMES = {0x9: "PDO2", 0xA: "PDO3", 0xB: "SDO_TX", 0xC: "SDO_RX",
+                           0xD: "FLASH", 0xE: "HB", 0xF: "NMT"}
+            device_summary: dict[int, list[str]] = {}
+            for (dev, func), count in sorted(_frame_counts.items()):
+                label = _FUNC_NAMES.get(func, f"0x{func:X}")
+                device_summary.setdefault(dev, []).append(
+                    f"{label}×{count}" if count > 1 else label)
+            parts = [f"ID {dev}:[{' '.join(fs)}]"
+                     for dev, fs in sorted(device_summary.items())]
+            self._log(f"Sniff result ({len(raw_frames)} frames): {', '.join(parts)}")
+            if _sniff_saw_comm_id:
+                mode_str = _mode_name(_hb_last_mode) if _hb_last_mode is not None else "?"
+                err_str  = _error_str(_hb_last_error) if _hb_last_error is not None else "?"
+                self._log(
+                    f"  ↳ ID {comm_id} (commissioning ESC): "
+                    f"{_hb_count_comm} heartbeat(s) — mode={mode_str}, error={err_str}")
+            if _sniff_saw_target_id:
+                self._log(
+                    f"  ↳ ID {config.can_id} (target): heartbeat seen")
+        else:
+            self._log(
+                f"No CAN frames in 3 s on {config.can_channel}. "
+                f"ESC may not be booted or CAN cable/termination is wrong.")
+
+        # Determine which ID the ESC is currently at.
+        active_id = comm_id
+        esc_found = False
+
+        if _sniff_saw_target_id and config.can_id != comm_id:
+            active_id = config.can_id
+            esc_found = True
+            self._log(
+                f"ESC at target CAN ID {config.can_id} — "
+                f"booted from config page (fresh flash) or previously commissioned.",
+                progress=44)
+        elif _sniff_saw_comm_id:
+            esc_found = True
+
+        if not esc_found and config.can_id != comm_id:
+            hb = await loop.run_in_executor(
+                None, dc.wait_heartbeat, config.can_channel, config.can_id, 1000)
+            if hb is not None:
+                active_id = config.can_id
+                esc_found = True
+                self._log(
+                    f"ESC at target CAN ID {config.can_id} — "
+                    f"booted from config page (fresh flash) or previously commissioned.",
+                    progress=44)
+
+        if not esc_found:
+            self._log(
+                f"Waiting for ESC at commissioning ID {comm_id} on {config.can_channel}...",
+                progress=43)
+            hb = await loop.run_in_executor(
+                None, dc.wait_heartbeat, config.can_channel, comm_id, 30000)
+            if hb is not None:
+                esc_found = True
+            else:
+                self._log("ESC not on CAN — reading controller state via SWD for diagnosis...")
+                swd = await _read_controller_state_via_swd(firmware_dir)
+                if swd is not None:
+                    can_state = _format_fdcan_state(swd)
+                    self._log(
+                        f"SWD: device_id={swd['device_id']}, "
+                        f"firmware={swd['firmware_version']:#010x}, "
+                        f"mode={_mode_name(swd['mode'])}, "
+                        f"error={_error_str(swd['error'])}"
+                        + (f", CAN={can_state}" if can_state else ""))
+                    if swd.get("can_bo"):
+                        raise FlashError(
+                            f"ESC FDCAN is in BUS_OFF (TEC={swd.get('can_tec', '?')}). "
+                            f"Power cycle the ESC to recover.")
+                else:
+                    self._log("SWD diagnostic unavailable — ST-LINK may not be connected.")
+                raise FlashError(
+                    f"ESC did not appear on {config.can_channel} within 30 s — "
+                    f"check CAN cable, ESC power, and that it was power-cycled after flashing.")
+
+        self._log(
+            f"ESC confirmed at ID {active_id} (commissioning firmware). "
+            f"Writing params: target_id={config.can_id}, "
+            f"phase_order={'inverted (-1)' if invert_phase else 'normal (+1)'}, "
+            f"i_kp={profile['i_kp']:.4f}, i_ki={profile['i_ki']:.3f}",
+            progress=45)
+
+        # Write motor parameters. DEVICE_ID must go last.
+        phase_val = -1 if invert_phase else +1
+        ack_phase = await loop.run_in_executor(
+            None, dc.generic_sdo_write,
+            config.can_channel, active_id, _PARAM_MOTOR_PHASE_ORDER, "i32", phase_val)
+        self._log(
+            f"  SDO[ID {active_id}] phase_order={phase_val:+d} → "
+            f"{'ACK' if ack_phase else 'NO_ACK (ELF does not ACK SDO writes; config page value used)'}")
+
+        ack_kp = await loop.run_in_executor(
+            None, dc.generic_sdo_write,
+            config.can_channel, active_id, _PARAM_CURRENT_I_KP, "f32", profile["i_kp"])
+        self._log(
+            f"  SDO[ID {active_id}] i_kp={profile['i_kp']:.4f} → "
+            f"{'ACK' if ack_kp else 'NO_ACK'}")
+
+        ack_ki = await loop.run_in_executor(
+            None, dc.generic_sdo_write,
+            config.can_channel, active_id, _PARAM_CURRENT_I_KI, "f32", profile["i_ki"])
+        self._log(
+            f"  SDO[ID {active_id}] i_ki={profile['i_ki']:.3f} → "
+            f"{'ACK' if ack_ki else 'NO_ACK'}")
+
+        if active_id != config.can_id:
+            ack_id = await loop.run_in_executor(
+                None, dc.generic_sdo_write,
+                config.can_channel, active_id, _PARAM_DEVICE_ID, "u32", config.can_id)
+            self._log(
+                f"  SDO[ID {active_id}] device_id → {config.can_id} → "
+                f"{'ACK' if ack_id else 'NO_ACK (ESC may not have changed its CAN ID)'}")
+            await asyncio.sleep(0.1)
+
+        self._log(
+            f"Sending flash store to ID {active_id} "
+            f"(target={config.can_id})...")
+        await loop.run_in_executor(
+            None, dc.send_flash_store, config.can_channel, active_id)
+        await asyncio.sleep(0.2)
+
+        self._log(
+            f"Verification: waiting for heartbeat from ID {config.can_id} (3 s)...",
+            progress=50)
+        hb_new = await loop.run_in_executor(
+            None, dc.wait_heartbeat, config.can_channel, config.can_id, 3000)
+        if hb_new is None:
+            self._log(f"No heartbeat at target ID {config.can_id} within 3 s.")
+            if active_id != config.can_id:
+                self._log(
+                    f"Checking if ESC is still at source ID {active_id} (1.5 s)...")
+                hb_old = await loop.run_in_executor(
+                    None, dc.wait_heartbeat, config.can_channel, active_id, 1500)
+                if hb_old is not None:
+                    self._log(
+                        f"ESC still at ID {active_id}: "
+                        f"mode={_mode_name(hb_old['mode'])}, error={_error_str(hb_old['error'])}")
+                    raise FlashError(
+                        f"ESC still at source ID {active_id} after DEVICE_ID write — "
+                        f"SDO write was not ACK'd. The commissioning ELF may require "
+                        f"DEVICE_ID to be encoded in the config page before flashing.")
+            raise FlashError(
+                f"No response from ESC at CAN ID {config.can_id} — "
+                f"check CAN cable and ESC power.")
+
+        self._log(
+            f"ESC confirmed at CAN ID {config.can_id}. "
+            f"Config saved to flash. ESC is live.", progress=54)
+
+        # ── 4. Calibration ───────────────────────────────────────────────────
+        self._log("Waiting for CAN bus to settle...", progress=56)
         await asyncio.sleep(2.0)
 
-        joint_cfg = JointConfig(
-            joint_name="__flash_target__",
-            can_channel=config.can_channel,
-            can_id=config.can_id,
-            phase_inverted=invert_phase,
-        )
-        actuator = Actuator(bus, joint_cfg)
+        while True:
+            self.status.state = FlashState.CALIBRATING
+            ack_freq = await loop.run_in_executor(
+                None, dc.generic_sdo_write,
+                config.can_channel, config.can_id, _PARAM_FAST_FRAME_FREQUENCY, "u32", 100)
+            self._log(
+                f"SDO[ID {config.can_id}] fast_frame_frequency=100 Hz → "
+                f"{'ACK' if ack_freq else 'NO_ACK'}",
+                progress=60)
 
-        try:
-            while True:
-                # ── 4. Calibrate ─────────────────────────────────────────────
-                self.status.state = FlashState.CALIBRATING
-                self._log("Setting fast_frame_frequency=100 Hz...", progress=45)
-                await bus.write_parameter_u32(config.can_id, Parameter.FAST_FRAME_FREQUENCY, 100)
-                self._log(
-                    "Starting encoder flux offset calibration (MODE_CALIBRATION). "
-                    "This takes ~15 s. Do NOT power off the ESC.",
-                    progress=48,
-                )
+            self._log(
+                "Starting encoder flux offset calibration (MODE_CALIBRATION). "
+                "This takes ~15 s. Do NOT power off the ESC.",
+                progress=62)
 
-                flux_offset = await actuator.calibrate_offset(
-                    timeout=90.0,
-                    on_progress=self._log,
-                )
-                self.status.flux_offset = flux_offset
-                self._log(
-                    f"Calibration done: flux_offset = {flux_offset:.4f} rad "
-                    f"({math.degrees(flux_offset):.2f}°). Saved to Flash.",
-                    progress=75,
-                )
+            cal_result = await loop.run_in_executor(
+                None, dc.calibrate_device,
+                config.can_channel, config.can_id, 90000)
 
-                # ── 5. Confirm direction ──────────────────────────────────────
-                self.status.state = FlashState.AWAITING_CONFIRMATION
-                self._confirm_event = asyncio.Event()
-                self._confirmed_correct = None
-                self._log(
-                    "Did the motor rotate correctly during calibration? Confirm direction. (120 s timeout)",
-                    progress=78,
-                )
-                await asyncio.wait_for(self._confirm_event.wait(), timeout=120.0)
-                direction_correct = bool(self._confirmed_correct)
+            if cal_result["status"] == "ERROR":
+                raise FlashError(
+                    f"Calibration failed: error_code=0x{cal_result['error_code']:04X}")
+            if cal_result["status"] == "TIMEOUT":
+                raise FlashError(
+                    "Calibration timed out after 90 s. "
+                    "Check motor phase wires and encoder connection.")
 
-                if direction_correct:
-                    break
+            # Read flux_offset from the device.
+            fo_result = await loop.run_in_executor(
+                None, dc.generic_sdo_read,
+                config.can_channel, config.can_id, _PARAM_ENCODER_FLUX_OFFSET)
+            flux_offset = fo_result["value_f32"] if fo_result else 0.0
+            self.status.flux_offset = flux_offset
+            self._log(
+                f"Calibration done: flux_offset = {flux_offset:.4f} rad "
+                f"({math.degrees(flux_offset):.2f}°). Saved to Flash.",
+                progress=75)
 
-                # Toggle phase, save, and re-calibrate
-                invert_phase = not invert_phase
-                self._log(
-                    f"Direction wrong — toggling phase_order, saving, and re-calibrating...",
-                    progress=80,
-                )
-                self.status.state = FlashState.CALIBRATING
-                await bus.write_parameter_i32(config.can_id, Parameter.MOTOR_PHASE_ORDER, -1 if invert_phase else +1)
-                await bus.write_parameter_u32(config.can_id, Parameter.SAVE_CONFIG, 1)
-                self._log("Phase order updated and saved. Re-running calibration...", progress=82)
+            # ── 5. Confirm direction ──────────────────────────────────────────
+            self.status.state = FlashState.AWAITING_CONFIRMATION
+            self._confirm_event = asyncio.Event()
+            self._confirmed_correct = None
+            self._log(
+                "Did the motor rotate correctly during calibration? "
+                "Confirm direction. (120 s timeout)",
+                progress=78)
+            await asyncio.wait_for(self._confirm_event.wait(), timeout=120.0)
+            direction_correct = bool(self._confirmed_correct)
 
-        finally:
-            await bus.disconnect()
+            if direction_correct:
+                break
+
+            # Toggle phase, save, and re-calibrate.
+            invert_phase = not invert_phase
+            new_phase_val = -1 if invert_phase else +1
+            self._log(
+                f"Direction wrong — toggling phase_order to {new_phase_val:+d}, "
+                f"saving, and re-calibrating...",
+                progress=80)
+            self.status.state = FlashState.CALIBRATING
+            ack_tog = await loop.run_in_executor(
+                None, dc.generic_sdo_write,
+                config.can_channel, config.can_id, _PARAM_MOTOR_PHASE_ORDER,
+                "i32", new_phase_val)
+            self._log(
+                f"SDO[ID {config.can_id}] phase_order={new_phase_val:+d} → "
+                f"{'ACK' if ack_tog else 'NO_ACK'}")
+            await loop.run_in_executor(
+                None, dc.send_flash_store, config.can_channel, config.can_id)
+            self._log("Phase order saved. Re-running calibration...", progress=82)
 
         self.status.updated_config = {
             "torque_constant":         profile["torque_constant"],

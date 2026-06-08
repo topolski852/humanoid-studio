@@ -12,6 +12,7 @@
 
 #include "config/config_loader.hpp"
 #include "can/can_bus_manager.hpp"
+#include "can/generic_listener.hpp"
 #include "motor/actuator.hpp"
 #include "control/control_loop.hpp"
 #include "ipc/udp_broadcaster.hpp"
@@ -64,6 +65,7 @@ private:
     RobotOptions  opts_;
 
     std::unique_ptr<CanBusManager>  bus_mgr_;
+    GenericListener                 generic_listener_;
     std::vector<std::unique_ptr<Actuator>> actuators_;
     std::unordered_map<std::string, Actuator*> actuator_by_name_;
 

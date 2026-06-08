@@ -171,10 +171,6 @@ class Parameter(IntEnum):
     ENCODER_FLUX_OFFSET                             = 0x13C
     ENCODER_FLUX_OFFSET_TABLE                       = 0x140
 
-    # Virtual parameters — not struct offsets; handled specially by the firmware SDO handler
-    SAVE_CONFIG                                     = 0xFF00  # write non-zero → storeConfig()
-    REBOOT                                          = 0xFF04  # write non-zero → NVIC_SystemReset()
-
 
 # SDO command specifiers (bits [7:5] of the command byte)
 _SDO_CCS_WRITE = 0x01 << 5   # 0x20  — download (host → node)
@@ -296,7 +292,11 @@ class CANBus:
                     w.future.cancel()
             self._waiters.clear()
 
-        self._executor.shutdown(wait=True)
+        # Do NOT shut down the executor here — disconnect() is called between
+        # reconnect cycles (e.g. during the commissioning pre-check retry loop).
+        # Shutting it down prevents connect() from reusing it, producing a flood
+        # of "cannot schedule new futures after shutdown" errors on the next
+        # connect().  The executor is cleaned up when the process exits.
         _log.info("CANBus disconnected: %s", self.channel)
 
     async def __aenter__(self) -> "CANBus":
@@ -491,8 +491,14 @@ class CANBus:
 
             try:
                 rx = await asyncio.wait_for(future, timeout=timeout)
-                # Standard 8-byte response: byte0=0x43, bytes1-2=param_id, bytes4-7=value
-                return bytes(rx.data[4:8])
+                # Production firmware: 8-byte CANopen upload response, value at [4:8].
+                # Commissioning ELF v3.0.0: 4-byte raw response, value at [0:4].
+                if len(rx.data) >= 8:
+                    return bytes(rx.data[4:8])
+                elif len(rx.data) == 4:
+                    return bytes(rx.data[0:4])
+                else:
+                    return None
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 async with self._waiters_lock:
                     try:
@@ -511,7 +517,8 @@ class CANBus:
         Firmware sends a standard 8-byte CANopen download response (byte0=0x60, bytes1-2=
         param_id echo) on FUNC_TRANSMIT_SDO after each write.  We register a waiter
         BEFORE transmitting so the ACK is consumed here and never leaks to a concurrent
-        _sdo_read() waiter.  The 15 ms timeout covers the sub-millisecond CAN round-trip.
+        _sdo_read() waiter.  200 ms covers the sub-millisecond CAN round-trip with ample
+        margin for slow firmware response paths (e.g. during flash-write operations).
         """
         assert len(raw) == 4, "SDO value must be exactly 4 bytes"
         async with self._sdo_lock(device_id):
@@ -529,7 +536,7 @@ class CANBus:
             await self.transmit(frame)
 
             try:
-                await asyncio.wait_for(ack_future, timeout=0.015)
+                await asyncio.wait_for(ack_future, timeout=0.200)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 async with self._waiters_lock:
                     try:
@@ -632,6 +639,16 @@ class CANBus:
             func_id=Function.FLASH,
             data=struct.pack("<B", 1),
         ))
+
+    async def reboot(self, device_id: int) -> None:
+        """Trigger a hardware system reset via the special SDO command (0xFF04).
+
+        The firmware sends a write-ACK before asserting SYSRESETREQ, so the
+        15 ms timeout in _sdo_write is sufficient to confirm the command was
+        received.  Caller should sleep ~3 s after this returns to let the
+        device complete its boot sequence.
+        """
+        await self._sdo_write(device_id, 0xFF04, struct.pack("<L", 1))
 
     async def load_from_flash(self, device_id: int) -> None:
         """Reload Flash config into RAM."""
