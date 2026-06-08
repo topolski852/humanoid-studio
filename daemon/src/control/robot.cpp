@@ -313,6 +313,13 @@ std::string Robot::handle_command(const std::string& request) {
         std::string name = req.value("joint_name", "");
         auto it = actuator_by_name_.find(name);
         if (it == actuator_by_name_.end()) return error("unknown joint: " + name);
+        // If the Python side included updated config values, apply them to the
+        // in-memory JointConfig before writing to device RAM.  Without this the
+        // daemon would re-apply its startup config, overwriting any changes the
+        // user made via the Tune page.
+        if (req.contains("config") && req["config"].is_object()) {
+            it->second->update_cfg(req["config"]);
+        }
         bool ok = it->second->apply_config(*bus_mgr_);
         return ok ? ack() : error("apply_config failed for " + name);
     }

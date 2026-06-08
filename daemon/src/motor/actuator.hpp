@@ -10,6 +10,7 @@
 #include "config/config_loader.hpp"
 #include "can/can_bus_manager.hpp"
 #include "motor/recoil_protocol.hpp"
+#include "json.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -68,6 +69,12 @@ public:
 
     // Clear fault and return to IDLE.
     void clear_fault();
+
+    // Update the in-memory JointConfig from a flat JSON object.
+    // Fields absent from the JSON are left unchanged.
+    // Not thread-safe against simultaneous control-loop reads of cfg_ —
+    // callers (robot.cpp APPLY_CONFIG handler) must only call this before apply_config().
+    void update_cfg(const nlohmann::json& j);
 
     // --- Blocking SDO write sequence (startup only, not called during real-time loop) ---
     // Returns false if any write fails or times out.

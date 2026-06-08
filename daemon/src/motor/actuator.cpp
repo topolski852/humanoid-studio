@@ -341,6 +341,48 @@ bool Actuator::sdo_write_i32(CanBusManager& bus, uint16_t param, int32_t val, in
         [this]{ return sdo_ack_received_; });
 }
 
+// ── update_cfg ───────────────────────────────────────────────────────────────
+
+void Actuator::update_cfg(const nlohmann::json& j) {
+    auto f = [&](const char* k, float cur) -> float {
+        return j.contains(k) && j[k].is_number() ? j[k].get<float>() : cur;
+    };
+    auto i = [&](const char* k, int cur) -> int {
+        return j.contains(k) && j[k].is_number() ? j[k].get<int>() : cur;
+    };
+    auto b = [&](const char* k, bool cur) -> bool {
+        return j.contains(k) && j[k].is_boolean() ? j[k].get<bool>() : cur;
+    };
+
+    cfg_.gear_ratio               = f("gear_ratio",               cfg_.gear_ratio);
+    cfg_.position_kp              = f("position_kp",              cfg_.position_kp);
+    cfg_.position_ki              = f("position_ki",              cfg_.position_ki);
+    cfg_.velocity_kp              = f("velocity_kp",              cfg_.velocity_kp);
+    cfg_.velocity_ki              = f("velocity_ki",              cfg_.velocity_ki);
+    cfg_.torque_limit             = f("torque_limit",             cfg_.torque_limit);
+    cfg_.velocity_limit           = f("velocity_limit",           cfg_.velocity_limit);
+    cfg_.position_limit_min       = f("position_limit_min",       cfg_.position_limit_min);
+    cfg_.position_limit_max       = f("position_limit_max",       cfg_.position_limit_max);
+    cfg_.position_offset          = f("position_offset",          cfg_.position_offset);
+    cfg_.torque_filter_alpha      = f("torque_filter_alpha",      cfg_.torque_filter_alpha);
+    cfg_.current_limit            = f("current_limit",            cfg_.current_limit);
+    cfg_.current_kp               = f("current_kp",               cfg_.current_kp);
+    cfg_.current_ki               = f("current_ki",               cfg_.current_ki);
+    cfg_.undervoltage_threshold   = f("undervoltage_threshold",   cfg_.undervoltage_threshold);
+    cfg_.overvoltage_threshold    = f("overvoltage_threshold",    cfg_.overvoltage_threshold);
+    cfg_.bus_voltage_filter_alpha = f("bus_voltage_filter_alpha", cfg_.bus_voltage_filter_alpha);
+    cfg_.torque_constant          = f("torque_constant",          cfg_.torque_constant);
+    cfg_.max_calibration_current  = f("max_calibration_current",  cfg_.max_calibration_current);
+    cfg_.encoder_position_offset  = f("encoder_position_offset",  cfg_.encoder_position_offset);
+    cfg_.velocity_filter_alpha    = f("velocity_filter_alpha",    cfg_.velocity_filter_alpha);
+    cfg_.electrical_offset        = f("electrical_offset",        cfg_.electrical_offset);
+    cfg_.fast_frame_frequency     = i("fast_frame_frequency",     cfg_.fast_frame_frequency);
+    cfg_.watchdog_timeout_ms      = i("watchdog_timeout",         cfg_.watchdog_timeout_ms);
+    cfg_.pole_pairs               = i("pole_pairs",               cfg_.pole_pairs);
+    cfg_.cpr                      = i("cpr",                      cfg_.cpr);
+    cfg_.phase_inverted           = b("phase_inverted",           cfg_.phase_inverted);
+}
+
 // ── apply_config ────────────────────────────────────────────────────────────
 
 bool Actuator::apply_config(CanBusManager& bus, int timeout_ms) {

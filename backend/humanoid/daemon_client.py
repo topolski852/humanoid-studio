@@ -192,9 +192,39 @@ class DaemonActuatorProxy:
         return None
 
     async def apply_config(self) -> None:
-        """Tell daemon to write this joint's config (from loaded JSON) to device RAM."""
+        """Tell daemon to write this joint's live config to device RAM."""
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._client.apply_config, self._name)
+        cfg = self._config
+        config_dict = {
+            "gear_ratio":               float(cfg.gear_ratio),
+            "position_kp":              float(cfg.position_kp),
+            "position_ki":              float(cfg.position_ki),
+            "velocity_kp":              float(cfg.velocity_kp),
+            "velocity_ki":              float(cfg.velocity_ki),
+            "torque_limit":             float(cfg.torque_limit),
+            "velocity_limit":           float(cfg.velocity_limit),
+            "position_limit_min":       float(cfg.position_limits.lower_bound),
+            "position_limit_max":       float(cfg.position_limits.upper_bound),
+            "position_offset":          float(cfg.position_offset),
+            "torque_filter_alpha":      float(cfg.torque_filter_alpha),
+            "current_limit":            float(cfg.current_limit),
+            "current_kp":               float(cfg.current_kp),
+            "current_ki":               float(cfg.current_ki),
+            "undervoltage_threshold":   float(cfg.undervoltage_threshold),
+            "overvoltage_threshold":    float(cfg.overvoltage_threshold),
+            "bus_voltage_filter_alpha": float(cfg.bus_voltage_filter_alpha),
+            "torque_constant":          float(cfg.torque_constant),
+            "max_calibration_current":  float(cfg.max_calibration_current),
+            "encoder_position_offset":  float(cfg.encoder_position_offset),
+            "velocity_filter_alpha":    float(cfg.velocity_filter_alpha),
+            "electrical_offset":        float(cfg.electrical_offset),
+            "fast_frame_frequency":     int(cfg.fast_frame_frequency),
+            "watchdog_timeout":         int(cfg.watchdog_timeout),
+            "pole_pairs":               int(cfg.pole_pairs),
+            "cpr":                      int(cfg.cpr),
+            "phase_inverted":           bool(cfg.phase_inverted),
+        }
+        await loop.run_in_executor(None, self._client.apply_config, self._name, config_dict)
 
     async def feed_watchdog(self) -> None:
         """No-op — daemon feeds watchdogs from its 200 Hz control loop."""
@@ -479,8 +509,11 @@ class DaemonClient:
     def clear_error(self, joint_name: str) -> None:
         self._send_command({"type": "CLEAR_ERROR", "joint_name": joint_name})
 
-    def apply_config(self, joint_name: str) -> None:
-        self._send_command({"type": "APPLY_CONFIG", "joint_name": joint_name})
+    def apply_config(self, joint_name: str, config: dict | None = None) -> None:
+        cmd: dict = {"type": "APPLY_CONFIG", "joint_name": joint_name}
+        if config is not None:
+            cmd["config"] = config
+        self._send_command(cmd)
 
     def apply_all_configs(self) -> None:
         self._send_command({"type": "APPLY_ALL_CONFIGS"})
