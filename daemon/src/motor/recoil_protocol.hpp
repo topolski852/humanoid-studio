@@ -40,7 +40,7 @@ enum FuncCode : uint8_t {
     FUNC_RECEIVE_PDO_3    = 0x8,  // host→node: unused
     FUNC_TRANSMIT_PDO_4   = 0x9,  // node→host: autonomous fast-frame [pos f32, vel f32]
     FUNC_RECEIVE_PDO_4    = 0xA,  // host→node: no-op
-    FUNC_TRANSMIT_SDO     = 0xB,  // node→host: SDO read response (4 bytes value)
+    FUNC_TRANSMIT_SDO     = 0xB,  // node→host: SDO response (8 bytes, standard CANopen)
     FUNC_RECEIVE_SDO      = 0xC,  // host→node: SDO read/write request
     FUNC_FLASH            = 0xD,  // host→node: store(1) or load(2) Flash
     FUNC_HEARTBEAT        = 0xE,  // host→node: watchdog feed (0 bytes)
@@ -170,9 +170,10 @@ enum ParamId : uint16_t {
 
 // ─── SDO command bytes ────────────────────────────────────────────────────────
 // Source: can_bus.py _SDO_CCS_WRITE / _SDO_CCS_READ
-static constexpr uint8_t SDO_CMD_WRITE = 0x20;  // CCS=1, expedited 4-byte download
-static constexpr uint8_t SDO_CMD_READ  = 0x40;  // CCS=2, upload initiate
-static constexpr uint8_t SDO_WRITE_ACK = 0x60;  // firmware >= 0x20250226 write confirmation
+static constexpr uint8_t SDO_CMD_WRITE  = 0x20;  // CCS=1, expedited download request (host→node)
+static constexpr uint8_t SDO_CMD_READ   = 0x40;  // CCS=2, upload initiate request   (host→node)
+static constexpr uint8_t SDO_WRITE_ACK  = 0x60;  // download response byte 0, DLC=8   (node→host)
+static constexpr uint8_t SDO_READ_RESP  = 0x43;  // upload response byte 0,   DLC=8   (node→host)
 
 // ─── Ping magic byte ─────────────────────────────────────────────────────────
 // Source: can_bus.py ping() — sends RECEIVE_PDO_1 with 0xCA, expects TRANSMIT_PDO_1 echo
@@ -254,13 +255,15 @@ struct __attribute__((packed)) SdoRequest {
 };
 static_assert(sizeof(SdoRequest) == 8, "SdoRequest must be 8 bytes");
 
-// SDO response (node → host, TRANSMIT_SDO): 4 bytes of raw value
-// Source: can_bus.py _sdo_read — reads rx.data[:4]
-// NOTE: DAEMON_SPEC incorrectly described this as bytes 4-7; actual value is bytes 0-3.
+// SDO response (node → host, TRANSMIT_SDO): standard 8-byte CANopen upload response
+// Byte 0: 0x43 (SDO_READ_RESP), bytes 1-2: param_id LE, byte 3: 0, bytes 4-7: value LE
 struct __attribute__((packed)) SdoResponse {
-    uint8_t value[4];   // float32 or uint32 LE
+    uint8_t  cmd;       // SDO_READ_RESP (0x43)
+    uint16_t param_id;  // echoed from request
+    uint8_t  _pad;      // 0x00
+    uint8_t  value[4];  // float32 or uint32 LE
 };
-static_assert(sizeof(SdoResponse) == 4, "SdoResponse must be 4 bytes");
+static_assert(sizeof(SdoResponse) == 8, "SdoResponse must be 8 bytes");
 
 // NMT frame (host → node, FUNC_NMT): mode change
 // Source: can_bus.py set_mode() — struct.pack("<BB", mode, device_id)

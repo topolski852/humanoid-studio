@@ -20,15 +20,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from humanoid.flash import FlashConfig, FlashError, MOTOR_PROFILES
-from humanoid.daemon_client import DaemonClient
 
 router = APIRouter(tags=["flash"])
 
-# Actual firmware project is one level deeper than the BESC repo root
-_DEFAULT_FIRMWARE_DIR = (
-    Path("/home/nse/Recoil-Motor-Controller-BESC")
-    / "Recoil-Motor-Controller-B-G431B-ESC1"
-)
+# firmware/esc/ lives two directories above this file (backend/api/ → backend/ → repo root)
+_DEFAULT_FIRMWARE_DIR = Path(__file__).parents[2] / "firmware" / "esc"
 
 
 async def _bounce_can_interface(channel: str) -> None:
@@ -76,6 +72,7 @@ class FlashStartBody(BaseModel):
     can_channel: str = "can0"
     port: str = "SWD"
     firmware_dir: str | None = None
+    skip_flash: bool = False
 
 
 class ConfirmDirectionBody(BaseModel):
@@ -93,14 +90,12 @@ async def flash_profiles() -> dict:
     for key, data in MOTOR_PROFILES.items():
         profiles.append({
             "key":                     key,
-            "define":                  data["define"],
             "torque_constant":         data["torque_constant"],
             "phase_resistance":        data["phase_resistance"],
             "phase_inductance":        data["phase_inductance"],
             "max_calibration_current": data["max_calibration_current"],
             "i_kp":                    data["i_kp"],
             "i_ki":                    data["i_ki"],
-            "available":               data["torque_constant"] is not None,
         })
     return _ok({"profiles": profiles})
 
@@ -119,6 +114,7 @@ async def flash_start(body: FlashStartBody, request: Request) -> dict | JSONResp
         can_id=body.can_id,
         invert_phase=body.invert_phase,
         motor_profile=body.motor_profile,
+        skip_flash=body.skip_flash,
     )
     try:
         await flash_manager.start(port=body.port, config=config)
@@ -153,33 +149,14 @@ async def flash_step(request: Request) -> dict:
 
 @router.post("/flash/power_cycled", response_model=None)
 async def flash_power_cycled(request: Request) -> dict | JSONResponse:
-    """Frontend calls this when the user has power-cycled the ESC after Pass 1."""
-    flash_manager = request.app.state.flash_manager
-    try:
-        await flash_manager.power_cycled()
-        return _ok({"message": "Power cycle acknowledged"})
-    except FlashError as exc:
-        return _err(str(exc), 409)
+    """No-op: power cycle step no longer required in the new single-pass flow."""
+    return _ok({"message": "No power cycle required in this firmware version"})
 
 
 @router.post("/flash/can_connected", response_model=None)
 async def flash_can_connected(request: Request) -> dict | JSONResponse:
     """Frontend calls this when user confirms motor + CAN + encoder are connected."""
     flash_manager = request.app.state.flash_manager
-
-    # Shut the daemon down before the flash wizard opens its own CAN socket.
-    # The daemon ACKs SHUTDOWN immediately but stops asynchronously, so we
-    # wait 0.3 s then bounce the interface to flush any pending kernel TX frames.
-    client: DaemonClient | None = request.app.state.can_monitor
-    if client is not None and client.is_running():
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, client.daemon_shutdown)
-        await asyncio.sleep(0.3)
-
-    channel = flash_manager.current_channel
-    if channel:
-        await _bounce_can_interface(channel)
-
     try:
         await flash_manager.can_connected()
         return _ok({"message": "CAN connection confirmed"})
@@ -219,3 +196,22 @@ async def flash_reset(request: Request) -> dict:
     """Force the flash manager back to IDLE, cancelling any in-progress session."""
     await request.app.state.flash_manager.reset()
     return _ok({"state": "IDLE", "message": "Session reset"})
+
+
+@router.get("/flash/firmware_version", response_model=None)
+async def flash_firmware_version(
+    request: Request,
+    firmware_dir: str | None = None,
+) -> dict | JSONResponse:
+    """
+    Read ESC firmware version via SWD and compare to the bundled VERSION file.
+    Returns match, esc_version_str, expected_version_str, error.
+    Requires ST-LINK to be connected and ESC powered.
+    """
+    flash_manager = request.app.state.flash_manager
+    fw_dir = Path(firmware_dir) if firmware_dir else _DEFAULT_FIRMWARE_DIR
+    try:
+        result = await flash_manager.check_firmware_version(fw_dir)
+        return _ok(result)
+    except Exception as exc:
+        return _err(str(exc), 500)

@@ -1,27 +1,24 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 
-// Steps matching FlashState.step_index (0-7)
+// Steps matching FlashState.step_index (0-5)
 const STEP_LABELS = [
   'Configure',    // 0 — pre-start
-  'Init Flash',   // 1 — INIT_FLASH
-  'Power Cycle',  // 2 — WAITING_POWER_CYCLE
-  'Program',      // 3 — PROGRAM_FLASH / REFLASHING
-  'Connect',      // 4 — WAITING_CAN_CONNECT
-  'Calibrate',    // 5 — CALIBRATING / AWAITING_CONFIRMATION
-  'Finalize',     // 6 — FINALIZE_FLASH
-  'Done',         // 7 — COMPLETE
+  'Flash',        // 1 — FLASHING
+  'Connect',      // 2 — WAITING_CAN_CONNECT
+  'Commission',   // 3 — COMMISSIONING
+  'Calibrate',    // 4 — CALIBRATING / AWAITING_CONFIRMATION
+  'Done',         // 5 — COMPLETE
 ]
 
 const ACTIVE_STATES = new Set([
-  'INIT_FLASH', 'WAITING_POWER_CYCLE', 'PROGRAM_FLASH',
+  'FLASHING', 'COMMISSIONING',
   'WAITING_CAN_CONNECT', 'CALIBRATING', 'AWAITING_CONFIRMATION',
-  'REFLASHING', 'FINALIZE_FLASH',
 ])
 
 // States where closing would leave the ESC in a broken intermediate state
 const LOCKED_STATES = new Set([
-  'INIT_FLASH', 'PROGRAM_FLASH', 'CALIBRATING', 'REFLASHING', 'FINALIZE_FLASH',
+  'FLASHING', 'COMMISSIONING', 'CALIBRATING',
 ])
 
 
@@ -80,31 +77,6 @@ function StepStrip({ stepIndex, isFailed, isComplete }) {
 }
 
 
-// ── Power cycle waiting indicator ──────────────────────────────────────────────
-function PowerCycleWaiting({ onManualConfirm }) {
-  return (
-    <div className="flex items-center gap-3">
-      <div className="flex-1">
-        <div className="flex items-center gap-2 mb-1">
-          <span className="w-3 h-3 rounded-full bg-warn animate-pulse inline-block" />
-          <p className="text-sm font-medium">Waiting for ESC to come back online…</p>
-        </div>
-        <p className="text-xs text-gray-500">
-          Power cycle the ESC (disconnect / reconnect motor power).
-          The wizard detects when it comes back — or click the button if you cycled it manually.
-        </p>
-      </div>
-      <button
-        onClick={onManualConfirm}
-        className="btn-primary px-4 py-2 whitespace-nowrap flex-shrink-0"
-      >
-        ↻ Cycled
-      </button>
-    </div>
-  )
-}
-
-
 // ── Calibration progress ───────────────────────────────────────────────────────
 function CalibrationProgress({ startedAt }) {
   const [elapsed, setElapsed] = useState(0)
@@ -136,12 +108,31 @@ function CalibrationProgress({ startedAt }) {
 
 // ── Log output ────────────────────────────────────────────────────────────────
 function LogPane({ messages }) {
-  const bottomRef = useRef(null)
+  const containerRef = useRef(null)
+  // Use a ref (not state) so scroll checks don't trigger re-renders.
+  const userScrolledRef = useRef(false)
+
+  // Auto-scroll to bottom on new messages unless the user has scrolled up.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const el = containerRef.current
+    if (!el || userScrolledRef.current) return
+    el.scrollTop = el.scrollHeight
   }, [messages])
+
+  function handleScroll() {
+    const el = containerRef.current
+    if (!el) return
+    // Resume auto-scroll when user scrolls back within 40 px of the bottom.
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+    userScrolledRef.current = !atBottom
+  }
+
   return (
-    <div className="flex-1 bg-surface rounded-lg border border-surface-3 p-3 overflow-y-auto font-mono text-xs leading-relaxed">
+    <div
+      ref={containerRef}
+      onScroll={handleScroll}
+      className="flex-1 bg-surface rounded-lg border border-surface-3 p-3 overflow-y-auto font-mono text-xs leading-relaxed"
+    >
       {messages?.length === 0 && (
         <p className="text-gray-600">Waiting for log output…</p>
       )}
@@ -156,16 +147,15 @@ function LogPane({ messages }) {
           <span className="text-gray-600 mr-2 select-none">&gt;</span>{msg}
         </div>
       ))}
-      <div ref={bottomRef} />
     </div>
   )
 }
 
 
 // ── Main component ────────────────────────────────────────────────────────────
-export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
+export default function FlashWizard({ canId, canChannel, jointName, onClose, commissionOnly = false }) {
   const [status, setStatus]           = useState(null)
-  const [stepInfo, setStepInfo]       = useState({ step_index: 0, total_steps: 8 })
+  const [stepInfo, setStepInfo]       = useState({ step_index: 0, total_steps: 6 })
   const [profiles, setProfiles]       = useState([])
   const [motorProfile, setMotorProfile] = useState('MAD_5010_200KV')
   const [invertPhase, setInvertPhase] = useState(false)
@@ -174,6 +164,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
   const [calStartedAt, setCalStartedAt] = useState(null)
   const [configSynced, setConfigSynced] = useState(false)
   const [pingState, setPingState] = useState(null)   // null | 'pending' | {reachable, detail}
+  const [versionCheck, setVersionCheck]     = useState(null)  // null | result dict from /flash/firmware_version
+  const [versionChecking, setVersionChecking] = useState(false)
+  const [awaitingFlashChoice, setAwaitingFlashChoice] = useState(false)
   const pollRef = useRef(null)
 
   // Reset backend state on mount so a fresh wizard never shows a previous session's data
@@ -238,15 +231,36 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
     }
   }, [status?.state])
 
-  async function handleStart() {
-    setStartError(null)
+  async function _doStart(skipFlash) {
     setStarted(true)
+    setAwaitingFlashChoice(false)
     try {
-      await api.flashStart(canId, invertPhase, motorProfile, 'SWD', canChannel ?? 'can0')
+      await api.flashStart(canId, invertPhase, motorProfile, 'SWD', canChannel ?? 'can0', skipFlash)
     } catch (e) {
       setStartError(e.message)
       setStarted(false)
     }
+  }
+
+  async function handleStart() {
+    setStartError(null)
+    if (!commissionOnly) {
+      // Check if ESC already has the latest firmware before flashing.
+      setVersionChecking(true)
+      try {
+        const result = await api.flashCheckFirmwareVersion()
+        setVersionCheck(result)
+        setVersionChecking(false)
+        if (result.match) {
+          setAwaitingFlashChoice(true)
+          return   // Show choice dialog — user picks skip or flash
+        }
+      } catch {
+        setVersionChecking(false)
+        // Check failed (ST-LINK not connected etc.) — proceed with flash
+      }
+    }
+    await _doStart(commissionOnly)
   }
 
   async function handleReset() {
@@ -257,10 +271,6 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
     } catch (e) {
       setStartError(e.message)
     }
-  }
-
-  async function handlePowerCycled() {
-    try { await api.flashPowerCycled() } catch (e) { console.error(e) }
   }
 
   async function handleCanConnected() {
@@ -283,14 +293,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
     await api.flashReset().catch(() => {})
     onClose()
 
-    // After closing: restart daemon (it was stopped for SWD), apply config (firmware
-    // RAM), then persist this joint's params to ESC flash. Non-fatal if any step fails.
-    if (jointName) {
-      Promise.resolve(window.electron?.ensureDaemon?.())
-        .then(() => api.connectRobot())
-        .then(() => api.storeMotorToFlash(jointName))
-        .catch(() => {})
-    }
+    // Reconnect the robot so the newly-commissioned joint is reflected in telemetry.
+    // Non-fatal if this fails (user can reconnect manually via the sidebar).
+    api.connectRobot().catch(() => {})
   }
 
   async function handleConfirm(correct) {
@@ -303,7 +308,6 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
   const isComplete       = currentState === 'COMPLETE'
   const isFailed         = currentState === 'FAILED'
   const isLocked         = started && LOCKED_STATES.has(currentState)
-  const awaitingPowerCycle  = currentState === 'WAITING_POWER_CYCLE'
   const awaitingCanConnect  = currentState === 'WAITING_CAN_CONNECT'
   const awaitingConfirm     = currentState === 'AWAITING_CONFIRMATION'
   const isCalibrating       = currentState === 'CALIBRATING'
@@ -317,7 +321,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
         {/* ── Header ── */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-surface-3 flex-shrink-0">
           <div>
-            <h2 className="font-semibold text-base">ESC Flash Wizard</h2>
+            <h2 className="font-semibold text-base">
+              {commissionOnly ? 'ESC Commission Wizard' : 'ESC Flash Wizard'}
+            </h2>
             <p className="text-xs text-gray-500 font-mono">
               {jointName} · {canChannel} · CAN ID {canId}
             </p>
@@ -389,8 +395,8 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
                   className="w-full bg-surface-2 border border-surface-3 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:border-accent"
                 >
                   {profiles.map((p) => (
-                    <option key={p.key} value={p.key} disabled={!p.available}>
-                      {p.key}{!p.available ? ' (incomplete)' : ''}
+                    <option key={p.key} value={p.key}>
+                      {p.key}
                     </option>
                   ))}
                   {profiles.length === 0 && (
@@ -411,13 +417,47 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
                   />
                   Invert Phase
                 </label>
-                <span className="text-xs text-gray-600 font-mono px-2 py-1 rounded bg-surface-2 border border-surface-3">
-                  ST-LINK · SWD
-                </span>
-                <button onClick={handleStart} className="btn-primary ml-auto px-5">
-                  Start Flash
+                {!commissionOnly && (
+                  <span className="text-xs text-gray-600 font-mono px-2 py-1 rounded bg-surface-2 border border-surface-3">
+                    ST-LINK · SWD
+                  </span>
+                )}
+                <button
+                  onClick={handleStart}
+                  disabled={versionChecking}
+                  className="btn-primary ml-auto px-5 disabled:opacity-50"
+                >
+                  {versionChecking
+                    ? 'Checking firmware…'
+                    : commissionOnly ? 'Commission Motor' : 'Flash + Commission Motor'}
                 </button>
               </div>
+
+              {/* Firmware version match — offer to skip flash */}
+              {awaitingFlashChoice && versionCheck?.match && (
+                <div className="rounded-lg bg-online/10 border border-online/20 px-4 py-3 space-y-2">
+                  <p className="text-sm font-medium text-online">Firmware version matches</p>
+                  <p className="text-xs text-gray-400">
+                    ESC is running <span className="font-mono">{versionCheck.esc_version_str}</span> — matches
+                    the latest firmware (<span className="font-mono">{versionCheck.expected_version_str}</span>).
+                    Skip flashing and go straight to commissioning?
+                  </p>
+                  <div className="flex gap-2 pt-1">
+                    <button
+                      onClick={() => _doStart(true)}
+                      className="btn-primary text-xs px-4 py-1.5"
+                    >
+                      Skip Flash → Commission Only
+                    </button>
+                    <button
+                      onClick={() => _doStart(false)}
+                      className="btn-ghost text-xs px-4 py-1.5"
+                    >
+                      Flash Anyway
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Error display */}
               {startError && (
@@ -425,7 +465,7 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
                   <div className="rounded-lg bg-warn/10 border border-warn/20 px-4 py-3 space-y-1">
                     <p className="text-xs text-warn font-medium">Missing tools — run in terminal:</p>
                     <code className="block text-xs font-mono text-warn/80 select-all">
-                      sudo apt install openocd gcc-arm-none-eabi
+                      sudo apt install openocd
                     </code>
                   </div>
                 ) : startError.includes('already in progress') ? (
@@ -440,33 +480,52 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
                 )
               )}
 
-              {/* 3-pass explanation */}
               <p className="text-[10px] text-gray-600">
-                3-pass procedure: (1) init Flash option bytes → power cycle → (2) write CAN ID + calibrate → (3) operational firmware.
-                Estimated time: ~3 min not counting compile time.
+                {commissionOnly
+                  ? 'Commissions the ESC over CAN (sets motor profile + gains + ID), then runs encoder calibration. Firmware must already be on the ESC. Estimated time: ~1 min.'
+                  : 'Flashes pre-compiled firmware via ST-LINK, commissions the ESC over CAN (sets motor profile + gains + ID), then runs encoder calibration. No compile step — estimated time: ~2 min.'}
               </p>
             </div>
-          )}
-
-          {/* Awaiting power cycle */}
-          {awaitingPowerCycle && (
-            <PowerCycleWaiting onManualConfirm={handlePowerCycled} />
           )}
 
           {/* Awaiting CAN connect */}
           {awaitingCanConnect && (
             <div className="space-y-3">
               <div>
-                <p className="text-sm font-medium">Connect motor, CAN bus, and encoder</p>
-                <ol className="mt-2 space-y-1 text-xs text-gray-400 list-decimal list-inside">
-                  <li>Connect the CAN bus cable to the ESC ({canChannel})</li>
-                  <li>Connect the motor phase wires to the ESC</li>
-                  <li>Connect the encoder cable to the ESC</li>
-                  <li>Power on the ESC (apply motor bus voltage)</li>
-                </ol>
+                {commissionOnly ? (
+                  <>
+                    <p className="text-sm font-medium">Power cycle, then connect hardware</p>
+                    <ol className="mt-2 space-y-1 text-xs text-gray-400 list-decimal list-inside">
+                      <li>Power cycle the ESC — disconnect then reconnect its power supply</li>
+                      <li>Connect the CAN bus cable to the ESC ({canChannel})</li>
+                      <li>Connect the motor phase wires to the ESC</li>
+                      <li>Connect the encoder cable to the ESC</li>
+                    </ol>
+                    <p className="mt-2 text-[11px] text-gray-500">
+                      Power cycling resets the CAN controller to a clean state.
+                      The ESC will boot at its configured CAN ID.
+                      Commissioning (setting CAN ID {canId} and motor profile) runs automatically after you click below.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-sm font-medium">Power cycle, then connect hardware</p>
+                    <ol className="mt-2 space-y-1 text-xs text-gray-400 list-decimal list-inside">
+                      <li>Power cycle the ESC — disconnect then reconnect its power supply</li>
+                      <li>Connect the CAN bus cable to the ESC ({canChannel})</li>
+                      <li>Connect the motor phase wires to the ESC</li>
+                      <li>Connect the encoder cable to the ESC</li>
+                    </ol>
+                    <p className="mt-2 text-[11px] text-gray-500">
+                      A power cycle is required after SWD flash so the CAN peripheral initialises
+                      from a clean hardware reset. Commissioning (setting CAN ID {canId}) runs
+                      automatically after you click below.
+                    </p>
+                  </>
+                )}
               </div>
 
-              {/* CAN connectivity test */}
+              {/* CAN connectivity test — pings at commissioning ID 127 */}
               <div className="flex items-center gap-3 flex-wrap">
                 <button
                   onClick={handleCanPing}
@@ -488,12 +547,12 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
               </div>
               {pingState && pingState !== 'pending' && !pingState.reachable && (
                 <p className="text-xs text-warn">
-                  ESC not responding. Check: power is applied, CAN cable is connected to {canChannel}, CAN ID {canId} matches what was flashed.
+                  ESC not responding. Check: ESC was power-cycled, CAN cable is connected to {canChannel}, 120 Ω termination on both ends of the CAN bus.
                 </p>
               )}
 
               <button onClick={handleCanConnected} className="btn-primary w-full">
-                Motor connected — Start Calibration
+                Hardware connected — Start Commissioning
               </button>
             </div>
           )}
@@ -562,7 +621,7 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
           )}
 
           {/* Generic in-progress spinner */}
-          {isActive && !awaitingPowerCycle && !awaitingCanConnect && !awaitingConfirm && !isCalibrating && (
+          {isActive && !awaitingCanConnect && !awaitingConfirm && !isCalibrating && (
             <div className="flex items-center gap-2">
               <span className="w-3.5 h-3.5 rounded-full border-2 border-accent border-t-transparent animate-spin" />
               <span className="text-sm text-gray-400">

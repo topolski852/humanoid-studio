@@ -119,9 +119,8 @@ void Robot::stop() {
 // ── Control tick (200 Hz) ────────────────────────────────────────────────────
 
 void Robot::control_tick() {
-    // 1. Drain all pending Rx frames and dispatch to actuators.
+    // 1. Drain all pending Rx frames and dispatch to actuators + generic listeners.
     bus_mgr_->drain_all([this](const std::string& ifname, const can_frame& frame) {
-        (void)ifname;
         uint32_t arb = frame.can_id & CAN_EFF_MASK;
         int dev_id = static_cast<int>(get_device_id(arb));
         for (auto& a : actuators_) {
@@ -130,6 +129,7 @@ void Robot::control_tick() {
                 break;
             }
         }
+        generic_listener_.on_frame(ifname, frame);
     });
 
     // 2. Tick each actuator (send PDO2 or heartbeat).
@@ -381,6 +381,268 @@ std::string Robot::handle_command(const std::string& request) {
         // Respond first, then stop asynchronously.
         std::thread([this]{ std::this_thread::sleep_for(ms(100)); stop(); }).detach();
         return ack();
+    }
+
+    // ── Generic CAN passthrough commands ─────────────────────────────────────
+    // These allow the Flash Wizard (and any other Python caller) to perform
+    // SDO reads/writes, heartbeat waits, bus sniffs, and calibration against
+    // arbitrary device IDs without opening a second SocketCAN socket.
+
+    if (type == "GENERIC_SDO_WRITE") {
+        std::string channel  = req.value("channel", "");
+        int         device_id = req.value("device_id", -1);
+        int         param_id  = req.value("param_id", -1);
+        std::string val_type  = req.value("value_type", "u32");
+        int         timeout_ms = req.value("timeout_ms", 500);
+
+        if (!bus_mgr_->is_open(channel))
+            return error("bus not open: " + channel);
+        if (device_id < 0 || device_id > 127 || param_id < 0)
+            return error("invalid device_id or param_id");
+
+        uint8_t val_bytes[4] = {};
+        if (val_type == "f32") {
+            float v = req.value("value", 0.0f);
+            std::memcpy(val_bytes, &v, 4);
+        } else if (val_type == "i32") {
+            int32_t v = req.value("value", 0);
+            std::memcpy(val_bytes, &v, 4);
+        } else {
+            uint32_t v = req.value<uint32_t>("value", 0u);
+            std::memcpy(val_bytes, &v, 4);
+        }
+
+        auto fut = generic_listener_.expect_once(channel,
+            static_cast<uint8_t>(device_id), FUNC_TRANSMIT_SDO);
+
+        can_frame f{};
+        f.can_id  = make_arb_id(FUNC_RECEIVE_SDO, static_cast<uint8_t>(device_id));
+        f.can_dlc = 8;
+        f.data[0] = SDO_CMD_WRITE;
+        f.data[1] = static_cast<uint8_t>(param_id & 0xFF);
+        f.data[2] = static_cast<uint8_t>((param_id >> 8) & 0xFF);
+        f.data[3] = 0;
+        std::memcpy(f.data + 4, val_bytes, 4);
+        bus_mgr_->send(channel, f);
+
+        auto stat = fut.wait_for(ms(timeout_ms));
+        if (stat != std::future_status::ready) {
+            return json{{"type","SDO_WRITE_RESULT"},{"id",id},{"status","NO_ACK"}}.dump();
+        }
+        can_frame ack_frame = fut.get();
+        if (ack_frame.can_dlc < 1 || ack_frame.data[0] != SDO_WRITE_ACK) {
+            return json{{"type","SDO_WRITE_RESULT"},{"id",id},{"status","BAD_ACK"}}.dump();
+        }
+        return json{{"type","SDO_WRITE_RESULT"},{"id",id},{"status","OK"}}.dump();
+    }
+
+    if (type == "GENERIC_SDO_READ") {
+        std::string channel  = req.value("channel", "");
+        int         device_id = req.value("device_id", -1);
+        int         param_id  = req.value("param_id", -1);
+        int         timeout_ms = req.value("timeout_ms", 500);
+
+        if (!bus_mgr_->is_open(channel))
+            return error("bus not open: " + channel);
+        if (device_id < 0 || device_id > 127 || param_id < 0)
+            return error("invalid device_id or param_id");
+
+        auto fut = generic_listener_.expect_once(channel,
+            static_cast<uint8_t>(device_id), FUNC_TRANSMIT_SDO);
+
+        can_frame f{};
+        f.can_id  = make_arb_id(FUNC_RECEIVE_SDO, static_cast<uint8_t>(device_id));
+        f.can_dlc = 8;
+        f.data[0] = SDO_CMD_READ;
+        f.data[1] = static_cast<uint8_t>(param_id & 0xFF);
+        f.data[2] = static_cast<uint8_t>((param_id >> 8) & 0xFF);
+        std::memset(f.data + 3, 0, 5);
+        bus_mgr_->send(channel, f);
+
+        auto stat = fut.wait_for(ms(timeout_ms));
+        if (stat != std::future_status::ready) {
+            return json{{"type","SDO_READ_RESULT"},{"id",id},{"status","TIMEOUT"}}.dump();
+        }
+        can_frame rx = fut.get();
+
+        // Production firmware: 8-byte response, value at bytes 4-7.
+        // Commissioning ELF v3.0.0: 4-byte response, value at bytes 0-3.
+        uint8_t vbytes[4] = {};
+        if (rx.can_dlc >= 8 && rx.data[0] == SDO_READ_RESP) {
+            std::memcpy(vbytes, rx.data + 4, 4);
+        } else if (rx.can_dlc >= 4) {
+            std::memcpy(vbytes, rx.data, 4);
+        } else {
+            return json{{"type","SDO_READ_RESULT"},{"id",id},{"status","BAD_RESPONSE"}}.dump();
+        }
+
+        uint32_t u32 = 0; float f32 = 0.0f; int32_t i32 = 0;
+        std::memcpy(&u32, vbytes, 4);
+        std::memcpy(&f32, vbytes, 4);
+        std::memcpy(&i32, vbytes, 4);
+
+        return json{{"type","SDO_READ_RESULT"},{"id",id},{"status","OK"},
+                    {"value_u32",u32},{"value_f32",f32},{"value_i32",i32}}.dump();
+    }
+
+    if (type == "WAIT_HEARTBEAT") {
+        std::string channel  = req.value("channel", "");
+        int         device_id = req.value("device_id", -1);
+        int         timeout_ms = req.value("timeout_ms", 3000);
+
+        if (!bus_mgr_->is_open(channel))
+            return error("bus not open: " + channel);
+        if (device_id < 0 || device_id > 127)
+            return error("invalid device_id");
+
+        auto fut = generic_listener_.expect_once(channel,
+            static_cast<uint8_t>(device_id), FUNC_HEARTBEAT);
+
+        auto stat = fut.wait_for(ms(timeout_ms));
+        if (stat != std::future_status::ready) {
+            return json{{"type","HEARTBEAT_RESULT"},{"id",id},{"status","TIMEOUT"}}.dump();
+        }
+        can_frame hb = fut.get();
+        uint8_t  mode = (hb.can_dlc >= 1) ? hb.data[0] : 0;
+        uint32_t err  = 0;
+        if (hb.can_dlc >= 5) std::memcpy(&err, hb.data + 1, 4);
+        return json{{"type","HEARTBEAT_RESULT"},{"id",id},{"status","OK"},
+                    {"mode",mode},{"error",err}}.dump();
+    }
+
+    if (type == "SNIFF_BUS") {
+        std::string channel    = req.value("channel", "");
+        int         duration_ms = req.value("duration_ms", 3000);
+        if (duration_ms > 30000) duration_ms = 30000;
+
+        if (!bus_mgr_->is_open(channel))
+            return error("bus not open: " + channel);
+
+        uint64_t sniff_id = generic_listener_.begin_sniff(channel);
+        std::this_thread::sleep_for(ms(duration_ms));
+        auto frames = generic_listener_.end_sniff(sniff_id);
+
+        json frames_arr = json::array();
+        for (const auto& fr : frames) {
+            uint32_t arb = fr.can_id & CAN_EFF_MASK;
+            char hex[17] = {};
+            int dlc = (fr.can_dlc <= 8) ? fr.can_dlc : 8;
+            for (int i = 0; i < dlc; i++)
+                std::snprintf(hex + i * 2, 3, "%02x", fr.data[i]);
+            frames_arr.push_back(json{
+                {"device_id", get_device_id(arb)},
+                {"func_id",   get_func_id(arb)},
+                {"dlc",       dlc},
+                {"data",      hex}
+            });
+        }
+        return json{{"type","SNIFF_RESULT"},{"id",id},{"status","OK"},
+                    {"frames",frames_arr}}.dump();
+    }
+
+    if (type == "SEND_NMT") {
+        std::string channel  = req.value("channel", "");
+        int         device_id = req.value("device_id", -1);
+        int         mode      = req.value("mode", -1);
+
+        if (!bus_mgr_->is_open(channel))
+            return error("bus not open: " + channel);
+        if (device_id < 0 || device_id > 127 || mode < 0 || mode > 255)
+            return error("invalid device_id or mode");
+
+        can_frame f{};
+        f.can_id  = make_arb_id(FUNC_NMT, static_cast<uint8_t>(device_id));
+        f.can_dlc = 2;
+        f.data[0] = static_cast<uint8_t>(mode);
+        f.data[1] = static_cast<uint8_t>(device_id);
+        bus_mgr_->send(channel, f);
+        return ack();
+    }
+
+    if (type == "SEND_FLASH_STORE") {
+        std::string channel  = req.value("channel", "");
+        int         device_id = req.value("device_id", -1);
+
+        if (!bus_mgr_->is_open(channel))
+            return error("bus not open: " + channel);
+        if (device_id < 0 || device_id > 127)
+            return error("invalid device_id");
+
+        can_frame f{};
+        f.can_id  = make_arb_id(FUNC_FLASH, static_cast<uint8_t>(device_id));
+        f.can_dlc = 1;
+        f.data[0] = 0x01;
+        bus_mgr_->send(channel, f);
+        // Flash write takes ~150 ms; wait 300 ms to ensure completion.
+        std::this_thread::sleep_for(ms(300));
+        return ack();
+    }
+
+    if (type == "FEED_WATCHDOG") {
+        std::string channel  = req.value("channel", "");
+        int         device_id = req.value("device_id", -1);
+
+        if (!bus_mgr_->is_open(channel))
+            return error("bus not open: " + channel);
+        if (device_id < 0 || device_id > 127)
+            return error("invalid device_id");
+
+        can_frame f{};
+        f.can_id  = make_arb_id(FUNC_HEARTBEAT, static_cast<uint8_t>(device_id));
+        f.can_dlc = 8;
+        std::memset(f.data, 0, 8);
+        bus_mgr_->send(channel, f);
+        return ack();
+    }
+
+    if (type == "CALIBRATE_DEVICE") {
+        std::string channel  = req.value("channel", "");
+        int         device_id = req.value("device_id", -1);
+        int         timeout_ms = req.value("timeout_ms", 90000);
+
+        if (!bus_mgr_->is_open(channel))
+            return error("bus not open: " + channel);
+        if (device_id < 0 || device_id > 127)
+            return error("invalid device_id");
+
+        // Enter calibration mode.
+        {
+            can_frame nmt{};
+            nmt.can_id  = make_arb_id(FUNC_NMT, static_cast<uint8_t>(device_id));
+            nmt.can_dlc = 2;
+            nmt.data[0] = MODE_CALIBRATION;
+            nmt.data[1] = static_cast<uint8_t>(device_id);
+            bus_mgr_->send(channel, nmt);
+        }
+
+        // Poll heartbeats until mode returns to IDLE or DISABLED.
+        auto deadline = Clock::now() + ms(timeout_ms);
+        while (Clock::now() < deadline) {
+            int remaining = static_cast<int>(
+                std::chrono::duration_cast<ms>(deadline - Clock::now()).count());
+            if (remaining <= 0) break;
+
+            auto fut = generic_listener_.expect_once(channel,
+                static_cast<uint8_t>(device_id), FUNC_HEARTBEAT);
+            auto stat = fut.wait_for(ms(std::min(remaining, 2000)));
+
+            if (stat != std::future_status::ready) continue;
+
+            can_frame hb = fut.get();
+            uint8_t  hb_mode = (hb.can_dlc >= 1) ? hb.data[0] : 0xFF;
+            uint32_t hb_err  = 0;
+            if (hb.can_dlc >= 5) std::memcpy(&hb_err, hb.data + 1, 4);
+
+            if (hb_err & ERROR_CALIBRATION_ERROR) {
+                return json{{"type","CALIBRATE_RESULT"},{"id",id},{"status","ERROR"},
+                            {"error_code",hb_err}}.dump();
+            }
+            if (hb_mode == MODE_IDLE || hb_mode == MODE_DISABLED) {
+                return json{{"type","CALIBRATE_RESULT"},{"id",id},{"status","OK"},
+                            {"error_code",hb_err}}.dump();
+            }
+        }
+        return json{{"type","CALIBRATE_RESULT"},{"id",id},{"status","TIMEOUT"}}.dump();
     }
 
     return error("unknown command type: " + type);

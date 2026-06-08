@@ -243,13 +243,10 @@ class CANBus:
         self._waiters: list[_Waiter] = []
         self._waiters_lock = asyncio.Lock()
         self._tx_lock = asyncio.Lock()
-        # Per-device SDO lock: guarantees only one SDO read or write is in flight
-        # per device_id at a time.  Without this, two concurrent coroutines (e.g.
-        # two WebSocket telemetry loops, or telemetry + a GET /motors API call)
-        # can each register a waiter for (device_id, TRANSMIT_SDO) simultaneously.
-        # The firmware SDO response carries no param_id echo, so whichever waiter
-        # fires first gets the other coroutine's response bytes — producing the
-        # random garbage error-register values seen in practice.
+        # Per-device SDO lock: guarantees only one SDO transaction is in flight per
+        # device_id at a time.  Firmware now echoes param_id in 8-byte responses, so
+        # concurrent reads would no longer silently corrupt each other, but the lock
+        # is kept for serialization correctness.
         self._device_sdo_locks: dict[int, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
@@ -295,7 +292,11 @@ class CANBus:
                     w.future.cancel()
             self._waiters.clear()
 
-        self._executor.shutdown(wait=True)
+        # Do NOT shut down the executor here — disconnect() is called between
+        # reconnect cycles (e.g. during the commissioning pre-check retry loop).
+        # Shutting it down prevents connect() from reusing it, producing a flood
+        # of "cannot schedule new futures after shutdown" errors on the next
+        # connect().  The executor is cleaned up when the process exits.
         _log.info("CANBus disconnected: %s", self.channel)
 
     async def __aenter__(self) -> "CANBus":
@@ -467,12 +468,10 @@ class CANBus:
     async def _sdo_read(
         self, device_id: int, param_id: int, timeout: float = 0.1
     ) -> bytes | None:
-        """Send SDO read request; return 4 raw bytes or None on timeout.
+        """Send SDO read request; return 4 raw value bytes or None on timeout.
 
-        The per-device lock ensures only one SDO transaction is in flight for
-        this device at a time.  The firmware SDO response is 4 bytes of raw
-        value with no param_id echo, so concurrent reads to the same device
-        would cause each waiter to consume the other's response.
+        Standard 8-byte CANopen upload response: byte0=0x43, bytes1-2=param_id echo,
+        byte3=0, bytes4-7=value.  The per-device lock serializes transactions.
         """
         async with self._sdo_lock(device_id):
             # Register waiter BEFORE transmitting — avoids race if response arrives fast
@@ -492,7 +491,14 @@ class CANBus:
 
             try:
                 rx = await asyncio.wait_for(future, timeout=timeout)
-                return bytes(rx.data[:4])
+                # Production firmware: 8-byte CANopen upload response, value at [4:8].
+                # Commissioning ELF v3.0.0: 4-byte raw response, value at [0:4].
+                if len(rx.data) >= 8:
+                    return bytes(rx.data[4:8])
+                elif len(rx.data) == 4:
+                    return bytes(rx.data[0:4])
+                else:
+                    return None
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 async with self._waiters_lock:
                     try:
@@ -508,13 +514,11 @@ class CANBus:
         Acquires the per-device SDO lock so writes do not interleave with
         concurrent reads (which would cause the read waiter to miss its response).
 
-        Firmware >= 0x20250226 sends a 1-byte 0x60 write-ACK on FUNC_TRANSMIT_SDO
-        immediately after receiving a write.  We register a waiter for it BEFORE
-        transmitting so the ACK is always consumed here and never leaks to a
-        subsequent _sdo_read() waiter (which expects 4-byte value data and would
-        raise struct.error on a 1-byte payload).  The 15 ms timeout is generous
-        enough to catch the sub-millisecond CAN round-trip while keeping writes
-        fast against older firmware that sends no ACK.
+        Firmware sends a standard 8-byte CANopen download response (byte0=0x60, bytes1-2=
+        param_id echo) on FUNC_TRANSMIT_SDO after each write.  We register a waiter
+        BEFORE transmitting so the ACK is consumed here and never leaks to a concurrent
+        _sdo_read() waiter.  200 ms covers the sub-millisecond CAN round-trip with ample
+        margin for slow firmware response paths (e.g. during flash-write operations).
         """
         assert len(raw) == 4, "SDO value must be exactly 4 bytes"
         async with self._sdo_lock(device_id):
@@ -532,7 +536,7 @@ class CANBus:
             await self.transmit(frame)
 
             try:
-                await asyncio.wait_for(ack_future, timeout=0.015)
+                await asyncio.wait_for(ack_future, timeout=0.200)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 async with self._waiters_lock:
                     try:
@@ -635,6 +639,16 @@ class CANBus:
             func_id=Function.FLASH,
             data=struct.pack("<B", 1),
         ))
+
+    async def reboot(self, device_id: int) -> None:
+        """Trigger a hardware system reset via the special SDO command (0xFF04).
+
+        The firmware sends a write-ACK before asserting SYSRESETREQ, so the
+        15 ms timeout in _sdo_write is sufficient to confirm the command was
+        received.  Caller should sleep ~3 s after this returns to let the
+        device complete its boot sequence.
+        """
+        await self._sdo_write(device_id, 0xFF04, struct.pack("<L", 1))
 
     async def load_from_flash(self, device_id: int) -> None:
         """Reload Flash config into RAM."""

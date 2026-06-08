@@ -19,9 +19,25 @@ import time
 import uuid
 from typing import Callable
 
+from enum import IntEnum
+
 from humanoid.actuator import ActuatorState
-from humanoid.can_bus import Mode
 from humanoid.robot_config import JointConfig, RobotConfig
+
+
+class Mode(IntEnum):
+    DISABLED            = 0x00
+    IDLE                = 0x01
+    DAMPING             = 0x02
+    CALIBRATION         = 0x05
+    CURRENT             = 0x10
+    TORQUE              = 0x11
+    VELOCITY            = 0x12
+    POSITION            = 0x13
+    VABC_OVERRIDE       = 0x20
+    VALPHABETA_OVERRIDE = 0x21
+    VQD_OVERRIDE        = 0x22
+    DEBUG               = 0x80
 
 _log = logging.getLogger(__name__)
 
@@ -455,6 +471,145 @@ class DaemonClient:
             self._send_command({"type": "SHUTDOWN"})
         except DaemonError:
             pass  # daemon may already be gone
+
+    # ------------------------------------------------------------------ #
+    # Generic CAN passthrough — flash wizard and commissioning            #
+    # ------------------------------------------------------------------ #
+
+    def generic_sdo_write(
+        self,
+        channel: str,
+        device_id: int,
+        param_id: int,
+        value_type: str,
+        value: float | int,
+        timeout: float = 1.0,
+    ) -> bool:
+        """
+        Write a parameter to any device_id on the bus (not just configured joints).
+        value_type: 'u32', 'i32', or 'f32'.
+        Returns True if the ESC ACK'd, False if no-ACK (commissioning ELF may not respond).
+        Raises DaemonNotRunningError if the daemon is unreachable.
+        """
+        resp = self._send_command({
+            "type": "GENERIC_SDO_WRITE",
+            "channel": channel,
+            "device_id": device_id,
+            "param_id": param_id,
+            "value_type": value_type,
+            "value": value,
+            "timeout_ms": int(timeout * 1000),
+        }, timeout=timeout + 1.0)
+        return resp.get("status") == "OK"
+
+    def generic_sdo_read(
+        self,
+        channel: str,
+        device_id: int,
+        param_id: int,
+        timeout: float = 1.0,
+    ) -> dict | None:
+        """
+        Read a parameter from any device_id.
+        Returns dict with value_u32, value_f32, value_i32, or None on timeout.
+        """
+        resp = self._send_command({
+            "type": "GENERIC_SDO_READ",
+            "channel": channel,
+            "device_id": device_id,
+            "param_id": param_id,
+            "timeout_ms": int(timeout * 1000),
+        }, timeout=timeout + 1.0)
+        if resp.get("status") == "OK":
+            return {
+                "value_u32": resp.get("value_u32"),
+                "value_f32": resp.get("value_f32"),
+                "value_i32": resp.get("value_i32"),
+            }
+        return None
+
+    def wait_heartbeat(
+        self,
+        channel: str,
+        device_id: int,
+        timeout_ms: int = 3000,
+    ) -> dict | None:
+        """
+        Block until a heartbeat is received from device_id, or timeout.
+        Returns dict with 'mode' (int) and 'error' (int), or None on timeout.
+        """
+        resp = self._send_command({
+            "type": "WAIT_HEARTBEAT",
+            "channel": channel,
+            "device_id": device_id,
+            "timeout_ms": timeout_ms,
+        }, timeout=timeout_ms / 1000.0 + 1.0)
+        if resp.get("status") == "OK":
+            return {"mode": resp.get("mode", 0), "error": resp.get("error", 0)}
+        return None
+
+    def sniff_bus(
+        self,
+        channel: str,
+        duration_ms: int = 3000,
+    ) -> list[dict]:
+        """
+        Collect all CAN frames on the channel for duration_ms milliseconds.
+        Returns list of {device_id, func_id, dlc, data} dicts.
+        """
+        resp = self._send_command({
+            "type": "SNIFF_BUS",
+            "channel": channel,
+            "duration_ms": duration_ms,
+        }, timeout=duration_ms / 1000.0 + 2.0)
+        return resp.get("frames", [])
+
+    def send_nmt(self, channel: str, device_id: int, mode: int) -> None:
+        """Send an NMT mode-change frame to any device_id."""
+        self._send_command({
+            "type": "SEND_NMT",
+            "channel": channel,
+            "device_id": device_id,
+            "mode": mode,
+        })
+
+    def send_flash_store(self, channel: str, device_id: int) -> None:
+        """Send FUNC_FLASH store command; blocks ~300 ms for flash write to complete."""
+        self._send_command({
+            "type": "SEND_FLASH_STORE",
+            "channel": channel,
+            "device_id": device_id,
+        }, timeout=2.0)
+
+    def feed_watchdog_generic(self, channel: str, device_id: int) -> None:
+        """Send a heartbeat (watchdog feed) frame to any device_id."""
+        self._send_command({
+            "type": "FEED_WATCHDOG",
+            "channel": channel,
+            "device_id": device_id,
+        })
+
+    def calibrate_device(
+        self,
+        channel: str,
+        device_id: int,
+        timeout_ms: int = 90000,
+    ) -> dict:
+        """
+        Enter MODE_CALIBRATION on device_id and wait for it to complete.
+        Blocks until the device heartbeats back to IDLE/DISABLED, or timeout.
+        Returns dict with 'status' ('OK', 'TIMEOUT', 'ERROR') and 'error_code'.
+        """
+        resp = self._send_command({
+            "type": "CALIBRATE_DEVICE",
+            "channel": channel,
+            "device_id": device_id,
+            "timeout_ms": timeout_ms,
+        }, timeout=timeout_ms / 1000.0 + 5.0)
+        return {
+            "status": resp.get("status", "TIMEOUT"),
+            "error_code": resp.get("error_code", 0),
+        }
 
     # ------------------------------------------------------------------ #
     # Robot-like interface for routes                                      #

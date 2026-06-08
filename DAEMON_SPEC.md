@@ -606,7 +606,7 @@ via `asyncio.DatagramProtocol` is sufficient).
 
 ## 6. Migration Plan
 
-### Phase 1 — Daemon Skeleton
+### Phase 1 — Daemon Skeleton ✅ Complete
 **Goal:** Buildable binary with config loading, UDP server, signal handling. No CAN.
 
 1. Create `daemon/` with `CMakeLists.txt`.
@@ -619,7 +619,7 @@ via `asyncio.DatagramProtocol` is sufficient).
 
 **Python:** No changes.
 
-### Phase 2 — CAN Layer
+### Phase 2 — CAN Layer ✅ Complete
 **Goal:** Daemon opens CAN sockets, receives frames, performs SDO reads/writes.
 
 1. Implement `can_bus.cpp` — socket, reader thread, epoll, Tx queue.
@@ -631,7 +631,7 @@ via `asyncio.DatagramProtocol` is sufficient).
 
 **Python:** No changes. Old stack fully operational.
 
-### Phase 3 — Control Loop + Full Command Set
+### Phase 3 — Control Loop + Full Command Set ✅ Complete
 **Goal:** Daemon runs the 200 Hz loop, feeds watchdog, handles all commands, pushes telemetry.
 
 1. Implement `loop_func.h` — period timing, SCHED_FIFO, CPU affinity, overrun logging.
@@ -645,7 +645,7 @@ via `asyncio.DatagramProtocol` is sufficient).
 
 **Python:** No changes.
 
-### Phase 4 — Python Migration
+### Phase 4 — Python Migration ✅ Complete
 **Goal:** FastAPI routes talk to `DaemonClient`; old Python CAN stack deleted.
 
 1. Implement `daemon_client.py` and `daemon_process.py`.
@@ -654,10 +654,12 @@ via `asyncio.DatagramProtocol` is sufficient).
 4. Update `/ws/telemetry` endpoint.
 5. Remove `python-can` from `requirements.txt`.
 6. Delete `can_bus.py`, `actuator.py`, `robot.py`, `can_monitor.py`, `recoil_protocol.py`.
+   **Note:** `can_bus.py`, `actuator.py`, and `recoil_protocol.py` were kept for type definitions
+   and enums re-used by `flash.py`. No live CAN operations remain in Python.
 7. **Verify:** Full end-to-end — Electron app connects, telemetry streams at 10 Hz, 100 Hz
    position commands work, calibration completes, Flash Wizard unaffected (uses OpenOCD).
 
-### Phase 5 — Integration Testing + Performance Validation
+### Phase 5 — Integration Testing + Performance Validation ✅ Complete
 **Goal:** No regressions; latency and throughput improvements confirmed.
 
 1. 10-minute soak test: 22 joints ENABLED, 10 Hz telemetry, 100 Hz position commands.
@@ -675,13 +677,13 @@ via `asyncio.DatagramProtocol` is sufficient).
 
 Minimum before declaring Phase 3 complete:
 
-- [ ] `./humanoid_daemon --config ../configs/humanoid_lite.json` starts without error
-- [ ] `GET_ALL_STATES` returns all 22 joints (`OFFLINE` for unpowered, `IDLE` for powered)
-- [ ] `APPLY_ALL_CONFIGS` writes all params to ESCs without SDO timeout
-- [ ] `SET_MODE left_hip_yaw POSITION` → joint transitions to `ENABLED`
-- [ ] `SET_POSITION left_hip_yaw 0.5` → PDO2 frame visible on `candump can_left_leg`
-- [ ] PDO4 feedback received → `position_measured` updates in `GET_STATE`
-- [ ] HEARTBEAT feed frames visible every 200 ms on `candump` for IDLE joints
-- [ ] EMCY received from ESC → joint transitions to `FAULT` in `GET_STATE`
-- [ ] Ctrl+C → all joints `DAMPING` within 500 ms, then `IDLE` within 1 s, exit 0
-- [ ] No Python-originated CAN frames on `candump` while daemon is running
+- [x] `./humanoid_daemon --config ../configs/humanoid_lite.json` starts without error
+- [x] `GET_ALL_STATES` returns all 22 joints (`OFFLINE` for unpowered, `IDLE` for powered)
+- [x] `APPLY_ALL_CONFIGS` writes all params to ESCs without SDO timeout
+- [x] `SET_MODE left_hip_yaw POSITION` → joint transitions to `ENABLED`
+- [x] `SET_POSITION left_hip_yaw 0.5` → PDO2 frame visible on `candump can_left_leg`
+- [x] PDO4 feedback received → `position_measured` updates in `GET_STATE`
+- [x] HEARTBEAT feed frames visible every 200 ms on `candump` for IDLE joints
+- [x] EMCY received from ESC → joint transitions to `FAULT` in `GET_STATE`
+- [x] Ctrl+C → all joints `DAMPING` within 500 ms, then `IDLE` within 1 s, exit 0
+- [x] No Python-originated CAN frames on `candump` while daemon is running

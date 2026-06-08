@@ -76,7 +76,6 @@ async def lifespan(app: FastAPI):
         _TELEMETRY_HZ = config.telemetry_hz
         _log.info("Telemetry rate: %d Hz", _TELEMETRY_HZ)
 
-    app.state.flash_manager = FlashManager()
     app.state.ws_clients: set[WebSocket] = set()
 
     # DaemonClient replaces both Robot and CanMonitor.
@@ -86,6 +85,8 @@ async def lifespan(app: FastAPI):
     await client.start()
     app.state.robot       = client if config is not None else None
     app.state.can_monitor = client
+
+    app.state.flash_manager = FlashManager(client)
 
     # Background watchdog feed — no-op with daemon (daemon feeds watchdogs internally),
     # but kept so the task structure is unchanged.
