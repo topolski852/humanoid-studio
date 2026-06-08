@@ -198,7 +198,7 @@ async def flash_reset(request: Request) -> dict:
     return _ok({"state": "IDLE", "message": "Session reset"})
 
 
-@router.get("/flash/firmware_version")
+@router.get("/flash/firmware_version", response_model=None)
 async def flash_firmware_version(
     request: Request,
     firmware_dir: str | None = None,
