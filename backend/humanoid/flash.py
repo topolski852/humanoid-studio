@@ -695,14 +695,14 @@ class FlashManager:
         comm_id = _COMMISSIONING_CAN_ID
         dc = self._daemon_client
 
-        # Feed watchdog at the active comm ID before sniffing.
-        # Production firmware in IDLE mode has no watchdog timeout, but this
-        # is a no-op safety measure in case the ESC is in an unexpected mode.
+        # Feed watchdog at the ID the ESC is expected to be at.
+        # With skip_flash, the ESC is already at the target ID (not comm_id=127).
+        feed_id = comm_id if not config.skip_flash else config.can_id
         self._log(
-            f"Sending watchdog feed to ID {comm_id} on {config.can_channel}...",
+            f"Sending watchdog feed to ID {feed_id} on {config.can_channel}...",
             progress=41)
         await loop.run_in_executor(
-            None, dc.feed_watchdog_generic, config.can_channel, comm_id)
+            None, dc.feed_watchdog_generic, config.can_channel, feed_id)
         await asyncio.sleep(0.5)
 
         # Passive sniff: collect all CAN frames for 3 s.
@@ -712,6 +712,7 @@ class FlashManager:
 
         _sniff_saw_comm_id = False
         _sniff_saw_target_id = False
+        _sniff_target_emcy_error: int | None = None   # set if ESC broadcasts EMCY (error state)
         _hb_count_comm = 0
         _hb_last_mode: int | None = None
         _hb_last_error: int | None = None
@@ -732,12 +733,24 @@ class FlashManager:
                             _hb_last_error = struct.unpack_from("<I", raw_bytes, 1)[0]
                         except Exception:
                             pass
-            if dev == config.can_id and func == 0xE and config.can_id != comm_id:
-                _sniff_saw_target_id = True
+            if dev == config.can_id and config.can_id != comm_id:
+                if func == 0xE:
+                    _sniff_saw_target_id = True
+                elif func == 0x1 and _sniff_target_emcy_error is None:
+                    # FUNC_SYNC_EMCY — ESC is present but broadcasting an error state.
+                    # Payload is a 4-byte error_code LE (EmcyFrame).
+                    try:
+                        raw_bytes = bytes.fromhex(fr.get("data", ""))
+                        _sniff_target_emcy_error = (
+                            struct.unpack_from("<I", raw_bytes, 0)[0]
+                            if len(raw_bytes) >= 4 else 0
+                        )
+                    except Exception:
+                        _sniff_target_emcy_error = 0
 
         if raw_frames:
-            _FUNC_NAMES = {0x9: "PDO2", 0xA: "PDO3", 0xB: "SDO_TX", 0xC: "SDO_RX",
-                           0xD: "FLASH", 0xE: "HB", 0xF: "NMT"}
+            _FUNC_NAMES = {0x1: "EMCY", 0x9: "PDO2", 0xA: "PDO3", 0xB: "SDO_TX",
+                           0xC: "SDO_RX", 0xD: "FLASH", 0xE: "HB", 0xF: "NMT"}
             device_summary: dict[int, list[str]] = {}
             for (dev, func), count in sorted(_frame_counts.items()):
                 label = _FUNC_NAMES.get(func, f"0x{func:X}")
@@ -753,8 +766,12 @@ class FlashManager:
                     f"  ↳ ID {comm_id} (commissioning ESC): "
                     f"{_hb_count_comm} heartbeat(s) — mode={mode_str}, error={err_str}")
             if _sniff_saw_target_id:
+                self._log(f"  ↳ ID {config.can_id} (target): heartbeat seen")
+            if _sniff_target_emcy_error is not None:
                 self._log(
-                    f"  ↳ ID {config.can_id} (target): heartbeat seen")
+                    f"  ↳ ID {config.can_id} (target): EMCY broadcast — "
+                    f"error={_error_str(_sniff_target_emcy_error)} "
+                    f"(ESC in error/DAMPING state; will send NMT IDLE to recover)")
         else:
             self._log(
                 f"No CAN frames in 3 s on {config.can_channel}. "
@@ -763,6 +780,7 @@ class FlashManager:
         # Determine which ID the ESC is currently at.
         active_id = comm_id
         esc_found = False
+        esc_needs_idle_recovery = False  # True if ESC is in error/DAMPING — must reset before writes
 
         if _sniff_saw_target_id and config.can_id != comm_id:
             active_id = config.can_id
@@ -770,6 +788,16 @@ class FlashManager:
             self._log(
                 f"ESC at target CAN ID {config.can_id} — "
                 f"booted from config page (fresh flash) or previously commissioned.",
+                progress=44)
+        elif _sniff_target_emcy_error is not None and config.can_id != comm_id:
+            # ESC present at target ID but broadcasting EMCY error frames (e.g. DAMPING after
+            # watchdog timeout).  It cannot send heartbeats in this state but IS reachable.
+            active_id = config.can_id
+            esc_found = True
+            esc_needs_idle_recovery = True
+            self._log(
+                f"ESC at target CAN ID {config.can_id} (detected via EMCY broadcast). "
+                f"Will send NMT IDLE to recover before writing params.",
                 progress=44)
         elif _sniff_saw_comm_id:
             esc_found = True
@@ -813,6 +841,26 @@ class FlashManager:
                 raise FlashError(
                     f"ESC did not appear on {config.can_channel} within 30 s — "
                     f"check CAN cable, ESC power, and that it was power-cycled after flashing.")
+
+        # If the ESC is in an error/DAMPING state, reset to IDLE before writing params.
+        # WATCHDOG_TIMEOUT drives the ESC into DAMPING — NMT IDLE clears the watchdog
+        # timer and returns the ESC to a state where SDO writes and calibration work.
+        if esc_needs_idle_recovery:
+            self._log(
+                f"Sending NMT IDLE to ID {active_id} to clear DAMPING/error state...",
+                progress=44)
+            await loop.run_in_executor(
+                None, dc.send_nmt, config.can_channel, active_id, 0x01)  # MODE_IDLE
+            await asyncio.sleep(1.0)
+            hb_idle = await loop.run_in_executor(
+                None, dc.wait_heartbeat, config.can_channel, active_id, 3000)
+            if hb_idle is not None:
+                self._log(
+                    f"ESC recovered: mode={_mode_name(hb_idle['mode'])}, "
+                    f"error={_error_str(hb_idle['error'])}")
+            else:
+                self._log(
+                    "No heartbeat after NMT IDLE (ESC may not broadcast in IDLE — continuing)")
 
         self._log(
             f"ESC at ID {active_id}. "
