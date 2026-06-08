@@ -497,11 +497,11 @@ class FlashManager:
                         f"Required tool not found on PATH: {', '.join(missing)}. "
                         "Install openocd and ensure it is on PATH."
                     )
-                elf_path = config.firmware_dir / "prebuilt" / "production.elf"
+                elf_path = config.firmware_dir / "prebuilt" / f"production_{config.motor_profile}.elf"
                 if not elf_path.exists():
                     raise FlashError(
-                        f"Production firmware not found: {elf_path}. "
-                        "Expected firmware/esc/prebuilt/production.elf"
+                        f"Firmware not found: {elf_path}. "
+                        f"Expected firmware/esc/prebuilt/production_{config.motor_profile}.elf"
                     )
 
             config.profile_data()
@@ -638,7 +638,7 @@ class FlashManager:
         if not config.skip_flash:
             # ── 1. Flash pre-compiled binary ──────────────────────────────────
             self.status.state = FlashState.FLASHING
-            elf_path = firmware_dir / "prebuilt" / "production.elf"
+            elf_path = firmware_dir / "prebuilt" / f"production_{config.motor_profile}.elf"
             self._log(f"Flashing production firmware for {config.motor_profile}...", progress=5)
             await _flash_prebuilt(
                 elf_path, firmware_dir, self._log, profile,
