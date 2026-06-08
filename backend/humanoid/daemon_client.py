@@ -82,8 +82,11 @@ def _daemon_state_to_actuator(d: dict) -> ActuatorState | None:
 
     Returns None for OFFLINE joints so the frontend null-checks correctly
     distinguish unreachable devices from reachable-but-idle ones.
+
+    Telemetry uses "state" key; GET_STATE response uses "joint_state" key.
     """
-    if d.get("state") == "OFFLINE":
+    joint_state = d.get("state") or d.get("joint_state")
+    if joint_state == "OFFLINE":
         return None
     mode_int = int(d.get("mode", 0))
     bv = d.get("bus_voltage")
@@ -210,7 +213,7 @@ class DaemonActuatorProxy:
         )
 
     async def store_to_flash(self) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._client.store_joint_to_flash, self._name)
 
     async def load_from_flash(self) -> None:
@@ -220,7 +223,7 @@ class DaemonActuatorProxy:
         )
 
     async def read_config_from_device(self) -> dict:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._client.read_device_config, self._name)
 
     def __repr__(self) -> str:

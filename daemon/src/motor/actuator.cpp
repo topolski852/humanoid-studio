@@ -46,7 +46,7 @@ void Actuator::on_rx_frame(const can_frame& frame) {
         if (frame.can_dlc < 8) return;
         float wire_pos = get_f32(frame.data);
         float vel      = get_f32(frame.data + 4);
-        state_.position = wire_pos;
+        state_.position = wire_pos - cfg_.position_offset;  // store display-frame
         state_.velocity = vel;
         state_.updated_at = Clock::now();
         last_pdo4_received_ = Clock::now();
@@ -137,8 +137,8 @@ void Actuator::on_rx_frame(const can_frame& frame) {
         // PDO2 feedback — no command-byte prefix, raw position + velocity floats.
         float wire_pos = get_f32(frame.data);
         float vel      = get_f32(frame.data + 4);
-        state_.position   = wire_pos;
-        state_.velocity   = vel;
+        state_.position = wire_pos - cfg_.position_offset;  // store display-frame
+        state_.velocity = vel;
         state_.updated_at = Clock::now();
     }
     // FUNC_TRANSMIT_PDO_3 (calibration status) — ignored for now.
@@ -165,7 +165,7 @@ void Actuator::send_pdo2(CanBusManager& bus, float display_pos, float vel_ff) {
         static_cast<uint8_t>(FuncCode::FUNC_RECEIVE_PDO_2),
         static_cast<uint8_t>(cfg_.device_id));
     frame.can_dlc = 8;
-    put_f32(frame.data,     display_pos);
+    put_f32(frame.data,     display_pos + cfg_.position_offset);  // convert display → wire
     put_f32(frame.data + 4, vel_ff);
     bus.send(cfg_.can_channel, frame);
 }
@@ -199,6 +199,10 @@ void Actuator::tick(CanBusManager& bus) {
                 // Send hold position immediately after NMT so firmware doesn't snap to 0.
                 float hold;
                 { std::lock_guard<std::mutex> slk(state_mutex_); hold = state_.position; }
+                // Seed position_target_ so all subsequent ticks hold this position
+                // until the first SET_POSITION command arrives.  Without this, the
+                // default 0.0 would be sent on tick +1 causing an immediate large error.
+                position_target_ = hold;
                 if (send_nmt) bus.send(cfg_.can_channel, nmt);
                 send_pdo2(bus, hold);
                 { std::lock_guard<std::mutex> slk(state_mutex_); state_.joint_state = JointState::ENABLED; }
