@@ -4,22 +4,31 @@ Flash wizard state machine for B-G431B-ESC1 boards.
 Single-pass firmware procedure:
 
   1. FLASHING:
-     Flash a pre-compiled .elf (one per motor profile) via openocd/ST-LINK,
-     then write a valid commissioning config page so loadConfig succeeds.
-     Device boots at commissioning CAN ID 127.
+     Flash production.elf via openocd/ST-LINK, then write a valid config page
+     so loadConfig succeeds.  The config page encodes device_id=target, motor
+     profile params (i_kp, i_ki, phase_order, etc.).  The ESC boots at the
+     target CAN ID because the production firmware uses CAN_init(filter=0,mask=0)
+     (accept-all FDCAN hardware filter) and reads device_id from the config page.
 
   2. COMMISSIONING:
-     Send CAN SDO writes to ID 127: set phase order and current gains, then set
-     device CAN ID (last), then store config via FUNC_FLASH at the new ID.
+     SDO-write params to the target CAN ID (firmware ACKs writes).  The writes
+     are mostly redundant — the config page already encoded the correct values —
+     but they allow in-memory tuning and update fast_frame_frequency.  Save
+     config to flash via FUNC_FLASH so the target CAN ID is persistent.
 
   3. CALIBRATING:
-     At the real CAN ID: run encoder flux offset calibration.
+     At the target CAN ID: run encoder flux offset calibration.
 
   4. AWAITING_CONFIRMATION:
      User confirms motor direction is correct.
      If wrong: toggle phase order, save, re-calibrate.
 
   5. COMPLETE.
+
+NOTE: The prebuilt commissioning_*.elf files (old firmware) are NOT used.
+They have a hardcoded FDCAN filter for device_id=127 and cannot communicate
+at any other CAN ID.  production.elf (compiled from current source with
+CAN_init(0,0)) accepts all frames and routes by software device_id check.
 """
 from __future__ import annotations
 
@@ -260,17 +269,17 @@ def _make_commissioning_config_page(
     invert_phase: bool = False,
 ) -> bytes:
     """
-    Build a 2 KB valid STM32G431 flash config page for the commissioning ELF.
+    Build a 2 KB valid STM32G431 flash config page for the production ELF.
 
     Without this, a plain page erase leaves all 0xFF bytes.  Every float field
     then reads as NaN, MotorController_loadConfig returns HAL_ERROR on the first
     NaN check, and the firmware enters an infinite UART error loop — no CAN
     response at all.
 
-    The commissioning ELF does NOT process SDO writes — it ignores all SDO
-    frames without sending an ACK.  Therefore ALL persistent configuration must
-    be encoded in this page before flashing.  The ESC will boot at
-    target_device_id using the i_kp, i_ki, and phase_order encoded here.
+    The production ELF uses CAN_init(filter=0, mask=0) = accept-all FDCAN
+    hardware filter.  It reads ALL configuration from this page via loadConfig
+    and routes received CAN frames by device_id in software.  Therefore the
+    ESC boots at target_device_id and accepts SDO writes at that ID.
 
     Layout is determined from MotorController_storeConfig disassembly.
     """
@@ -324,9 +333,11 @@ async def _flash_prebuilt(
 ) -> None:
     phase_str = "inverted (-1)" if invert_phase else "normal (+1)"
     log_fn(
-        f"Flashing {elf_path.name} via ST-LINK (openocd)... "
-        f"Config page: device_id={target_device_id}, phase_order={phase_str}, "
-        f"i_kp={profile['i_kp']:.4f}, i_ki={profile['i_ki']:.3f}")
+        f"Flashing {elf_path.name} via ST-LINK (openocd) — "
+        f"config page: device_id={target_device_id}, phase_order={phase_str}, "
+        f"i_kp={profile['i_kp']:.4f}, i_ki={profile['i_ki']:.3f}. "
+        f"ESC will boot at CAN ID {target_device_id}."
+    )
 
     config_page = _make_commissioning_config_page(
         profile, target_device_id=target_device_id, invert_phase=invert_phase)
@@ -367,7 +378,7 @@ async def _flash_prebuilt(
     log_fn(f"openocd output:\n{_openocd_summary}")
     if rc != 0:
         raise FlashError(f"Flash failed:\n{out[-3000:]}")
-    log_fn("Flash written, commissioning config page verified — device is resetting.")
+    log_fn(f"Flash written and config page verified — device is resetting (will boot at ID {target_device_id}).")
 
 
 async def _read_controller_state_via_swd(firmware_dir: Path) -> dict | None:
@@ -486,9 +497,12 @@ class FlashManager:
                         f"Required tool not found on PATH: {', '.join(missing)}. "
                         "Install openocd and ensure it is on PATH."
                     )
-                elf_path = config.firmware_dir / "prebuilt" / f"commissioning_{config.motor_profile}.elf"
+                elf_path = config.firmware_dir / "prebuilt" / "production.elf"
                 if not elf_path.exists():
-                    raise FlashError(f"Pre-compiled binary not found: {elf_path}")
+                    raise FlashError(
+                        f"Production firmware not found: {elf_path}. "
+                        "Expected firmware/esc/prebuilt/production.elf"
+                    )
 
             config.profile_data()
 
@@ -624,14 +638,17 @@ class FlashManager:
         if not config.skip_flash:
             # ── 1. Flash pre-compiled binary ──────────────────────────────────
             self.status.state = FlashState.FLASHING
-            elf_path = firmware_dir / "prebuilt" / f"commissioning_{config.motor_profile}.elf"
-            self._log(f"Flashing firmware for {config.motor_profile}...", progress=5)
+            elf_path = firmware_dir / "prebuilt" / "production.elf"
+            self._log(f"Flashing production firmware for {config.motor_profile}...", progress=5)
             await _flash_prebuilt(
                 elf_path, firmware_dir, self._log, profile,
                 target_device_id=config.can_id,
                 invert_phase=invert_phase,
             )
-            self._log("Firmware flashed. Device booting at commissioning ID 127...", progress=20)
+            self._log(
+                f"Firmware flashed. Device booting at target CAN ID {config.can_id} "
+                f"(config page encodes device_id={config.can_id})...",
+                progress=20)
             # Bounce the CAN interface NOW while the ESC is not yet connected.
             # Doing this here (rather than when the user clicks the button) avoids
             # disrupting the ESC after it is live on the bus — a late bounce can
@@ -678,10 +695,12 @@ class FlashManager:
         comm_id = _COMMISSIONING_CAN_ID
         dc = self._daemon_client
 
-        # Feed watchdog so the ESC doesn't timeout before we start talking to it.
+        # Feed watchdog at the active comm ID before sniffing.
+        # Production firmware in IDLE mode has no watchdog timeout, but this
+        # is a no-op safety measure in case the ESC is in an unexpected mode.
         self._log(
-            f"Sending watchdog feed to ID {comm_id} on {config.can_channel} "
-            f"(prevents WATCHDOG_TIMEOUT error state)...", progress=41)
+            f"Sending watchdog feed to ID {comm_id} on {config.can_channel}...",
+            progress=41)
         await loop.run_in_executor(
             None, dc.feed_watchdog_generic, config.can_channel, comm_id)
         await asyncio.sleep(0.5)
@@ -796,20 +815,22 @@ class FlashManager:
                     f"check CAN cable, ESC power, and that it was power-cycled after flashing.")
 
         self._log(
-            f"ESC confirmed at ID {active_id} (commissioning firmware). "
-            f"Writing params: target_id={config.can_id}, "
+            f"ESC at ID {active_id}. "
+            f"Writing params via SDO: target_id={config.can_id}, "
             f"phase_order={'inverted (-1)' if invert_phase else 'normal (+1)'}, "
             f"i_kp={profile['i_kp']:.4f}, i_ki={profile['i_ki']:.3f}",
             progress=45)
 
-        # Write motor parameters. DEVICE_ID must go last.
+        # Write motor parameters. Values are already correct from the config page,
+        # but SDO writes allow in-memory override and update fast_frame_frequency.
+        # DEVICE_ID must go last (changes the software device_id filter).
         phase_val = -1 if invert_phase else +1
         ack_phase = await loop.run_in_executor(
             None, dc.generic_sdo_write,
             config.can_channel, active_id, _PARAM_MOTOR_PHASE_ORDER, "i32", phase_val)
         self._log(
             f"  SDO[ID {active_id}] phase_order={phase_val:+d} → "
-            f"{'ACK' if ack_phase else 'NO_ACK (ELF does not ACK SDO writes; config page value used)'}")
+            f"{'ACK' if ack_phase else 'NO_ACK'}")
 
         ack_kp = await loop.run_in_executor(
             None, dc.generic_sdo_write,
@@ -831,7 +852,7 @@ class FlashManager:
                 config.can_channel, active_id, _PARAM_DEVICE_ID, "u32", config.can_id)
             self._log(
                 f"  SDO[ID {active_id}] device_id → {config.can_id} → "
-                f"{'ACK' if ack_id else 'NO_ACK (ESC may not have changed its CAN ID)'}")
+                f"{'ACK' if ack_id else 'NO_ACK'}")
             await asyncio.sleep(0.1)
 
         self._log(
