@@ -447,3 +447,76 @@ continues — the commissioning ELF reads parameters from the config page writte
 `_make_commissioning_config_page()`, so SDO writes to it may be advisory only. If DEVICE_ID
 writes are also not processed, the symptom (ESC stays at 127) will still appear; the fix
 at that point is to encode DEVICE_ID into the config page before flashing.
+
+---
+
+## BUG-009 — Prebuilt commissioning ELFs have FDCAN hardware filter hardcoded to device_id=127; ESC cannot receive CAN frames at any other ID
+
+**Symptom:**
+```
+ESC found at ID 127 (commissioning firmware).
+SDO[ID 127] device_id → 1 → NO_ACK
+Verifying ESC at CAN ID 1...
+FAILED: ESC still at source ID 127 after DEVICE_ID write — SDO write may have failed.
+```
+
+**Root cause (confirmed via ARM Thumb-2 disassembly):**
+
+The prebuilt `commissioning_*.elf` files were compiled from old firmware source where
+`MotorController_init` calls `CAN_init(&hfdcan1, device_id=127, mask=0x7F)` **before**
+calling `MotorController_loadConfig`. The FDCAN hardware filter is set with a hardcoded
+device_id=127 and is never updated after `loadConfig` overrides `controller->device_id`
+from the config page.
+
+Disassembly of commissioning ELF `MotorController_init`:
+```
+movs r1, #127    ; filter = 127 (hardcoded, ignores loadConfig result)
+bl   CAN_init
+bl   MotorController_loadConfig   ; sets controller->device_id from config page — too late
+```
+
+Disassembly of commissioning ELF `CAN_init`:
+```
+movs r4, #127
+str  r4, [sp, #28]   ; FilterID2 = 127 (hardcoded — argument in r2 ignored)
+```
+
+Combined effect: if the config page encodes `device_id=1`, the ESC heartbeats from CAN ID 1
+(software filter sends heartbeats from `controller->device_id=1`) but the FDCAN hardware
+filter accepts only frames where `arb_id & 0x7F == 127`. The software filter in
+`handleCANMessage` then further rejects ID-127 frames because
+`device_id=127 != controller->device_id=1`. Result: **no CAN frames can reach the ESC at all**.
+SDO writes, NMT mode changes, and flash store commands are all silently discarded.
+
+The commissioning ELFs also do not send SDO write ACKs, making it impossible to distinguish
+"write accepted" from "write dropped by hardware filter."
+
+### FIX-009-a — Replace commissioning ELFs with production.elf [UNTESTED]
+
+**Files changed:** `backend/humanoid/flash.py`, `firmware/esc/prebuilt/production.elf` (new)
+
+The current Recoil firmware source (`motor_controller.c`) calls `CAN_init(&hfdcan1, 0, 0)`,
+setting the FDCAN hardware filter to accept **all** frames. Device routing is done in
+software: `if (device_id && device_id != controller->device_id) return`. With mask=0,
+the hardware filter passes everything to the software layer.
+
+Also, with `LOAD_CALIBRATION_FROM_FLASH=1`, all motor parameters (i_kp, i_ki, phase_order,
+pole_pairs, torque_constant, etc.) are read from the config page. A single production ELF
+handles all motor profiles.
+
+**Changes:**
+- Copied `production.elf` from Recoil source build output to `firmware/esc/prebuilt/production.elf`
+- `flash.py` `start()` and `_do_session()`: ELF path changed from
+  `prebuilt/commissioning_{motor_profile}.elf` → `prebuilt/production.elf`
+- `_make_commissioning_config_page()` is unchanged — it already encodes all motor-profile
+  params (i_kp, i_ki, phase_order, etc.) into the config page before flashing
+- `_flash_prebuilt()` log updated to reflect that the ESC will boot at the target CAN ID
+  (not commissioning ID 127)
+- Module docstring updated to explain the single-pass production ELF flow
+
+**Flow with production.elf:**
+1. Flash `production.elf` with a config page encoding `device_id=target_id` and all motor params
+2. ESC boots at `target_id`; FDCAN hardware accepts all frames; software filter routes by `device_id`
+3. SDO writes to `target_id` are ACKed — `GENERIC_SDO_WRITE` returns `{status:"OK"}`
+4. NMT `MODE_CALIBRATION` to `target_id` triggers calibration
+5. `SEND_FLASH_STORE` to `target_id` persists config to flash
