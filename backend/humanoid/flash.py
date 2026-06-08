@@ -712,7 +712,10 @@ class FlashManager:
 
         _sniff_saw_comm_id = False
         _sniff_saw_target_id = False
-        _sniff_target_emcy_error: int | None = None   # set if ESC broadcasts EMCY (error state)
+        # EMCY (func_id=0x1 = FUNC_SYNC_EMCY) can come from ANY device_id, not just the target.
+        # An ESC in DAMPING/error state broadcasts EMCY instead of heartbeats.
+        # Key: device_id, value: first seen error_code (4-byte LE uint32).
+        _sniff_emcy_by_device: dict[int, int] = {}
         _hb_count_comm = 0
         _hb_last_mode: int | None = None
         _hb_last_error: int | None = None
@@ -733,20 +736,17 @@ class FlashManager:
                             _hb_last_error = struct.unpack_from("<I", raw_bytes, 1)[0]
                         except Exception:
                             pass
-            if dev == config.can_id and config.can_id != comm_id:
-                if func == 0xE:
-                    _sniff_saw_target_id = True
-                elif func == 0x1 and _sniff_target_emcy_error is None:
-                    # FUNC_SYNC_EMCY — ESC is present but broadcasting an error state.
-                    # Payload is a 4-byte error_code LE (EmcyFrame).
-                    try:
-                        raw_bytes = bytes.fromhex(fr.get("data", ""))
-                        _sniff_target_emcy_error = (
-                            struct.unpack_from("<I", raw_bytes, 0)[0]
-                            if len(raw_bytes) >= 4 else 0
-                        )
-                    except Exception:
-                        _sniff_target_emcy_error = 0
+            if dev == config.can_id and func == 0xE and config.can_id != comm_id:
+                _sniff_saw_target_id = True
+            if func == 0x1 and dev not in _sniff_emcy_by_device:
+                try:
+                    raw_bytes = bytes.fromhex(fr.get("data", ""))
+                    _sniff_emcy_by_device[dev] = (
+                        struct.unpack_from("<I", raw_bytes, 0)[0]
+                        if len(raw_bytes) >= 4 else 0
+                    )
+                except Exception:
+                    _sniff_emcy_by_device[dev] = 0
 
         if raw_frames:
             _FUNC_NAMES = {0x1: "EMCY", 0x9: "PDO2", 0xA: "PDO3", 0xB: "SDO_TX",
@@ -767,11 +767,21 @@ class FlashManager:
                     f"{_hb_count_comm} heartbeat(s) — mode={mode_str}, error={err_str}")
             if _sniff_saw_target_id:
                 self._log(f"  ↳ ID {config.can_id} (target): heartbeat seen")
-            if _sniff_target_emcy_error is not None:
-                self._log(
-                    f"  ↳ ID {config.can_id} (target): EMCY broadcast — "
-                    f"error={_error_str(_sniff_target_emcy_error)} "
-                    f"(ESC in error/DAMPING state; will send NMT IDLE to recover)")
+            for emcy_dev, emcy_err in sorted(_sniff_emcy_by_device.items()):
+                if emcy_dev == config.can_id:
+                    self._log(
+                        f"  ↳ ID {emcy_dev} (target): EMCY — "
+                        f"error={_error_str(emcy_err)} (DAMPING/error state)")
+                elif emcy_dev == comm_id:
+                    self._log(
+                        f"  ↳ ID {emcy_dev} (commissioning): EMCY — "
+                        f"error={_error_str(emcy_err)}")
+                else:
+                    self._log(
+                        f"  ↳ ID {emcy_dev} (unexpected): EMCY — "
+                        f"error={_error_str(emcy_err)} "
+                        f"(ESC has stale device_id={emcy_dev} from prior commissioning; "
+                        f"will re-commission to target ID={config.can_id})")
         else:
             self._log(
                 f"No CAN frames in 3 s on {config.can_channel}. "
@@ -789,9 +799,8 @@ class FlashManager:
                 f"ESC at target CAN ID {config.can_id} — "
                 f"booted from config page (fresh flash) or previously commissioned.",
                 progress=44)
-        elif _sniff_target_emcy_error is not None and config.can_id != comm_id:
-            # ESC present at target ID but broadcasting EMCY error frames (e.g. DAMPING after
-            # watchdog timeout).  It cannot send heartbeats in this state but IS reachable.
+        elif config.can_id in _sniff_emcy_by_device and config.can_id != comm_id:
+            # ESC present at target ID but in error/DAMPING — broadcasts EMCY, not heartbeat.
             active_id = config.can_id
             esc_found = True
             esc_needs_idle_recovery = True
@@ -801,6 +810,21 @@ class FlashManager:
                 progress=44)
         elif _sniff_saw_comm_id:
             esc_found = True
+        else:
+            # Check for EMCY from an unexpected device_id — ESC with stale device_id from a
+            # prior commissioning run.  active_id is the current ID; code below will write
+            # device_id=config.can_id and save to flash, re-commissioning without a re-flash.
+            stale_ids = [d for d in _sniff_emcy_by_device
+                         if d != config.can_id and d != comm_id]
+            if stale_ids:
+                active_id = stale_ids[0]   # use the first unexpected EMCY source
+                esc_found = True
+                esc_needs_idle_recovery = True
+                self._log(
+                    f"ESC found at unexpected CAN ID {active_id} (target={config.can_id}). "
+                    f"ESC has stale device_id from prior commissioning. "
+                    f"Will re-commission: NMT IDLE → write device_id={config.can_id} → save.",
+                    progress=44)
 
         if not esc_found and config.can_id != comm_id:
             hb = await loop.run_in_executor(
