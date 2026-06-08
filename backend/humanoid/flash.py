@@ -4,17 +4,19 @@ Flash wizard state machine for B-G431B-ESC1 boards.
 Single-pass firmware procedure:
 
   1. FLASHING:
-     Flash production.elf via openocd/ST-LINK, then write a valid config page
-     so loadConfig succeeds.  The config page encodes device_id=target, motor
-     profile params (i_kp, i_ki, phase_order, etc.).  The ESC boots at the
-     target CAN ID because the production firmware uses CAN_init(filter=0,mask=0)
-     (accept-all FDCAN hardware filter) and reads device_id from the config page.
+     Flash production_{motor_profile}.elf via openocd/ST-LINK, then write a
+     valid config page so loadConfig succeeds.  The config page encodes
+     device_id=target and all motor profile params (i_kp, i_ki, pole_pairs,
+     cpr, phase_order, etc.) at the correct MotorController struct offsets.
+     The ESC boots at the target CAN ID because the production firmware uses
+     CAN_init(filter=0, mask=0) (accept-all FDCAN hardware filter) and reads
+     device_id from the config page.
 
   2. COMMISSIONING:
-     SDO-write params to the target CAN ID (firmware ACKs writes).  The writes
-     are mostly redundant — the config page already encoded the correct values —
-     but they allow in-memory tuning and update fast_frame_frequency.  Save
-     config to flash via FUNC_FLASH so the target CAN ID is persistent.
+     SDO-write all motor profile params plus device_id to the target CAN ID
+     (firmware ACKs writes).  These writes reinforce what the config page
+     encoded and correct any values that may be stale from a prior session.
+     Save config to flash via FUNC_FLASH so all params are persistent.
 
   3. CALIBRATING:
      At the target CAN ID: run encoder flux offset calibration.
@@ -27,8 +29,10 @@ Single-pass firmware procedure:
 
 NOTE: The prebuilt commissioning_*.elf files (old firmware) are NOT used.
 They have a hardcoded FDCAN filter for device_id=127 and cannot communicate
-at any other CAN ID.  production.elf (compiled from current source with
-CAN_init(0,0)) accepts all frames and routes by software device_id check.
+at any other CAN ID.  The production ELF (compiled with CAN_init(0,0))
+accepts all frames and routes by software device_id check.  A separate ELF
+per motor profile ensures the correct compile-time defaults are present even
+if the config page is ever erased.
 """
 from __future__ import annotations
 
@@ -769,9 +773,9 @@ class FlashManager:
         comm_id = _COMMISSIONING_CAN_ID
         dc = self._daemon_client
 
-        # Feed watchdog at config.can_id — with production.elf the ESC always boots at
-        # config.can_id (encoded in the config page), so comm_id=127 is never the right
-        # address. Feeding the wrong ID causes WATCHDOG_TIMEOUT → DAMPING before sniff.
+        # Feed watchdog at config.can_id — with production_{motor_profile}.elf the ESC
+        # always boots at config.can_id (encoded in the config page), so comm_id=127 is
+        # never the right address. Feeding the wrong ID causes WATCHDOG_TIMEOUT → DAMPING.
         feed_id = config.can_id
         self._log(
             f"Sending watchdog feed to ID {feed_id} on {config.can_channel}...",
@@ -838,7 +842,7 @@ class FlashManager:
                 mode_str = _mode_name(_hb_last_mode) if _hb_last_mode is not None else "?"
                 err_str  = _error_str(_hb_last_error) if _hb_last_error is not None else "?"
                 self._log(
-                    f"  ↳ ID {comm_id} (commissioning ESC): "
+                    f"  ↳ ID {comm_id} (unexpected — ESC booted with stale device_id=127): "
                     f"{_hb_count_comm} heartbeat(s) — mode={mode_str}, error={err_str}")
             if _sniff_saw_target_id:
                 self._log(f"  ↳ ID {config.can_id} (target): heartbeat seen")

@@ -223,9 +223,11 @@ All parameters accessible via `FUNC_RECEIVE_SDO` (func_id=0xC):
 **Requires reflash (compile-time only):**
 - `MOTOR_PHASE_ORDER` in source — this is copied into `motor.phase_order` at init only if
   `LOAD_CONFIG_FROM_FLASH=0`. When loading from Flash, the Flash-stored value is used.
-  **In practice**: reflash IS required to set phase_order on a fresh board that has never
-  stored a config, because the Flash contains uninitialized data (NaN). Our flash wizard
-  patches the `#define`, recompiles, reflashes, then calibrates and stores to Flash.
+  **In practice**: The flash wizard handles this automatically — it writes all motor
+  params (including phase_order) into the 2KB config page at the correct MotorController
+  struct byte offsets before flashing, using prebuilt per-motor ELFs
+  (`firmware/esc/prebuilt/production_{motor_profile}.elf`).  No manual `#define` patching
+  or recompile is needed.
 - `MOTOR_PROFILE` selection (pole_pairs, torque_constant, etc.)
 - `FIRMWARE_VERSION` (always overwritten from define at boot)
 - `COMMUTATION_FREQ`, `POSITION_UPDATE_FREQ` (timer hardware config)
@@ -677,12 +679,12 @@ class FlashManager:
 | `backend/humanoid/can_bus.py` | Async CAN transport. All protocol enums, async receive loop with ThreadPoolExecutor, race-free SDO read (waiter registered before transmit), asyncio.Lock for transmit. |
 | `backend/humanoid/actuator.py` | Single-joint controller. All public methods listed above. `calibrate_offset()` polls mode until IDLE, checks error bits. `apply_config()` writes 22+4+1 SDO params with no delays. |
 | `backend/humanoid/robot.py` | Multi-joint coordinator. Opens one `CANBus` per unique channel. `get_actuator_by_name()` is the primary lookup (unique). `get_actuator_by_id()` is legacy. `get_all_states()` is fault-tolerant (per-actuator try/except). |
-| `backend/humanoid/flash.py` | Flash wizard state machine. Patches `motor_controller_conf.h` regex, runs `make -j4`, runs `STM32_Programmer_CLI`, then calibrates and tests. Loop for REFLASHING if direction is wrong. |
+| `backend/humanoid/flash.py` | Flash wizard state machine. Selects prebuilt `production_{motor_profile}.elf` from `firmware/esc/prebuilt/`, flashes via `openocd`/ST-LINK, writes a config page (device_id, motor profile, gains, calibration params) over SWD, then runs encoder calibration and direction verification over CAN via `DaemonClient`. |
 | `backend/humanoid/__init__.py` | Package exports for all public symbols. |
 | `backend/api/__init__.py` | Imports all four route modules. |
 | `backend/api/routes_devices.py` | `GET /devices` — scans `/sys/class/net/` for interfaces with `DEVTYPE=can` in uevent. |
 | `backend/api/routes_motors.py` | `GET/POST /motors/{joint_name}` — enable, disable, calibrate, set_position. Uses `joint_name` (string) as path param, resolves via `robot.get_actuator_by_name()`. All return `{success, data, error}`. |
-| `backend/api/routes_flash.py` | `POST /flash/start`, `GET /flash/status`, `POST /flash/confirm_direction`. Reads `firmware_dir` from request or defaults to `../../Recoil-Motor-Controller-B-G431B-ESC1`. |
+| `backend/api/routes_flash.py` | `POST /flash/start`, `GET /flash/status`, `POST /flash/confirm_direction`. Reads `firmware_dir` from request or defaults to `firmware/esc/` in the repo root (two directories above `backend/api/`). |
 | `backend/api/routes_robot.py` | `GET/PUT /robot/config`, `POST /robot/connect`, `POST /robot/disconnect`. PUT validates, persists to disk, creates new Robot instance. connect/disconnect open/close CAN buses. |
 | `backend/main.py` | FastAPI on `localhost:8765`. Lifespan loads config from `configs/humanoid_lite.json`. Creates `Robot(config)` but does NOT auto-connect (call `POST /robot/connect` after startup). `/ws/telemetry` WebSocket at 50Hz. |
 | `backend/requirements.txt` | `fastapi`, `uvicorn[standard]`, `python-can`, `pydantic>=2.7`, `websockets` |
@@ -894,7 +896,7 @@ sudo apt-get install can-utils  # provides ip link, candump, cansend
 |---|---|---|
 | `backend/main.py:26` | `_CONFIG_PATH` points to `../../configs/humanoid_lite.json` | Auto-loaded config on startup |
 | `backend/main.py:27` | `_TELEMETRY_HZ = 50` | WebSocket broadcast rate |
-| `backend/api/routes_flash.py:16` | `_DEFAULT_FIRMWARE_DIR` points 3 levels up to `Recoil-Motor-Controller-B-G431B-ESC1` | Flash wizard firmware source path |
+| `backend/api/routes_flash.py:27` | `_DEFAULT_FIRMWARE_DIR = Path(__file__).parents[2] / "firmware" / "esc"` → resolves to `firmware/esc/` in the repo root | Flash wizard firmware source path |
 | `app/electron/main.js:8` | `BACKEND_PORT = 8765` | Port backend listens on |
 | `app/electron/main.js:9,10` | `BACKEND_DIR` = `../../backend` (relative to `app/electron/`) | Where Electron spawns Python from |
 | `app/src/api.js:1` | `BASE = 'http://localhost:8765'` | API base URL |
@@ -1535,11 +1537,16 @@ Key patterns NOT in Berkeley that the daemon must add:
 
 | Phase | Description | Status |
 |---|---|---|
-| 1 | Daemon skeleton (config load, UDP server, signal handling) | Not started |
-| 2 | CAN layer (SocketCAN, SDO read/write, actuator state machine) | Not started |
-| 3 | Control loop + full command set + telemetry push | Not started |
-| 4 | Python migration (DaemonClient, DaemonProcess, delete old CAN files) | Not started |
-| 5 | Integration testing + performance validation | Not started |
+| 1 | Daemon skeleton (config load, UDP server, signal handling) | Complete |
+| 2 | CAN layer (SocketCAN, SDO read/write, actuator state machine) | Complete |
+| 3 | Control loop + full command set + telemetry push | Complete |
+| 4 | Python migration (DaemonClient proxies; old CAN files retained for type definitions) | Complete |
+| 5 | Integration testing + performance validation | Complete — full Flash Wizard end-to-end confirmed working |
+
+**Note:** `can_bus.py`, `actuator.py`, and `recoil_protocol.py` still exist in the backend but
+are only used for the `ActuatorState` type definition (imported by `daemon_client.py`) and the
+debug decode endpoint (`routes_debug.py`).  They no longer open CAN sockets.  The daemon owns
+all SocketCAN file descriptors; Python communicates only via UDP on ports 9000/9001.
 
 ### Files to Delete in Phase 4
 

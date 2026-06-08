@@ -293,14 +293,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
     await api.flashReset().catch(() => {})
     onClose()
 
-    // After closing: restart daemon (it was stopped for SWD), apply config (firmware
-    // RAM), then persist this joint's params to ESC flash. Non-fatal if any step fails.
-    if (jointName) {
-      Promise.resolve(window.electron?.ensureDaemon?.())
-        .then(() => api.connectRobot())
-        .then(() => api.storeMotorToFlash(jointName))
-        .catch(() => {})
-    }
+    // Reconnect the robot so the newly-commissioned joint is reflected in telemetry.
+    // Non-fatal if this fails (user can reconnect manually via the sidebar).
+    api.connectRobot().catch(() => {})
   }
 
   async function handleConfirm(correct) {
@@ -487,8 +482,8 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
 
               <p className="text-[10px] text-gray-600">
                 {commissionOnly
-                  ? 'Commissions the ESC over CAN (sets ID + gains), then runs encoder calibration. Firmware must already be on the ESC at commissioning ID 127. Estimated time: ~1 min.'
-                  : 'Flashes pre-compiled firmware via ST-LINK, commissions the ESC over CAN (sets ID + gains), then runs encoder calibration. No compile step — estimated time: ~2 min.'}
+                  ? 'Commissions the ESC over CAN (sets motor profile + gains + ID), then runs encoder calibration. Firmware must already be on the ESC. Estimated time: ~1 min.'
+                  : 'Flashes pre-compiled firmware via ST-LINK, commissions the ESC over CAN (sets motor profile + gains + ID), then runs encoder calibration. No compile step — estimated time: ~2 min.'}
               </p>
             </div>
           )}
@@ -508,8 +503,8 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
                     </ol>
                     <p className="mt-2 text-[11px] text-gray-500">
                       Power cycling resets the CAN controller to a clean state.
-                      The ESC must have commissioning firmware and will boot at ID 127.
-                      Commissioning (setting CAN ID {canId}) runs automatically after you click below.
+                      The ESC will boot at its configured CAN ID.
+                      Commissioning (setting CAN ID {canId} and motor profile) runs automatically after you click below.
                     </p>
                   </>
                 ) : (
@@ -552,7 +547,7 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
               </div>
               {pingState && pingState !== 'pending' && !pingState.reachable && (
                 <p className="text-xs text-warn">
-                  ESC not responding. Check: {commissionOnly ? 'ESC was power-cycled and has commissioning firmware (boots at ID 127)' : 'ESC was power-cycled after flashing'}, CAN cable is connected to {canChannel}, 120 Ω termination on both ends of the CAN bus.
+                  ESC not responding. Check: ESC was power-cycled, CAN cable is connected to {canChannel}, 120 Ω termination on both ends of the CAN bus.
                 </p>
               )}
 

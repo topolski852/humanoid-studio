@@ -31,7 +31,7 @@ BUS_OFF and refuses to transmit at all until a power cycle.
 
 ---
 
-### FIX-001-a — Move CAN bounce to before WAITING_CAN_CONNECT [UNTESTED]
+### FIX-001-a — Move CAN bounce to before WAITING_CAN_CONNECT [WORKING]
 
 Moved `_bounce_can_interface(config.can_channel)` from
 `routes_flash.py::flash_can_connected()` to `flash.py::_do_session()`,
@@ -64,7 +64,7 @@ so BUS_OFF was invisible.
 
 ---
 
-### FIX-002-a — Read FDCAN1 ECR+PSR in SWD diagnostic; targeted BUS_OFF error message [UNTESTED]
+### FIX-002-a — Read FDCAN1 ECR+PSR in SWD diagnostic; targeted BUS_OFF error message [WORKING]
 
 Added `mdw 0x40006440 2` to the openocd command in
 `_read_controller_state_via_swd()`. Parses the two 32-bit words:
@@ -111,7 +111,7 @@ stopped processing SDO commands — but continued broadcasting heartbeats
 
 ---
 
-### FIX-003-a — Feed watchdog immediately on bus open; continuous feeds through sniff and pre-check loops [UNTESTED]
+### FIX-003-a — Feed watchdog immediately on bus open; continuous feeds through sniff and pre-check loops [WORKING]
 
 In `flash.py::_do_session()`:
 
@@ -167,7 +167,7 @@ calibration.
 
 ---
 
-### FIX-004-a — Guard feed_watchdog with try/except; check target ID first; introduce active_id [UNTESTED]
+### FIX-004-a — Guard feed_watchdog with try/except; check target ID first; introduce active_id [WORKING]
 
 **Issue A fix:** Wrapped `await bus.feed_watchdog(...)` in the sniff loop in a
 bare `try/except CANBusError: pass`. In the pre-check loop, moved
@@ -218,7 +218,7 @@ the pre-check loop, not this earlier call.
 
 ---
 
-### FIX-005-a — Bounce in `can_connected()` for all modes; wrap initial `feed_watchdog` [UNTESTED]
+### FIX-005-a — Bounce in `can_connected()` for all modes; wrap initial `feed_watchdog` [WORKING]
 
 **Issue A fix:** Added `await _bounce_can_interface(self._current_channel)` inside
 `FlashManager.can_connected()` (in `flash.py`) before setting `_can_connect_event`. This
@@ -278,7 +278,7 @@ can be observed. This meant the log never showed `dev=127` even though the ESC w
 
 ---
 
-### FIX-006-a — Handle 4-byte SDO responses; remove 8-frame sniff cap [UNTESTED]
+### FIX-006-a — Handle 4-byte SDO responses; remove 8-frame sniff cap [WORKING]
 
 **Issue A fix:** Updated `_sdo_read()` in `can_bus.py` to branch on response length:
 
@@ -328,7 +328,7 @@ implement SDO reads.
 
 ---
 
-### FIX-007-a — Heartbeat-based ESC detection; replace all SDO reads in commissioning path [UNTESTED]
+### FIX-007-a — Heartbeat-based ESC detection; replace all SDO reads in commissioning path [WORKING]
 
 **Pre-check fix:** Added `_sniff_saw_comm_id` and `_sniff_saw_target_id` flags in the
 sniff loop. If a heartbeat from `comm_id` (127) was seen during the sniff, `pre_ver` is
@@ -389,7 +389,7 @@ indication of failure was the post-commissioning heartbeat check at the target I
 
 ---
 
-### FIX-008-a — Unified daemon CAN: all commissioning traffic routed through the C++ daemon [UNTESTED]
+### FIX-008-a — Unified daemon CAN: all commissioning traffic routed through the C++ daemon [WORKING]
 
 **Architecture change:** The Python `can_bus.py` socket is no longer opened during the
 Flash Wizard. The C++ daemon is the single owner of all SocketCAN sockets for the
@@ -491,7 +491,7 @@ SDO writes, NMT mode changes, and flash store commands are all silently discarde
 The commissioning ELFs also do not send SDO write ACKs, making it impossible to distinguish
 "write accepted" from "write dropped by hardware filter."
 
-### FIX-009-a — Replace commissioning ELFs with production.elf [UNTESTED]
+### FIX-009-a — Replace commissioning ELFs with production.elf [WORKING]
 
 **Files changed:** `backend/humanoid/flash.py`, `firmware/esc/prebuilt/production.elf` (new)
 
@@ -543,7 +543,7 @@ the ESC and the feed is ignored. The target ESC times out.
 
 ---
 
-### FIX-010-a — Always feed watchdog to target CAN ID [UNTESTED]
+### FIX-010-a — Always feed watchdog to target CAN ID [WORKING]
 
 Changed `feed_id` assignment in `flash.py::_do_session()`:
 
@@ -602,7 +602,7 @@ because no current can flow and the encoder reports nothing meaningful.
 
 ---
 
-### FIX-011-a — Rewrite config page with correct Parameter enum offsets [UNTESTED]
+### FIX-011-a — Rewrite config page with correct Parameter enum offsets [WORKING]
 
 Rewrote `_make_commissioning_config_page()` in `backend/humanoid/flash.py` to use the
 Parameter enum byte values as offsets, matching the actual MotorController struct layout.
@@ -638,7 +638,7 @@ _PARAM_ENCODER_CPR            = 0x120
 All other fields remain 0x00 (0.0f for floats, 0 for integers), which passes all NaN
 checks in `loadConfig` and is safe for fields not used during commissioning.
 
-### FIX-011-b — Add SDO writes for all critical motor parameters [UNTESTED]
+### FIX-011-b — Add SDO writes for all critical motor parameters [WORKING]
 
 Extended the SDO commissioning sequence in `_do_session()` to write all motor parameters
 that were previously missing. Previously only `phase_order`, `i_kp`, `i_ki` were written

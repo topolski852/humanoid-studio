@@ -11,7 +11,7 @@
       "can_channel": "can_left_leg",
       "can_id": 1,
       "phase_inverted": false,
-      "electrical_offset": -22.468942642211914,
+      "electrical_offset": -0.03938247263431549,
       "gear_ratio": 15.0,
       "position_limits": {
         "min": -0.17453292519943295,
@@ -23,7 +23,7 @@
       "velocity_ki": 0.0,
       "torque_limit": 6.0,
       "velocity_limit": 20.0,
-      "position_offset": -0.08828913657768192,
+      "position_offset": 10.02536184103386,
       "torque_filter_alpha": 0.1454000025987625,
       "current_limit": 20.0,
       "current_kp": 0.190956,
