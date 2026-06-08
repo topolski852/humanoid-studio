@@ -51,6 +51,8 @@ from .daemon_client import DaemonClient
 # ---------------------------------------------------------------------------
 
 _PARAM_DEVICE_ID              = 0x000
+_PARAM_MODE                   = 0x010
+_PARAM_ERROR                  = 0x014
 _PARAM_FAST_FRAME_FREQUENCY   = 0x00C
 _PARAM_CURRENT_I_KP           = 0x078
 _PARAM_CURRENT_I_KI           = 0x07C
@@ -77,6 +79,14 @@ def _mode_name(byte: int) -> str:
 def _error_str(bits: int) -> str:
     names = [n for bit, n in _ERROR_BITS.items() if bits & bit]
     return " | ".join(names) if names else "NO_ERROR"
+
+def _parse_version_str(v: str) -> int | None:
+    """Parse 'v3.0.1' or '3.0.1' into 0x03000001 (8-8-16: MAJOR·MINOR·PATCH)."""
+    m = re.match(r'v?(\d+)\.(\d+)\.(\d+)', v.strip())
+    if not m:
+        return None
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return (major << 24) | (minor << 16) | patch
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +606,52 @@ class FlashManager:
         except Exception as exc:
             return {"reachable": False, "detail": str(exc)}
 
+    async def check_firmware_version(self, firmware_dir: Path) -> dict:
+        """
+        Read ESC firmware version via SWD and compare to the VERSION file.
+        Returns dict: match, esc_version_str, esc_version_hex, expected_version_str,
+        expected_version_hex, error (None if successful).
+        Requires ST-LINK to be connected and ESC to be powered.
+        """
+        version_file = firmware_dir / "VERSION"
+        expected_int: int | None = None
+        expected_str = "unknown"
+        if version_file.exists():
+            raw = version_file.read_text().strip()
+            expected_int = _parse_version_str(raw)
+            expected_str = raw
+
+        swd = await _read_controller_state_via_swd(firmware_dir)
+        if swd is None:
+            return {
+                "match": False,
+                "esc_version_str": None,
+                "esc_version_hex": None,
+                "expected_version_str": expected_str,
+                "expected_version_hex": (
+                    f"{expected_int:#010x}" if expected_int is not None else "unknown"
+                ),
+                "error": "SWD read failed — ST-LINK not connected or ESC not powered.",
+            }
+
+        esc_ver = swd["firmware_version"]
+        major = (esc_ver >> 24) & 0xFF
+        minor = (esc_ver >> 16) & 0xFF
+        patch = esc_ver & 0xFFFF
+        esc_ver_str = f"v{major}.{minor}.{patch}"
+        match = expected_int is not None and esc_ver == expected_int
+
+        return {
+            "match": match,
+            "esc_version_str": esc_ver_str,
+            "esc_version_hex": f"{esc_ver:#010x}",
+            "expected_version_str": expected_str,
+            "expected_version_hex": (
+                f"{expected_int:#010x}" if expected_int is not None else "unknown"
+            ),
+            "error": None,
+        }
+
     async def confirm_direction(self, correct: bool) -> None:
         if self.status.state != FlashState.AWAITING_CONFIRMATION:
             raise FlashError("No direction confirmation pending")
@@ -695,9 +751,10 @@ class FlashManager:
         comm_id = _COMMISSIONING_CAN_ID
         dc = self._daemon_client
 
-        # Feed watchdog at the ID the ESC is expected to be at.
-        # With skip_flash, the ESC is already at the target ID (not comm_id=127).
-        feed_id = comm_id if not config.skip_flash else config.can_id
+        # Feed watchdog at config.can_id — with production.elf the ESC always boots at
+        # config.can_id (encoded in the config page), so comm_id=127 is never the right
+        # address. Feeding the wrong ID causes WATCHDOG_TIMEOUT → DAMPING before sniff.
+        feed_id = config.can_id
         self._log(
             f"Sending watchdog feed to ID {feed_id} on {config.can_channel}...",
             progress=41)
@@ -962,6 +1019,31 @@ class FlashManager:
             f"ESC confirmed at CAN ID {config.can_id}. "
             f"Config saved to flash. ESC is live.", progress=54)
 
+        # Verify ESC is in a healthy state before calibration.
+        hb_mode = hb_new['mode']
+        hb_error = hb_new['error']
+        self._log(
+            f"ESC state: mode={_mode_name(hb_mode)}, error={_error_str(hb_error)}",
+            progress=55)
+        if hb_error != 0 or hb_mode not in (0x00, 0x01):
+            self._log(
+                f"ESC in unexpected state — sending NMT IDLE to clear "
+                f"({_mode_name(hb_mode)}, {_error_str(hb_error)})...")
+            await loop.run_in_executor(None, dc.send_nmt, config.can_channel, config.can_id, 0x01)
+            await asyncio.sleep(1.5)
+            hb_cleared = await loop.run_in_executor(
+                None, dc.wait_heartbeat, config.can_channel, config.can_id, 3000)
+            if hb_cleared is not None:
+                self._log(
+                    f"After NMT IDLE: mode={_mode_name(hb_cleared['mode'])}, "
+                    f"error={_error_str(hb_cleared['error'])}")
+                if hb_cleared['error'] != 0:
+                    self._log(
+                        f"ESC still has errors after NMT IDLE ({_error_str(hb_cleared['error'])}). "
+                        "Calibration may fail — check encoder and motor wiring.")
+            else:
+                self._log("No heartbeat after NMT IDLE (continuing).")
+
         # ── 4. Calibration ───────────────────────────────────────────────────
         self._log("Waiting for CAN bus to settle...", progress=56)
         await asyncio.sleep(2.0)
@@ -976,6 +1058,24 @@ class FlashManager:
                 f"{'ACK' if ack_freq else 'NO_ACK'}",
                 progress=60)
 
+            # Pre-calibration: verify ESC mode and error via SDO before triggering calibration.
+            pre_err_result  = await loop.run_in_executor(
+                None, dc.generic_sdo_read, config.can_channel, config.can_id, _PARAM_ERROR)
+            pre_mode_result = await loop.run_in_executor(
+                None, dc.generic_sdo_read, config.can_channel, config.can_id, _PARAM_MODE)
+            pre_error = int(pre_err_result["value_u32"] or 0) if pre_err_result else None
+            pre_mode  = int(pre_mode_result["value_u32"] or 0) if pre_mode_result else None
+            self._log(
+                f"Pre-calibration: mode={_mode_name(pre_mode) if pre_mode is not None else '?'}, "
+                f"error={_error_str(pre_error) if pre_error is not None else '?'}",
+                progress=61)
+            if pre_error:
+                self._log(
+                    f"ESC has errors ({_error_str(pre_error)}) — "
+                    "sending NMT IDLE to clear before calibration...")
+                await loop.run_in_executor(None, dc.send_nmt, config.can_channel, config.can_id, 0x01)
+                await asyncio.sleep(1.0)
+
             self._log(
                 "Starting encoder flux offset calibration (MODE_CALIBRATION). "
                 "This takes ~15 s. Do NOT power off the ESC.",
@@ -989,9 +1089,21 @@ class FlashManager:
                 raise FlashError(
                     f"Calibration failed: error_code=0x{cal_result['error_code']:04X}")
             if cal_result["status"] == "TIMEOUT":
+                self._log("Calibration timed out after 90 s. Reading SWD state for diagnosis...",
+                          progress=65)
+                swd_diag = await _read_controller_state_via_swd(firmware_dir)
+                swd_detail = ""
+                if swd_diag is not None:
+                    can_state = _format_fdcan_state(swd_diag)
+                    swd_detail = (
+                        f" ESC state: mode={_mode_name(swd_diag['mode'])}, "
+                        f"error={_error_str(swd_diag['error'])}"
+                        + (f", CAN={can_state}" if can_state else "")
+                    )
+                    self._log(f"SWD diagnostic:{swd_detail}")
                 raise FlashError(
-                    "Calibration timed out after 90 s. "
-                    "Check motor phase wires and encoder connection.")
+                    "Calibration timed out after 90 s." + swd_detail +
+                    " Check motor phase wires and encoder connection.")
 
             # Read flux_offset from the device.
             fo_result = await loop.run_in_executor(

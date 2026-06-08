@@ -196,3 +196,22 @@ async def flash_reset(request: Request) -> dict:
     """Force the flash manager back to IDLE, cancelling any in-progress session."""
     await request.app.state.flash_manager.reset()
     return _ok({"state": "IDLE", "message": "Session reset"})
+
+
+@router.get("/flash/firmware_version")
+async def flash_firmware_version(
+    request: Request,
+    firmware_dir: str | None = None,
+) -> dict | JSONResponse:
+    """
+    Read ESC firmware version via SWD and compare to the bundled VERSION file.
+    Returns match, esc_version_str, expected_version_str, error.
+    Requires ST-LINK to be connected and ESC powered.
+    """
+    flash_manager = request.app.state.flash_manager
+    fw_dir = Path(firmware_dir) if firmware_dir else _DEFAULT_FIRMWARE_DIR
+    try:
+        result = await flash_manager.check_firmware_version(fw_dir)
+        return _ok(result)
+    except Exception as exc:
+        return _err(str(exc), 500)

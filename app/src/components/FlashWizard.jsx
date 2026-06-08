@@ -146,6 +146,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
   const [calStartedAt, setCalStartedAt] = useState(null)
   const [configSynced, setConfigSynced] = useState(false)
   const [pingState, setPingState] = useState(null)   // null | 'pending' | {reachable, detail}
+  const [versionCheck, setVersionCheck]     = useState(null)  // null | result dict from /flash/firmware_version
+  const [versionChecking, setVersionChecking] = useState(false)
+  const [awaitingFlashChoice, setAwaitingFlashChoice] = useState(false)
   const pollRef = useRef(null)
 
   // Reset backend state on mount so a fresh wizard never shows a previous session's data
@@ -210,15 +213,36 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
     }
   }, [status?.state])
 
-  async function handleStart() {
-    setStartError(null)
+  async function _doStart(skipFlash) {
     setStarted(true)
+    setAwaitingFlashChoice(false)
     try {
-      await api.flashStart(canId, invertPhase, motorProfile, 'SWD', canChannel ?? 'can0', commissionOnly)
+      await api.flashStart(canId, invertPhase, motorProfile, 'SWD', canChannel ?? 'can0', skipFlash)
     } catch (e) {
       setStartError(e.message)
       setStarted(false)
     }
+  }
+
+  async function handleStart() {
+    setStartError(null)
+    if (!commissionOnly) {
+      // Check if ESC already has the latest firmware before flashing.
+      setVersionChecking(true)
+      try {
+        const result = await api.flashCheckFirmwareVersion()
+        setVersionCheck(result)
+        setVersionChecking(false)
+        if (result.match) {
+          setAwaitingFlashChoice(true)
+          return   // Show choice dialog — user picks skip or flash
+        }
+      } catch {
+        setVersionChecking(false)
+        // Check failed (ST-LINK not connected etc.) — proceed with flash
+      }
+    }
+    await _doStart(commissionOnly)
   }
 
   async function handleReset() {
@@ -385,10 +409,42 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
                     ST-LINK · SWD
                   </span>
                 )}
-                <button onClick={handleStart} className="btn-primary ml-auto px-5">
-                  {commissionOnly ? 'Commission Motor' : 'Flash + Commission Motor'}
+                <button
+                  onClick={handleStart}
+                  disabled={versionChecking}
+                  className="btn-primary ml-auto px-5 disabled:opacity-50"
+                >
+                  {versionChecking
+                    ? 'Checking firmware…'
+                    : commissionOnly ? 'Commission Motor' : 'Flash + Commission Motor'}
                 </button>
               </div>
+
+              {/* Firmware version match — offer to skip flash */}
+              {awaitingFlashChoice && versionCheck?.match && (
+                <div className="rounded-lg bg-online/10 border border-online/20 px-4 py-3 space-y-2">
+                  <p className="text-sm font-medium text-online">Firmware version matches</p>
+                  <p className="text-xs text-gray-400">
+                    ESC is running <span className="font-mono">{versionCheck.esc_version_str}</span> — matches
+                    the latest firmware (<span className="font-mono">{versionCheck.expected_version_str}</span>).
+                    Skip flashing and go straight to commissioning?
+                  </p>
+                  <div className="flex gap-2 pt-1">
+                    <button
+                      onClick={() => _doStart(true)}
+                      className="btn-primary text-xs px-4 py-1.5"
+                    >
+                      Skip Flash → Commission Only
+                    </button>
+                    <button
+                      onClick={() => _doStart(false)}
+                      className="btn-ghost text-xs px-4 py-1.5"
+                    >
+                      Flash Anyway
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Error display */}
               {startError && (
