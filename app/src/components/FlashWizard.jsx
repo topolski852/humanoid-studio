@@ -1,27 +1,24 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 
-// Steps matching FlashState.step_index (0-7)
+// Steps matching FlashState.step_index (0-5)
 const STEP_LABELS = [
   'Configure',    // 0 — pre-start
-  'Init Flash',   // 1 — INIT_FLASH
-  'Power Cycle',  // 2 — WAITING_POWER_CYCLE
-  'Program',      // 3 — PROGRAM_FLASH / REFLASHING
-  'Connect',      // 4 — WAITING_CAN_CONNECT
-  'Calibrate',    // 5 — CALIBRATING / AWAITING_CONFIRMATION
-  'Finalize',     // 6 — FINALIZE_FLASH
-  'Done',         // 7 — COMPLETE
+  'Flash',        // 1 — FLASHING
+  'Commission',   // 2 — COMMISSIONING
+  'Connect',      // 3 — WAITING_CAN_CONNECT
+  'Calibrate',    // 4 — CALIBRATING / AWAITING_CONFIRMATION
+  'Done',         // 5 — COMPLETE
 ]
 
 const ACTIVE_STATES = new Set([
-  'INIT_FLASH', 'WAITING_POWER_CYCLE', 'PROGRAM_FLASH',
+  'FLASHING', 'COMMISSIONING',
   'WAITING_CAN_CONNECT', 'CALIBRATING', 'AWAITING_CONFIRMATION',
-  'REFLASHING', 'FINALIZE_FLASH',
 ])
 
 // States where closing would leave the ESC in a broken intermediate state
 const LOCKED_STATES = new Set([
-  'INIT_FLASH', 'PROGRAM_FLASH', 'CALIBRATING', 'REFLASHING', 'FINALIZE_FLASH',
+  'FLASHING', 'COMMISSIONING', 'CALIBRATING',
 ])
 
 
@@ -75,31 +72,6 @@ function StepStrip({ stepIndex, isFailed, isComplete }) {
           </div>
         )
       })}
-    </div>
-  )
-}
-
-
-// ── Power cycle waiting indicator ──────────────────────────────────────────────
-function PowerCycleWaiting({ onManualConfirm }) {
-  return (
-    <div className="flex items-center gap-3">
-      <div className="flex-1">
-        <div className="flex items-center gap-2 mb-1">
-          <span className="w-3 h-3 rounded-full bg-warn animate-pulse inline-block" />
-          <p className="text-sm font-medium">Waiting for ESC to come back online…</p>
-        </div>
-        <p className="text-xs text-gray-500">
-          Power cycle the ESC (disconnect / reconnect motor power).
-          The wizard detects when it comes back — or click the button if you cycled it manually.
-        </p>
-      </div>
-      <button
-        onClick={onManualConfirm}
-        className="btn-primary px-4 py-2 whitespace-nowrap flex-shrink-0"
-      >
-        ↻ Cycled
-      </button>
     </div>
   )
 }
@@ -165,7 +137,7 @@ function LogPane({ messages }) {
 // ── Main component ────────────────────────────────────────────────────────────
 export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
   const [status, setStatus]           = useState(null)
-  const [stepInfo, setStepInfo]       = useState({ step_index: 0, total_steps: 8 })
+  const [stepInfo, setStepInfo]       = useState({ step_index: 0, total_steps: 6 })
   const [profiles, setProfiles]       = useState([])
   const [motorProfile, setMotorProfile] = useState('MAD_5010_200KV')
   const [invertPhase, setInvertPhase] = useState(false)
@@ -259,10 +231,6 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
     }
   }
 
-  async function handlePowerCycled() {
-    try { await api.flashPowerCycled() } catch (e) { console.error(e) }
-  }
-
   async function handleCanConnected() {
     try { await api.flashCanConnected() } catch (e) { console.error(e) }
   }
@@ -303,7 +271,6 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
   const isComplete       = currentState === 'COMPLETE'
   const isFailed         = currentState === 'FAILED'
   const isLocked         = started && LOCKED_STATES.has(currentState)
-  const awaitingPowerCycle  = currentState === 'WAITING_POWER_CYCLE'
   const awaitingCanConnect  = currentState === 'WAITING_CAN_CONNECT'
   const awaitingConfirm     = currentState === 'AWAITING_CONFIRMATION'
   const isCalibrating       = currentState === 'CALIBRATING'
@@ -389,8 +356,8 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
                   className="w-full bg-surface-2 border border-surface-3 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:border-accent"
                 >
                   {profiles.map((p) => (
-                    <option key={p.key} value={p.key} disabled={!p.available}>
-                      {p.key}{!p.available ? ' (incomplete)' : ''}
+                    <option key={p.key} value={p.key}>
+                      {p.key}
                     </option>
                   ))}
                   {profiles.length === 0 && (
@@ -425,7 +392,7 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
                   <div className="rounded-lg bg-warn/10 border border-warn/20 px-4 py-3 space-y-1">
                     <p className="text-xs text-warn font-medium">Missing tools — run in terminal:</p>
                     <code className="block text-xs font-mono text-warn/80 select-all">
-                      sudo apt install openocd gcc-arm-none-eabi
+                      sudo apt install openocd
                     </code>
                   </div>
                 ) : startError.includes('already in progress') ? (
@@ -440,17 +407,10 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
                 )
               )}
 
-              {/* 3-pass explanation */}
               <p className="text-[10px] text-gray-600">
-                3-pass procedure: (1) init Flash option bytes → power cycle → (2) write CAN ID + calibrate → (3) operational firmware.
-                Estimated time: ~3 min not counting compile time.
+                Flashes pre-compiled firmware via ST-LINK, commissions the ESC over CAN (sets ID + gains), then runs encoder calibration. No compile step — estimated time: ~2 min.
               </p>
             </div>
-          )}
-
-          {/* Awaiting power cycle */}
-          {awaitingPowerCycle && (
-            <PowerCycleWaiting onManualConfirm={handlePowerCycled} />
           )}
 
           {/* Awaiting CAN connect */}
@@ -562,7 +522,7 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose }) {
           )}
 
           {/* Generic in-progress spinner */}
-          {isActive && !awaitingPowerCycle && !awaitingCanConnect && !awaitingConfirm && !isCalibrating && (
+          {isActive && !awaitingCanConnect && !awaitingConfirm && !isCalibrating && (
             <div className="flex items-center gap-2">
               <span className="w-3.5 h-3.5 rounded-full border-2 border-accent border-t-transparent animate-spin" />
               <span className="text-sm text-gray-400">

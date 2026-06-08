@@ -24,11 +24,8 @@ from humanoid.daemon_client import DaemonClient
 
 router = APIRouter(tags=["flash"])
 
-# Actual firmware project is one level deeper than the BESC repo root
-_DEFAULT_FIRMWARE_DIR = (
-    Path("/home/nse/Recoil-Motor-Controller-BESC")
-    / "Recoil-Motor-Controller-B-G431B-ESC1"
-)
+# firmware/esc/ lives two directories above this file (backend/api/ → backend/ → repo root)
+_DEFAULT_FIRMWARE_DIR = Path(__file__).parents[2] / "firmware" / "esc"
 
 
 async def _bounce_can_interface(channel: str) -> None:
@@ -93,14 +90,12 @@ async def flash_profiles() -> dict:
     for key, data in MOTOR_PROFILES.items():
         profiles.append({
             "key":                     key,
-            "define":                  data["define"],
             "torque_constant":         data["torque_constant"],
             "phase_resistance":        data["phase_resistance"],
             "phase_inductance":        data["phase_inductance"],
             "max_calibration_current": data["max_calibration_current"],
             "i_kp":                    data["i_kp"],
             "i_ki":                    data["i_ki"],
-            "available":               data["torque_constant"] is not None,
         })
     return _ok({"profiles": profiles})
 
@@ -153,13 +148,8 @@ async def flash_step(request: Request) -> dict:
 
 @router.post("/flash/power_cycled", response_model=None)
 async def flash_power_cycled(request: Request) -> dict | JSONResponse:
-    """Frontend calls this when the user has power-cycled the ESC after Pass 1."""
-    flash_manager = request.app.state.flash_manager
-    try:
-        await flash_manager.power_cycled()
-        return _ok({"message": "Power cycle acknowledged"})
-    except FlashError as exc:
-        return _err(str(exc), 409)
+    """No-op: power cycle step no longer required in the new single-pass flow."""
+    return _ok({"message": "No power cycle required in this firmware version"})
 
 
 @router.post("/flash/can_connected", response_model=None)
