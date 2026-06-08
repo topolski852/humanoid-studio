@@ -51,6 +51,7 @@ from .daemon_client import DaemonClient
 # ---------------------------------------------------------------------------
 
 _PARAM_DEVICE_ID              = 0x000
+_PARAM_WATCHDOG_TIMEOUT       = 0x008
 _PARAM_MODE                   = 0x010
 _PARAM_ERROR                  = 0x014
 _PARAM_FAST_FRAME_FREQUENCY   = 0x00C
@@ -307,7 +308,7 @@ def _make_commissioning_config_page(
     struct.pack_into('<I', page,  0, 0xDEAD6431)       # magic
     struct.pack_into('<I', page,  4, 0)
     struct.pack_into('<I', page,  8, target_device_id)  # ESC boots at this CAN ID
-    struct.pack_into('<I', page, 12, 1000)              # watchdog_timeout (ms)
+    struct.pack_into('<I', page, 12, 30000)             # watchdog_timeout (ms) — 30 s to survive power-cycle connection window
 
     # Position controller — 0.0 passes NaN check everywhere.
     # gear_ratio=1.0 avoids any potential divide-by-zero during boot.
@@ -923,13 +924,31 @@ class FlashManager:
                     f"ESC did not appear on {config.can_channel} within 30 s — "
                     f"check CAN cable, ESC power, and that it was power-cycled after flashing.")
 
-        # If the ESC is in an error/DAMPING state, reset to IDLE before writing params.
-        # WATCHDOG_TIMEOUT drives the ESC into DAMPING — NMT IDLE clears the watchdog
-        # timer and returns the ESC to a state where SDO writes and calibration work.
+        # If the ESC is in an error/DAMPING state, attempt recovery before writing params.
+        # Strategy: disable watchdog + clear error register via SDO (firmware accepts writes
+        # to any param even in DAMPING), then send NMT IDLE.  The watchdog re-fires every
+        # timeout period if left enabled, keeping the ESC stuck in DAMPING.
         if esc_needs_idle_recovery:
             self._log(
-                f"Sending NMT IDLE to ID {active_id} to clear DAMPING/error state...",
+                f"Recovering ESC at ID {active_id} from DAMPING/error state...",
                 progress=44)
+            # 1. Disable watchdog so it stops retriggering DAMPING.
+            ack_wd = await loop.run_in_executor(
+                None, dc.generic_sdo_write,
+                config.can_channel, active_id, _PARAM_WATCHDOG_TIMEOUT, "u32", 0)
+            self._log(
+                f"  SDO[ID {active_id}] watchdog_timeout=0 (disable) → "
+                f"{'ACK' if ack_wd else 'NO_ACK'}")
+            # 2. Clear error register directly — firmware accepts SDO writes to any param.
+            ack_err = await loop.run_in_executor(
+                None, dc.generic_sdo_write,
+                config.can_channel, active_id, _PARAM_ERROR, "u32", 0)
+            self._log(
+                f"  SDO[ID {active_id}] error=0 (clear) → "
+                f"{'ACK' if ack_err else 'NO_ACK'}")
+            await asyncio.sleep(0.1)
+            # 3. Send NMT IDLE — now that the error register is cleared and watchdog is off,
+            #    the firmware should accept the mode transition.
             await loop.run_in_executor(
                 None, dc.send_nmt, config.can_channel, active_id, 0x01)  # MODE_IDLE
             await asyncio.sleep(1.0)
@@ -941,7 +960,7 @@ class FlashManager:
                     f"error={_error_str(hb_idle['error'])}")
             else:
                 self._log(
-                    "No heartbeat after NMT IDLE (ESC may not broadcast in IDLE — continuing)")
+                    "No heartbeat after recovery (ESC may not broadcast in IDLE — continuing)")
 
         self._log(
             f"ESC at ID {active_id}. "
@@ -1027,22 +1046,36 @@ class FlashManager:
             progress=55)
         if hb_error != 0 or hb_mode not in (0x00, 0x01):
             self._log(
-                f"ESC in unexpected state — sending NMT IDLE to clear "
-                f"({_mode_name(hb_mode)}, {_error_str(hb_error)})...")
+                f"ESC in unexpected state before calibration "
+                f"({_mode_name(hb_mode)}, {_error_str(hb_error)}). "
+                "Disabling watchdog + clearing errors via SDO then sending NMT IDLE...")
+            ack_wd2 = await loop.run_in_executor(
+                None, dc.generic_sdo_write,
+                config.can_channel, config.can_id, _PARAM_WATCHDOG_TIMEOUT, "u32", 0)
+            self._log(
+                f"  SDO[ID {config.can_id}] watchdog_timeout=0 → "
+                f"{'ACK' if ack_wd2 else 'NO_ACK'}")
+            ack_err2 = await loop.run_in_executor(
+                None, dc.generic_sdo_write,
+                config.can_channel, config.can_id, _PARAM_ERROR, "u32", 0)
+            self._log(
+                f"  SDO[ID {config.can_id}] error=0 (clear) → "
+                f"{'ACK' if ack_err2 else 'NO_ACK'}")
+            await asyncio.sleep(0.1)
             await loop.run_in_executor(None, dc.send_nmt, config.can_channel, config.can_id, 0x01)
             await asyncio.sleep(1.5)
             hb_cleared = await loop.run_in_executor(
                 None, dc.wait_heartbeat, config.can_channel, config.can_id, 3000)
             if hb_cleared is not None:
                 self._log(
-                    f"After NMT IDLE: mode={_mode_name(hb_cleared['mode'])}, "
+                    f"After recovery: mode={_mode_name(hb_cleared['mode'])}, "
                     f"error={_error_str(hb_cleared['error'])}")
                 if hb_cleared['error'] != 0:
                     self._log(
-                        f"ESC still has errors after NMT IDLE ({_error_str(hb_cleared['error'])}). "
+                        f"ESC still has errors ({_error_str(hb_cleared['error'])}). "
                         "Calibration may fail — check encoder and motor wiring.")
             else:
-                self._log("No heartbeat after NMT IDLE (continuing).")
+                self._log("No heartbeat after recovery (continuing).")
 
         # ── 4. Calibration ───────────────────────────────────────────────────
         self._log("Waiting for CAN bus to settle...", progress=56)
@@ -1072,7 +1105,14 @@ class FlashManager:
             if pre_error:
                 self._log(
                     f"ESC has errors ({_error_str(pre_error)}) — "
-                    "sending NMT IDLE to clear before calibration...")
+                    "clearing via SDO then NMT IDLE before calibration...")
+                await loop.run_in_executor(
+                    None, dc.generic_sdo_write,
+                    config.can_channel, config.can_id, _PARAM_WATCHDOG_TIMEOUT, "u32", 0)
+                await loop.run_in_executor(
+                    None, dc.generic_sdo_write,
+                    config.can_channel, config.can_id, _PARAM_ERROR, "u32", 0)
+                await asyncio.sleep(0.1)
                 await loop.run_in_executor(None, dc.send_nmt, config.can_channel, config.can_id, 0x01)
                 await asyncio.sleep(1.0)
 

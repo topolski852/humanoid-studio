@@ -108,12 +108,31 @@ function CalibrationProgress({ startedAt }) {
 
 // ── Log output ────────────────────────────────────────────────────────────────
 function LogPane({ messages }) {
-  const bottomRef = useRef(null)
+  const containerRef = useRef(null)
+  // Use a ref (not state) so scroll checks don't trigger re-renders.
+  const userScrolledRef = useRef(false)
+
+  // Auto-scroll to bottom on new messages unless the user has scrolled up.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const el = containerRef.current
+    if (!el || userScrolledRef.current) return
+    el.scrollTop = el.scrollHeight
   }, [messages])
+
+  function handleScroll() {
+    const el = containerRef.current
+    if (!el) return
+    // Resume auto-scroll when user scrolls back within 40 px of the bottom.
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+    userScrolledRef.current = !atBottom
+  }
+
   return (
-    <div className="flex-1 bg-surface rounded-lg border border-surface-3 p-3 overflow-y-auto font-mono text-xs leading-relaxed">
+    <div
+      ref={containerRef}
+      onScroll={handleScroll}
+      className="flex-1 bg-surface rounded-lg border border-surface-3 p-3 overflow-y-auto font-mono text-xs leading-relaxed"
+    >
       {messages?.length === 0 && (
         <p className="text-gray-600">Waiting for log output…</p>
       )}
@@ -128,7 +147,6 @@ function LogPane({ messages }) {
           <span className="text-gray-600 mr-2 select-none">&gt;</span>{msg}
         </div>
       ))}
-      <div ref={bottomRef} />
     </div>
   )
 }
