@@ -52,17 +52,6 @@ export default function MotorTab() {
   const passiveState = passiveTelemetry[decodedName] ?? null
   const online = state != null || passiveState?.status === 'ONLINE'
 
-  const histRef = useRef({ position: [], current: [] })
-  const [history, setHistory] = useState({ position: [], current: [] })
-
-  useEffect(() => {
-    if (state == null) return
-    const pos = [...histRef.current.position.slice(-49), state.position ?? 0]
-    const cur = [...histRef.current.current.slice(-49), state.current ?? 0]
-    histRef.current = { position: pos, current: cur }
-    setHistory({ position: pos, current: cur })
-  }, [state])
-
   // Dwell filter: require N consecutive non-zero (or zero) reads before logging.
   // Filters out transient 1-2 frame noise from the ESC error register.
   const ERR_DWELL = 4   // ~200 ms at 20 Hz — must stay non-zero this long to log
@@ -146,8 +135,6 @@ export default function MotorTab() {
         <TelemetryTable
           state={state}
           passiveState={passiveState}
-          posHistory={history.position}
-          currentHistory={history.current}
         />
 
         {view === 'drive' && (
