@@ -87,7 +87,7 @@ public:
     float read_config_param(CanBusManager& bus, uint16_t param, int timeout_ms = 300);
 
 private:
-    // Build and send one PDO2. pos is display-frame; conversion to wire applied here.
+    // Build and send one PDO2. pos is display-frame; firmware applies position_offset internally.
     void send_pdo2(CanBusManager& bus, float display_pos, float vel_ff = 0.0f);
 
     // Blocking SDO write with ACK wait. Returns false on timeout.

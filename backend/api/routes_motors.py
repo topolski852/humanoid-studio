@@ -279,7 +279,6 @@ async def position_calibrate(
         request.app.state.robot.config.joints[joint_name] = updated
         config_path: Path = getattr(request.app.state, "config_path", _DEFAULT_CONFIG_PATH)
         request.app.state.robot.config.to_json(config_path)
-        # Daemon applies its startup config; store_to_flash not available via daemon.
         await actuator.apply_config()
         return _ok({
             "position_offset": new_offset,
