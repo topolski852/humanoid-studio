@@ -167,14 +167,19 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
   const [versionCheck, setVersionCheck]     = useState(null)  // null | result dict from /flash/firmware_version
   const [versionChecking, setVersionChecking] = useState(false)
   const [awaitingFlashChoice, setAwaitingFlashChoice] = useState(false)
+  const [resetReady, setResetReady] = useState(false)  // true after initial flashReset() resolves
   const pollRef = useRef(null)
 
-  // Reset backend state on mount so a fresh wizard never shows a previous session's data
+  // Reset backend state on mount so a fresh wizard never shows a previous session's data.
+  // Polling must not start until this resolves — otherwise the first poll may return the
+  // previous session's COMPLETE state and briefly show stale data (or trigger config sync).
   useEffect(() => {
-    api.flashReset().catch(() => {})
     setStarted(false)
     setStartError(null)
     setConfigSynced(false)
+    api.flashReset()
+      .catch(() => {})
+      .finally(() => setResetReady(true))
   }, [])
 
   // Load motor profiles on mount
@@ -184,8 +189,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
       .catch(() => {})
   }, [])
 
-  // Poll flash status while open
+  // Poll flash status while open — only after the initial reset is confirmed
   useEffect(() => {
+    if (!resetReady) return
     async function poll() {
       try {
         const [s, step] = await Promise.all([api.flashStatus(), api.flashStep()])
@@ -202,7 +208,7 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
     poll()
     pollRef.current = setInterval(poll, 500)
     return () => clearInterval(pollRef.current)
-  }, [calStartedAt])
+  }, [calStartedAt, resetReady])
 
   // Sync updated_config to humanoid_lite.json when wizard completes
   useEffect(() => {

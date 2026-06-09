@@ -1169,7 +1169,13 @@ class FlashManager:
             fo_result = await loop.run_in_executor(
                 None, dc.generic_sdo_read,
                 config.can_channel, config.can_id, _PARAM_ENCODER_FLUX_OFFSET)
-            flux_offset = fo_result["value_f32"] if fo_result else 0.0
+            if fo_result is None:
+                raise FlashError(
+                    f"Calibration completed but flux_offset SDO read timed out "
+                    f"(CAN ID {config.can_id} on {config.can_channel}). "
+                    "Check CAN wiring and that the ESC is still powered."
+                )
+            flux_offset = fo_result["value_f32"]
             self.status.flux_offset = flux_offset
             self._log(
                 f"Calibration done: flux_offset = {flux_offset:.4f} rad "

@@ -622,7 +622,32 @@ std::string Robot::handle_command(const std::string& request) {
             bus_mgr_->send(channel, nmt);
         }
 
-        // Poll heartbeats until mode returns to IDLE or DISABLED.
+        // Phase 1: Wait for the motor to enter calibration mode (up to 5 s).
+        // Without this, the very next heartbeat (which may arrive before the motor
+        // has processed the NMT command) would show mode=IDLE and we would return
+        // immediately with stale flash data instead of the real calibrated value.
+        {
+            auto phase1_end = Clock::now() + ms(5000);
+            bool entered = false;
+            while (!entered && Clock::now() < phase1_end) {
+                int rem = static_cast<int>(
+                    std::chrono::duration_cast<ms>(phase1_end - Clock::now()).count());
+                if (rem <= 0) break;
+                auto fut = generic_listener_.expect_once(channel,
+                    static_cast<uint8_t>(device_id), FUNC_HEARTBEAT);
+                if (fut.wait_for(ms(std::min(rem, 1000))) != std::future_status::ready)
+                    continue;
+                can_frame hb = fut.get();
+                if (hb.can_dlc >= 1 && hb.data[0] == MODE_CALIBRATION)
+                    entered = true;
+            }
+            if (!entered) {
+                return json{{"type","CALIBRATE_RESULT"},{"id",id},{"status","TIMEOUT"},
+                            {"error_code",0}}.dump();
+            }
+        }
+
+        // Phase 2: Wait for calibration to complete — motor returns to IDLE or DISABLED.
         auto deadline = Clock::now() + ms(timeout_ms);
         while (Clock::now() < deadline) {
             int remaining = static_cast<int>(
