@@ -612,29 +612,37 @@ std::string Robot::handle_command(const std::string& request) {
         if (device_id < 0 || device_id > 127)
             return error("invalid device_id");
 
-        // Enter calibration mode.
-        {
-            can_frame nmt{};
-            nmt.can_id  = make_arb_id(FUNC_NMT, static_cast<uint8_t>(device_id));
-            nmt.can_dlc = 2;
-            nmt.data[0] = MODE_CALIBRATION;
-            nmt.data[1] = static_cast<uint8_t>(device_id);
-            bus_mgr_->send(channel, nmt);
-        }
-
         // Phase 1: Wait for the motor to enter calibration mode (up to 5 s).
-        // Without this, the very next heartbeat (which may arrive before the motor
-        // has processed the NMT command) would show mode=IDLE and we would return
-        // immediately with stale flash data instead of the real calibrated value.
+        // IMPORTANT: register the future BEFORE sending NMT. The motor sends its
+        // mode=CALIBRATION heartbeat ACK within ~0.2 ms of receiving the NMT command.
+        // If the future is registered after NMT is sent, the control loop (5 ms period)
+        // may drain that heartbeat before the future exists, causing a permanent miss —
+        // the motor's updateService() is blocked for the full ~15 s calibration sequence
+        // and sends no further CALIBRATION heartbeats after the initial NMT ACK.
         {
             auto phase1_end = Clock::now() + ms(5000);
             bool entered = false;
+            bool nmt_sent = false;
+
             while (!entered && Clock::now() < phase1_end) {
                 int rem = static_cast<int>(
                     std::chrono::duration_cast<ms>(phase1_end - Clock::now()).count());
                 if (rem <= 0) break;
+
+                // Register future first, THEN send NMT on the first iteration.
                 auto fut = generic_listener_.expect_once(channel,
                     static_cast<uint8_t>(device_id), FUNC_HEARTBEAT);
+
+                if (!nmt_sent) {
+                    can_frame nmt{};
+                    nmt.can_id  = make_arb_id(FUNC_NMT, static_cast<uint8_t>(device_id));
+                    nmt.can_dlc = 2;
+                    nmt.data[0] = MODE_CALIBRATION;
+                    nmt.data[1] = static_cast<uint8_t>(device_id);
+                    bus_mgr_->send(channel, nmt);
+                    nmt_sent = true;
+                }
+
                 if (fut.wait_for(ms(std::min(rem, 1000))) != std::future_status::ready)
                     continue;
                 can_frame hb = fut.get();
@@ -675,6 +683,22 @@ std::string Robot::handle_command(const std::string& request) {
             }
         }
         return json{{"type","CALIBRATE_RESULT"},{"id",id},{"status","TIMEOUT"}}.dump();
+    }
+
+    if (type == "DISABLE_SLOW_POLL") {
+        std::string name = req.value("joint_name", "");
+        auto it = actuator_by_name_.find(name);
+        if (it == actuator_by_name_.end()) return error("unknown joint: " + name);
+        it->second->set_slow_poll_enabled(false);
+        return ack();
+    }
+
+    if (type == "ENABLE_SLOW_POLL") {
+        std::string name = req.value("joint_name", "");
+        auto it = actuator_by_name_.find(name);
+        if (it == actuator_by_name_.end()) return error("unknown joint: " + name);
+        it->second->set_slow_poll_enabled(true);
+        return ack();
     }
 
     return error("unknown command type: " + type);

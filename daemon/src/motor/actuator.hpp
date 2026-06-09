@@ -12,6 +12,7 @@
 #include "motor/recoil_protocol.hpp"
 #include "json.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <limits>
@@ -70,6 +71,10 @@ public:
     // Clear fault and return to IDLE.
     void clear_fault();
 
+    // Enable or disable slow-poll SDO telemetry reads.
+    // Disable during Flash Wizard commissioning to avoid generic_listener_ interference.
+    void set_slow_poll_enabled(bool enabled) { slow_poll_enabled_.store(enabled, std::memory_order_relaxed); }
+
     // Update the in-memory JointConfig from a flat JSON object.
     // Fields absent from the JSON are left unchanged.
     // Not thread-safe against simultaneous control-loop reads of cfg_ —
@@ -111,6 +116,9 @@ private:
 
     // Slow-poll counter for periodic SDO telemetry reads (bus_voltage, current, torque).
     uint32_t slow_poll_counter_ = 0;
+    // When false, slow-poll SDO reads are skipped (set during Flash Wizard commissioning
+    // to prevent slow-poll responses from consuming generic_listener_ futures).
+    std::atomic<bool> slow_poll_enabled_{true};
 
     // SDO write ACK mailbox: on_rx_frame() signals here; sdo_write_*() waits.
     std::mutex              sdo_ack_mutex_;

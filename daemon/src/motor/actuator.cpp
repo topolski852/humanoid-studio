@@ -250,8 +250,10 @@ void Actuator::tick(CanBusManager& bus) {
     // OFFLINE, CALIBRATING, FAULT: no outbound frames from tick().
 
     // Slow-poll telemetry via SDO reads (~3 Hz per field at 200 Hz / 60 ticks).
-    // param_id is echoed in the standard 8-byte response so on_rx_frame routes correctly.
-    if (current_state == JointState::ENABLED || current_state == JointState::IDLE) {
+    // Skipped when slow_poll_enabled_ is false (e.g. during Flash Wizard commissioning)
+    // to prevent SDO read responses from consuming generic_listener_ futures.
+    if (slow_poll_enabled_.load(std::memory_order_relaxed) &&
+        (current_state == JointState::ENABLED || current_state == JointState::IDLE)) {
         using P = ParamId;
         slow_poll_counter_++;
         switch (slow_poll_counter_ % 60) {

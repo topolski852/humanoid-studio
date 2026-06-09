@@ -693,6 +693,7 @@ class FlashManager:
     # ── Internal session ──────────────────────────────────────────────────────
 
     async def _run_session(self, port: str, config: FlashConfig) -> None:
+        self._commissioning_joint_name: str | None = None
         try:
             await self._do_session(port, config)
         except asyncio.TimeoutError:
@@ -707,6 +708,16 @@ class FlashManager:
             self.status.state = FlashState.FAILED
             self.status.error = str(exc)
             self._log(f"FAILED (unexpected): {exc}")
+        finally:
+            # Re-enable slow-poll telemetry if it was suspended for commissioning.
+            dc = self._daemon_client
+            jn = getattr(self, "_commissioning_joint_name", None)
+            if dc is not None and jn is not None:
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, dc.enable_slow_poll, jn)
+                except Exception:
+                    pass
 
     async def _do_session(self, port: str, config: FlashConfig) -> None:
         profile = config.profile_data()
@@ -1003,15 +1014,25 @@ class FlashManager:
         gear_ratio = 1.0
         robot_cfg = self._daemon_client.config if self._daemon_client else None
         if robot_cfg is not None:
-            for jcfg in robot_cfg.joints.values():
+            for jname, jcfg in robot_cfg.joints.items():
                 if jcfg.can_channel == config.can_channel and jcfg.can_id == config.can_id:
                     gear_ratio = float(jcfg.gear_ratio)
+                    self._commissioning_joint_name = jname
                     self._log(f"  Using gear_ratio={gear_ratio:+.1f} from robot config")
                     break
             else:
                 self._log(
                     f"  No joint config for {config.can_channel} ID {config.can_id} "
                     f"— using gear_ratio=1.0 (direct drive)")
+
+        # Disable slow-poll SDO telemetry reads for this joint during commissioning.
+        # The daemon's slow-poll sends periodic SDO READ requests; the motor's SDO READ
+        # responses are FUNC_TRANSMIT_SDO frames that can consume generic_listener_ futures
+        # registered for the GENERIC_SDO_WRITE calls below, causing false NO_ACK results.
+        if self._commissioning_joint_name and dc:
+            await loop.run_in_executor(
+                None, dc.disable_slow_poll, self._commissioning_joint_name)
+            self._log(f"  Slow-poll SDO suspended for {self._commissioning_joint_name}")
 
         sdo_writes = [
             (_PARAM_POSITION_GEAR_RATIO,   "f32", gear_ratio,                   f"gear_ratio={gear_ratio:+.1f}"),

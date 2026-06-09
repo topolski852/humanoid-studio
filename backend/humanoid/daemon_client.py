@@ -559,6 +559,17 @@ class DaemonClient:
         except DaemonError:
             pass  # daemon may already be gone
 
+    def disable_slow_poll(self, joint_name: str) -> None:
+        """Stop slow-poll SDO telemetry reads for a joint.
+        Call before Flash Wizard commissioning to prevent SDO read responses
+        from consuming generic_listener_ futures registered for SDO writes.
+        """
+        self._send_command({"type": "DISABLE_SLOW_POLL", "joint_name": joint_name})
+
+    def enable_slow_poll(self, joint_name: str) -> None:
+        """Resume slow-poll SDO telemetry reads for a joint."""
+        self._send_command({"type": "ENABLE_SLOW_POLL", "joint_name": joint_name})
+
     # ------------------------------------------------------------------ #
     # Generic CAN passthrough — flash wizard and commissioning            #
     # ------------------------------------------------------------------ #
