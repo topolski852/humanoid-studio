@@ -1033,6 +1033,10 @@ class FlashManager:
             await loop.run_in_executor(
                 None, dc.disable_slow_poll, self._commissioning_joint_name)
             self._log(f"  Slow-poll SDO suspended for {self._commissioning_joint_name}")
+            # Allow 50 ms for any in-flight slow-poll SDO response already queued
+            # in the kernel receive buffer to be drained by the control loop before
+            # registering GENERIC_SDO_WRITE futures below.
+            await asyncio.sleep(0.05)
 
         sdo_writes = [
             (_PARAM_POSITION_GEAR_RATIO,   "f32", gear_ratio,                   f"gear_ratio={gear_ratio:+.1f}"),

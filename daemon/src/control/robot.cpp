@@ -434,6 +434,8 @@ std::string Robot::handle_command(const std::string& request) {
 
         auto stat = fut.wait_for(ms(timeout_ms));
         if (stat != std::future_status::ready) {
+            generic_listener_.cancel_stale(channel,
+                static_cast<uint8_t>(device_id), FUNC_TRANSMIT_SDO);
             return json{{"type","SDO_WRITE_RESULT"},{"id",id},{"status","NO_ACK"}}.dump();
         }
         can_frame ack_frame = fut.get();
@@ -468,6 +470,8 @@ std::string Robot::handle_command(const std::string& request) {
 
         auto stat = fut.wait_for(ms(timeout_ms));
         if (stat != std::future_status::ready) {
+            generic_listener_.cancel_stale(channel,
+                static_cast<uint8_t>(device_id), FUNC_TRANSMIT_SDO);
             return json{{"type","SDO_READ_RESULT"},{"id",id},{"status","TIMEOUT"}}.dump();
         }
         can_frame rx = fut.get();
@@ -507,6 +511,8 @@ std::string Robot::handle_command(const std::string& request) {
 
         auto stat = fut.wait_for(ms(timeout_ms));
         if (stat != std::future_status::ready) {
+            generic_listener_.cancel_stale(channel,
+                static_cast<uint8_t>(device_id), FUNC_HEARTBEAT);
             return json{{"type","HEARTBEAT_RESULT"},{"id",id},{"status","TIMEOUT"}}.dump();
         }
         can_frame hb = fut.get();
@@ -643,8 +649,11 @@ std::string Robot::handle_command(const std::string& request) {
                     nmt_sent = true;
                 }
 
-                if (fut.wait_for(ms(std::min(rem, 1000))) != std::future_status::ready)
+                if (fut.wait_for(ms(std::min(rem, 1000))) != std::future_status::ready) {
+                    generic_listener_.cancel_stale(channel,
+                        static_cast<uint8_t>(device_id), FUNC_HEARTBEAT);
                     continue;
+                }
                 can_frame hb = fut.get();
                 if (hb.can_dlc >= 1 && hb.data[0] == MODE_CALIBRATION)
                     entered = true;
@@ -666,7 +675,11 @@ std::string Robot::handle_command(const std::string& request) {
                 static_cast<uint8_t>(device_id), FUNC_HEARTBEAT);
             auto stat = fut.wait_for(ms(std::min(remaining, 2000)));
 
-            if (stat != std::future_status::ready) continue;
+            if (stat != std::future_status::ready) {
+                generic_listener_.cancel_stale(channel,
+                    static_cast<uint8_t>(device_id), FUNC_HEARTBEAT);
+                continue;
+            }
 
             can_frame hb = fut.get();
             uint8_t  hb_mode = (hb.can_dlc >= 1) ? hb.data[0] : 0xFF;

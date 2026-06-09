@@ -33,6 +33,12 @@ public:
     // Called for every incoming frame from drain_all() — control thread.
     void on_frame(const std::string& channel, const can_frame& frame);
 
+    // Remove all unfulfilled one-shots matching (channel, device_id, func_id).
+    // Must be called by UDP handlers after wait_for() times out so that stale
+    // entries cannot consume ACKs intended for the next registered future.
+    // Returns the number of entries removed.
+    int cancel_stale(const std::string& channel, uint8_t device_id, uint8_t func_id);
+
 private:
     struct OneShot {
         std::string             channel;

@@ -36,6 +36,28 @@ std::vector<can_frame> GenericListener::end_sniff(uint64_t sniff_id) {
     return result;
 }
 
+int GenericListener::cancel_stale(
+    const std::string& channel, uint8_t device_id, uint8_t func_id)
+{
+    std::lock_guard<std::mutex> lk(lock_);
+    int removed = 0;
+    auto new_end = std::remove_if(one_shots_.begin(), one_shots_.end(),
+        [&](const OneShot& os) -> bool {
+            if (!os.fulfilled &&
+                os.channel == channel &&
+                os.device_id == device_id &&
+                os.func_id == func_id) {
+                ++removed;
+                return true;
+            }
+            return false;
+        });
+    one_shots_.erase(new_end, one_shots_.end());
+    if (removed > 0)
+        pending_.fetch_sub(removed, std::memory_order_relaxed);
+    return removed;
+}
+
 bool GenericListener::matches(const std::string& ch, const can_frame& f,
                                const std::string& exp_ch, uint8_t exp_dev,
                                uint8_t exp_func) const
