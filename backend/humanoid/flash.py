@@ -997,8 +997,24 @@ class FlashManager:
         phase_val = -1 if invert_phase else +1
         i_limit_val = float(profile["max_calibration_current"]) * 2.0
 
+        # Look up the configured gear_ratio for this joint so it is persisted to
+        # ESC flash correctly.  Fall back to 1.0 (direct drive) only if the joint
+        # is not yet in the robot config (e.g. first-time commissioning of a new ESC).
+        gear_ratio = 1.0
+        robot_cfg = self._daemon_client.config if self._daemon_client else None
+        if robot_cfg is not None:
+            for jcfg in robot_cfg.joints.values():
+                if jcfg.can_channel == config.can_channel and jcfg.can_id == config.can_id:
+                    gear_ratio = float(jcfg.gear_ratio)
+                    self._log(f"  Using gear_ratio={gear_ratio:+.1f} from robot config")
+                    break
+            else:
+                self._log(
+                    f"  No joint config for {config.can_channel} ID {config.can_id} "
+                    f"— using gear_ratio=1.0 (direct drive)")
+
         sdo_writes = [
-            (_PARAM_POSITION_GEAR_RATIO,   "f32", 1.0,                          "gear_ratio=1.0"),
+            (_PARAM_POSITION_GEAR_RATIO,   "f32", gear_ratio,                   f"gear_ratio={gear_ratio:+.1f}"),
             (_PARAM_CURRENT_I_LIMIT,       "f32", i_limit_val,                  f"i_limit={i_limit_val:.2f}"),
             (_PARAM_CURRENT_I_KP,          "f32", profile["i_kp"],              f"i_kp={profile['i_kp']:.4f}"),
             (_PARAM_CURRENT_I_KI,          "f32", profile["i_ki"],              f"i_ki={profile['i_ki']:.3f}"),
@@ -1223,6 +1239,7 @@ class FlashManager:
             "electrical_offset":       self.status.flux_offset,
             "phase_inverted":          invert_phase,
             "fast_frame_frequency":    100,
+            "gear_ratio":              gear_ratio,
         }
 
         self.status.state = FlashState.COMPLETE
