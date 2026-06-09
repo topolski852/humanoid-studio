@@ -7,12 +7,14 @@ import TelemetryTable from './TelemetryTable'
 import MotorControlsPanel    from './MotorControlsPanel'
 import MotorConfigPanel      from './MotorConfigPanel'
 import MotorCalibrationPanel from './MotorCalibrationPanel'
+import AutoTunePanel         from './AutoTunePanel'
 import FlashWizard from './FlashWizard'
 import ErrorLogPanel from './ErrorLogPanel'
 
 const TABS = [
   { id: 'drive', label: 'Move' },
   { id: 'tune',  label: 'Tune' },
+  { id: 'auto',  label: 'Auto' },
   { id: 'cal',   label: 'Cal'  },
   { id: 'log',   label: 'Log'  },
 ]
@@ -158,6 +160,14 @@ export default function MotorTab() {
         )}
         {view === 'tune' && (
           <MotorConfigPanel jointName={decodedName} onLogError={addLogEntry} />
+        )}
+        {view === 'auto' && (
+          <AutoTunePanel
+            jointName={decodedName}
+            state={state}
+            config={config}
+            onLogError={addLogEntry}
+          />
         )}
         {view === 'cal' && (
           <MotorCalibrationPanel

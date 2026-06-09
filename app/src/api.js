@@ -114,6 +114,11 @@ export const api = {
     }),
   storeMotorToFlash: (jointName) =>
     request(`/motors/${encodeURIComponent(jointName)}/store_to_flash`, { method: 'POST' }),
+  runStepTest: (jointName, params) =>
+    request(`/motors/${encodeURIComponent(jointName)}/step_test`, {
+      method: 'POST',
+      body: JSON.stringify(params),
+    }),
 
   // ── App settings ───────────────────────────────────────────────────────────
   getSettings: () => request('/settings'),

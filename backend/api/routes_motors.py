@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from humanoid.daemon_client import DaemonError, DaemonNotSupportedError, Mode
+from humanoid.motor_tune import run_step_test
 from humanoid.robot_config import PositionLimits
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parents[3] / "configs" / "humanoid_lite.json"
@@ -313,5 +314,42 @@ async def store_motor_to_flash(joint_name: str, request: Request) -> dict | JSON
         return _ok({"stored": True})
     except DaemonNotSupportedError as exc:
         return _err(str(exc), 503)
+    except DaemonError as exc:
+        return _err(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Step-response auto-tuner
+# ---------------------------------------------------------------------------
+
+class StepTestBody(BaseModel):
+    position_kp: float
+    position_ki: float
+    torque_limit: float
+    center_rad: float
+    offset_rad: float = 0.45
+    step_hold_s: float = 1.5
+    num_steps: int = 4
+
+
+@router.post("/motors/{joint_name}/step_test", response_model=None)
+async def step_test_motor(
+    joint_name: str, body: StepTestBody, request: Request
+) -> dict | JSONResponse:
+    """
+    Run a step-response PID test on the motor.
+
+    The motor must be in POSITION mode (enabled).  The total duration is
+    step_hold_s * (num_steps + 1) seconds (including pre-settle at pos_a).
+    Returns samples and step-response metrics.
+    """
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    try:
+        result = await run_step_test(actuator, **body.model_dump())
+        return _ok(result)
+    except ValueError as exc:
+        return _err(str(exc), 400)
     except DaemonError as exc:
         return _err(str(exc))

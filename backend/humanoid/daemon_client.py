@@ -229,6 +229,25 @@ class DaemonActuatorProxy:
     async def feed_watchdog(self) -> None:
         """No-op — daemon feeds watchdogs from its 200 Hz control loop."""
 
+    def get_cached_state(self) -> ActuatorState | None:
+        """Return the latest telemetry-pushed state without a UDP round-trip.
+
+        Returns None when the joint is OFFLINE or no telemetry has been received yet.
+        Safe to call from any thread (reads a lock-protected cache).
+        """
+        d = self._client.get_cached_joint_state(self._name)
+        return _daemon_state_to_actuator(d) if d is not None else None
+
+    async def sdo_write_f32(self, param_id: int, value: float, timeout: float = 1.0) -> bool:
+        """Write a float32 parameter directly to the device via SDO (async wrapper)."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._client.generic_sdo_write(
+                self._can_channel, self._can_id, param_id, 'f32', float(value), timeout
+            ),
+        )
+
     # -- Unsupported operations (require direct CAN bus access) --
 
     async def calibrate_offset(
@@ -492,6 +511,11 @@ class DaemonClient:
         """Fetch states for all joints from daemon (blocking)."""
         resp = self._send_command({"type": "GET_ALL_STATES"})
         return resp.get("states", {})
+
+    def get_cached_joint_state(self, joint_name: str) -> dict | None:
+        """Return the most recent telemetry-cached state for joint_name without a UDP round-trip."""
+        with self._tel_lock:
+            return self._joint_states.get(joint_name)
 
     def set_mode(self, joint_name: str, mode: str) -> None:
         self._send_command({"type": "SET_MODE", "joint_name": joint_name, "mode": mode})
