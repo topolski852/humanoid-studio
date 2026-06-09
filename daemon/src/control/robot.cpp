@@ -325,7 +325,16 @@ std::string Robot::handle_command(const std::string& request) {
     }
 
     if (type == "APPLY_ALL_CONFIGS") {
+        // Skip joints whose CAN bus is not open — avoids 500 ms SDO timeout per
+        // joint when only a subset of buses are physically connected.  A partial
+        // robot (e.g. only left_leg attached) can now apply_config successfully
+        // without blocking for up to N_offline × 500 ms seconds.
         for (auto& a : actuators_) {
+            if (!bus_mgr_->is_open(a->can_channel())) {
+                fprintf(stderr, "[Robot] APPLY_ALL_CONFIGS: skipping %s (bus %s not open)\n",
+                        a->name().c_str(), a->can_channel().c_str());
+                continue;
+            }
             if (!a->apply_config(*bus_mgr_))
                 fprintf(stderr, "[Robot] apply_config failed for %s\n", a->name().c_str());
         }

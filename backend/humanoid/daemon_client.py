@@ -540,7 +540,11 @@ class DaemonClient:
         self._send_command(cmd)
 
     def apply_all_configs(self) -> None:
-        self._send_command({"type": "APPLY_ALL_CONFIGS"})
+        # Daemon applies config to every joint on every open CAN bus.
+        # Worst case: N_joints × 27 SDO writes × 500 ms/write = several seconds.
+        # Use a 60 s timeout so partial-bus setups (some buses unavailable) don't
+        # trigger a false DaemonNotRunningError in the Python caller.
+        self._send_command({"type": "APPLY_ALL_CONFIGS"}, timeout=60.0)
 
     def store_joint_to_flash(self, joint_name: str) -> None:
         self._send_command({"type": "STORE_TO_FLASH", "joint_name": joint_name})

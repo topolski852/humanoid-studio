@@ -6,6 +6,7 @@ PUT /robot/config
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, Request
@@ -43,22 +44,18 @@ async def connect_robot(request: Request) -> dict | JSONResponse:
     robot: DaemonClient | None = request.app.state.robot
     if robot is None:
         return _err("No robot config loaded — PUT /robot/config first", 503)
-    if robot.is_connected():
-        return _ok({"message": "Already connected"})
+    # Always call apply_all_configs — motors start OFFLINE after daemon launch.
+    # apply_config sends fast_frame_frequency=100 which triggers PDO4 broadcast and
+    # transitions motors OFFLINE → IDLE.  Skipping this when is_connected() is True
+    # was the bug: the daemon broadcasts telemetry immediately, so is_connected() is
+    # True before any config has been written to the ESCs.
     try:
-        await robot.connect()
-        # read_calibration_from_devices is a no-op in daemon mode (calibration loaded from JSON).
-        await robot.read_calibration_from_devices()
-        # apply_all_configs tells daemon to write config params to all device RAMs.
-        await robot.apply_all_configs()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, robot.apply_all_configs)
         return _ok({"message": "Connected", "joint_count": len(robot.config.joint_names())})
     except DaemonNotRunningError:
-        return _err("Daemon not running — try disconnecting and reconnecting", 503)
+        return _err("Daemon not running — click Connect again or restart the app", 503)
     except Exception as exc:
-        try:
-            await robot.disconnect()
-        except Exception:
-            pass
         return _err(f"Connect failed: {exc}", 500)
 
 
