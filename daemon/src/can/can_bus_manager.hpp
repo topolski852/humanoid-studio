@@ -5,6 +5,7 @@
 
 #include "can/socket_can.hpp"
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -43,5 +44,12 @@ public:
     std::unordered_map<std::string, BusStats> stats() const;
 
 private:
+    using TimePoint = std::chrono::steady_clock::time_point;
+
     std::unordered_map<std::string, std::unique_ptr<SocketCan>> buses_;
+
+    // Per-interface: earliest time to attempt the next reopen (1 s back-off).
+    std::unordered_map<std::string, TimePoint> reopen_not_before_;
+    // Per-interface: last time we logged "send on closed bus" (5 s rate-limit).
+    std::unordered_map<std::string, TimePoint> last_closed_log_;
 };
