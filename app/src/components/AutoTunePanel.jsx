@@ -35,6 +35,93 @@ function toDisplaySamples(samples) {
 
 const ACTIVE_MODES = new Set(['POSITION', 'VELOCITY', 'TORQUE', 'CURRENT'])
 
+// ── Suggestion algorithm ───────────────────────────────────────────────────────
+
+const round1 = (v) => Math.round(v * 10) / 10
+const round2 = (v) => Math.round(v * 100) / 100
+
+/**
+ * Compute suggested gains from step-test metrics.
+ * params: { position_kp, position_ki, torque_limit, offset_rad }
+ * Returns: { kp, ki, torqueLimit, rationale: string[], quality: 'good'|'marginal'|'poor' }
+ */
+function computeSuggestion(metrics, params) {
+  const {
+    max_overshoot_pct: overshoot,
+    settling_time_ms:  settling,
+    steady_state_error_rad: sseRad,
+    max_torque_nm,
+    torque_saturated,
+  } = metrics
+  const { position_kp: kp, position_ki: ki, torque_limit, offset_rad } = params
+
+  const rationale = []
+  let newKp          = kp
+  let newKi          = ki
+  let newTorqueLimit = torque_limit
+  let quality        = 'good'
+
+  // ── Kp / torque-limit decision (priority order) ───────────────────────────
+  if (torque_saturated) {
+    rationale.push('Torque saturated — response shape unreliable; raise limit or reduce Kp')
+    newKp          = round1(kp * 0.80)
+    newTorqueLimit = round1(max_torque_nm * 1.5)
+    quality        = 'poor'
+  } else if (overshoot > 20) {
+    rationale.push(`High overshoot (${overshoot.toFixed(1)}%) — reduce Kp significantly`)
+    newKp    = round1(kp * 0.65)
+    quality  = 'poor'
+  } else if (overshoot > 10) {
+    rationale.push(`Overshoot ${overshoot.toFixed(1)}% — reduce Kp moderately`)
+    newKp   = round1(kp * 0.82)
+    quality = 'marginal'
+  } else if (overshoot > 8) {
+    rationale.push(`Overshoot ${overshoot.toFixed(1)}% — minor Kp reduction`)
+    newKp   = round1(kp * 0.92)
+    quality = 'marginal'
+  } else if (overshoot >= 2 && overshoot <= 8) {
+    if (settling != null && settling < 500) {
+      rationale.push(`Overshoot ${overshoot.toFixed(1)}%, settling ${settling} ms — response is good`)
+      quality = 'good'
+    } else if (settling != null && settling > 1000) {
+      rationale.push(`Low overshoot but slow settling (${settling} ms) — can increase Kp`)
+      newKp   = round1(kp * 1.15)
+      quality = 'marginal'
+    } else {
+      rationale.push(`Overshoot ${overshoot.toFixed(1)}% — within target range`)
+      quality = 'good'
+    }
+  } else {
+    // overshoot < 2% — overdamped or very slow
+    if (settling == null || settling > 800) {
+      rationale.push(settling == null
+        ? 'Never settled within 2% band — increase Kp'
+        : `Low overshoot, slow settling (${settling} ms) — increase Kp`)
+      newKp   = round1(kp * 1.30)
+      quality = 'marginal'
+    } else {
+      rationale.push(`Low overshoot (${overshoot.toFixed(1)}%), fast settle — critically damped`)
+      quality = 'good'
+    }
+  }
+
+  // ── Ki suggestion (independent; only when response readable) ─────────────
+  if (!torque_saturated && overshoot < 15 && sseRad != null) {
+    const sseDeg = sseRad * R2D
+    if (sseDeg > 1.0) {
+      const suggestedKi = Math.max(0.05, round2(sseRad * kp / offset_rad * 0.3))
+      if (ki < suggestedKi * 0.5) {
+        rationale.push(`Steady-state error ${sseDeg.toFixed(1)}° — add small Ki`)
+        newKi = suggestedKi
+      }
+    } else if (sseDeg < 0.3 && ki > 0) {
+      rationale.push(`Steady-state error ${sseDeg.toFixed(1)}° — Ki may not be needed`)
+    }
+  }
+
+  return { kp: newKp, ki: newKi, torqueLimit: newTorqueLimit, rationale, quality }
+}
+
 export default function AutoTunePanel({ jointName, state, config, onLogError }) {
   const [testKp,          setTestKp]          = useState(20.0)
   const [testKi,          setTestKi]          = useState(0.0)
@@ -49,8 +136,10 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
   const [running,   setRunning]   = useState(false)
   const [result,    setResult]    = useState(null)
   const [runError,  setRunError]  = useState(null)
-  const [busy,      setBusy]      = useState(false)
-  const [clearing,  setClearing]  = useState(false)
+  const [busy,              setBusy]              = useState(false)
+  const [clearing,          setClearing]          = useState(false)
+  const [applyingSuggestion, setApplyingSuggestion] = useState(false)
+  const [triedSuggestion,    setTriedSuggestion]    = useState(false)
 
   const cfgInit = useRef(false)
   const posInit = useRef(false)
@@ -107,6 +196,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
     setRunning(true)
     setRunError(null)
     setResult(null)
+    setTriedSuggestion(false)
     try {
       const res = await api.runStepTest(jointName, {
         position_kp:   testKp,
@@ -140,8 +230,40 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
     }
   }
 
+  // ── Suggestion actions ──────────────────────────────────────────────────────
+  function trySuggestion(s) {
+    setTestKp(s.kp)
+    setTestKi(s.ki)
+    setTestTorqueLimit(s.torqueLimit)
+    setTriedSuggestion(true)
+  }
+
+  async function applySuggestion(s) {
+    setApplyingSuggestion(true)
+    try {
+      await api.applyMotorConfig(jointName, {
+        position_kp:  s.kp,
+        position_ki:  s.ki,
+        torque_limit: s.torqueLimit,
+      })
+    } catch (e) {
+      const msg = `Apply suggestion failed: ${e.message}`
+      setRunError(msg)
+      onLogError?.(msg, 'Auto-Tune')
+    }
+    setApplyingSuggestion(false)
+  }
+
   const metrics        = result?.metrics ?? null
   const displaySamples = toDisplaySamples(result?.samples ?? [])
+  const suggestion     = metrics
+    ? computeSuggestion(metrics, {
+        position_kp:  testKp,
+        position_ki:  testKi,
+        torque_limit: testTorqueLimit,
+        offset_rad:   offsetDeg * DEG,
+      })
+    : null
 
   return (
     <div className="flex-1 overflow-y-auto p-3 space-y-4">
@@ -402,13 +524,24 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
             </section>
           )}
 
-          {/* Apply */}
+          {/* Suggestion card */}
+          {suggestion && (
+            <SuggestionCard
+              suggestion={suggestion}
+              tried={triedSuggestion}
+              applying={applyingSuggestion}
+              onTry={() => trySuggestion(suggestion)}
+              onApply={() => applySuggestion(suggestion)}
+            />
+          )}
+
+          {/* Apply current test gains */}
           <button
             onClick={applyGains}
             className="w-full py-1.5 rounded-lg text-xs font-medium bg-surface-2 text-gray-300
               border border-surface-3 hover:border-accent/40 hover:text-accent transition-colors"
           >
-            Apply These Gains to ESC
+            Apply Current Test Gains to ESC
           </button>
           <p className="text-[9px] text-gray-600 text-center">
             Use "Store to Flash" in the Tune tab to persist gains after reboot
@@ -451,5 +584,83 @@ function MetricRow({ label, value, warn = false }) {
         {value}
       </span>
     </>
+  )
+}
+
+function SuggestionCard({ suggestion, tried, applying, onTry, onApply }) {
+  const { kp, ki, torqueLimit, rationale, quality } = suggestion
+
+  const borderCls = quality === 'good'     ? 'border-online/40'
+                  : quality === 'marginal' ? 'border-warn/40'
+                  :                          'border-danger/40'
+  const badgeCls  = quality === 'good'     ? 'bg-online/10 text-online'
+                  : quality === 'marginal' ? 'bg-warn/10 text-warn'
+                  :                          'bg-danger/10 text-danger'
+  const dotCls    = quality === 'good'     ? 'bg-online'
+                  : quality === 'marginal' ? 'bg-warn'
+                  :                          'bg-danger'
+
+  return (
+    <div className={`rounded-xl border p-3 space-y-3 bg-surface-2 ${borderCls}`}>
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <SectionLabel>Suggested Gains</SectionLabel>
+        <span className={`flex items-center gap-1.5 text-[9px] font-medium px-2 py-0.5 rounded ${badgeCls}`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${dotCls}`} />
+          {quality.toUpperCase()}
+        </span>
+      </div>
+
+      {/* Rationale */}
+      <ul className="space-y-0.5">
+        {rationale.map((r, i) => (
+          <li key={i} className="text-[10px] text-gray-400 flex gap-1.5">
+            <span className="text-gray-600 flex-shrink-0">•</span>
+            {r}
+          </li>
+        ))}
+      </ul>
+
+      {/* Suggested values */}
+      <div className="grid grid-cols-3 gap-2 text-center">
+        {[
+          { label: 'Kp',    value: kp },
+          { label: 'Ki',    value: ki },
+          { label: 'Limit', value: `${torqueLimit} Nm` },
+        ].map(({ label, value }) => (
+          <div key={label} className="bg-surface-1 rounded-lg py-1.5 px-2">
+            <p className="text-[9px] text-gray-600">{label}</p>
+            <p className="font-mono text-sm text-gray-200">{value}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Actions */}
+      <div className="flex gap-2">
+        <button
+          onClick={onTry}
+          className="flex-1 py-1.5 rounded-lg text-xs font-medium transition-colors
+            bg-surface-1 text-gray-300 border border-surface-3
+            hover:border-accent/40 hover:text-accent"
+        >
+          Try These Gains
+        </button>
+        <button
+          onClick={onApply}
+          disabled={applying}
+          className="flex-1 py-1.5 rounded-lg text-xs font-medium transition-colors
+            bg-accent/20 text-accent border border-accent/30
+            hover:bg-accent/30 disabled:opacity-40"
+        >
+          {applying ? 'Applying…' : 'Apply to ESC'}
+        </button>
+      </div>
+
+      {tried && (
+        <p className="text-[9px] text-accent text-center">
+          Gains loaded above — click Run Step Test to validate
+        </p>
+      )}
+    </div>
   )
 }
