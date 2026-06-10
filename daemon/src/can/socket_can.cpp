@@ -21,11 +21,12 @@ SocketCan::~SocketCan() {
     close();
 }
 
-bool SocketCan::open() {
+bool SocketCan::open(bool silent) {
     fd_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
     if (fd_ < 0) {
-        fprintf(stderr, "[SocketCan] socket() failed for %s: %s\n",
-                ifname_.c_str(), strerror(errno));
+        if (!silent)
+            fprintf(stderr, "[SocketCan] socket() failed for %s: %s\n",
+                    ifname_.c_str(), strerror(errno));
         return false;
     }
 
@@ -34,8 +35,9 @@ bool SocketCan::open() {
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, ifname_.c_str(), IFNAMSIZ - 1);
     if (ioctl(fd_, SIOCGIFINDEX, &ifr) < 0) {
-        fprintf(stderr, "[SocketCan] ioctl SIOCGIFINDEX failed for %s: %s\n",
-                ifname_.c_str(), strerror(errno));
+        if (!silent)
+            fprintf(stderr, "[SocketCan] ioctl SIOCGIFINDEX failed for %s: %s\n",
+                    ifname_.c_str(), strerror(errno));
         ::close(fd_);
         fd_ = -1;
         return false;
@@ -44,8 +46,9 @@ bool SocketCan::open() {
     // Set non-blocking — key difference from Berkeley's blocking reads
     int flags = fcntl(fd_, F_GETFL, 0);
     if (flags < 0 || fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
-        fprintf(stderr, "[SocketCan] fcntl O_NONBLOCK failed for %s: %s\n",
-                ifname_.c_str(), strerror(errno));
+        if (!silent)
+            fprintf(stderr, "[SocketCan] fcntl O_NONBLOCK failed for %s: %s\n",
+                    ifname_.c_str(), strerror(errno));
         ::close(fd_);
         fd_ = -1;
         return false;
@@ -57,8 +60,9 @@ bool SocketCan::open() {
     addr.can_family  = AF_CAN;
     addr.can_ifindex = ifr.ifr_ifindex;
     if (bind(fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "[SocketCan] bind failed for %s: %s\n",
-                ifname_.c_str(), strerror(errno));
+        if (!silent)
+            fprintf(stderr, "[SocketCan] bind failed for %s: %s\n",
+                    ifname_.c_str(), strerror(errno));
         ::close(fd_);
         fd_ = -1;
         return false;

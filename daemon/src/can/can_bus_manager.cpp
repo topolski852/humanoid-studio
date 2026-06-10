@@ -47,7 +47,7 @@ void CanBusManager::drain_all(
             // open() returns immediately on failure (interface still down/absent).
             auto& not_before = reopen_not_before_[name];
             if (now >= not_before) {
-                if (bus->open()) {
+                if (bus->open(/*silent=*/true)) {
                     fprintf(stderr, "[CanBusManager] interface %s reconnected\n", name.c_str());
                     last_closed_log_.erase(name);  // allow next closed-send log immediately
                 } else {

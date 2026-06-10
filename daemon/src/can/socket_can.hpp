@@ -16,7 +16,8 @@ public:
     ~SocketCan();
 
     // Open and bind the socket. Returns true on success.
-    bool open();
+    // Pass silent=true to suppress error logs (used for background reconnect attempts).
+    bool open(bool silent = false);
     void close();
     bool is_open() const { return fd_ >= 0; }
     const std::string& ifname() const { return ifname_; }
