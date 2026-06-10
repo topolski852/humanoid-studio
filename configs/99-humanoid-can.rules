@@ -1,6 +1,8 @@
 # Humanoid Studio — persistent CAN interface naming
 # CANable adapters (gs_usb driver) identified by USB serial number.
 # Automatically configures bitrate 1 Mbps and brings interface up on plug-in.
+# txqueuelen 1000: large TX queue to avoid ENOBUFS under high frame rate
+# restart-ms 100 is attempted but silently skipped if the driver doesn't support it (e.g. gs_usb)
 #
 # Install:
 #   sudo cp /home/nse/humanoid-studio/configs/99-humanoid-can.rules /etc/udev/rules.d/
@@ -13,13 +15,13 @@
 # To find serial for new adapters: udevadm info /sys/class/net/<iface> --query=property | grep ID_SERIAL_SHORT
 
 # ── Left leg ──────────────────────────────────────────────────────────────────
-SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="0032004A5043570120323339", NAME="can_left_leg", RUN+="/bin/sh -c '/usr/bin/ip link set can_left_leg type can bitrate 1000000 && /usr/bin/ip link set can_left_leg up'"
+SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="0032004A5043570120323339", NAME="can_left_leg", RUN+="/bin/sh -c '/usr/bin/ip link set can_left_leg type can bitrate 1000000 restart-ms 100 2>/dev/null || /usr/bin/ip link set can_left_leg type can bitrate 1000000; /usr/bin/ip link set can_left_leg txqueuelen 1000; /usr/bin/ip link set can_left_leg up'"
 
 # ── Right leg ─────────────────────────────────────────────────────────────────
-SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="0030002E5446571020343032", NAME="can_right_leg", RUN+="/bin/sh -c '/usr/bin/ip link set can_right_leg type can bitrate 1000000 && /usr/bin/ip link set can_right_leg up'"
+SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="0030002E5446571020343032", NAME="can_right_leg", RUN+="/bin/sh -c '/usr/bin/ip link set can_right_leg type can bitrate 1000000 restart-ms 100 2>/dev/null || /usr/bin/ip link set can_right_leg type can bitrate 1000000; /usr/bin/ip link set can_right_leg txqueuelen 1000; /usr/bin/ip link set can_right_leg up'"
 
 # ── Left arm (fill in serial when adapter is acquired) ───────────────────────
-# SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="REPLACE_WITH_LEFT_ARM_SERIAL", NAME="can_left_arm", RUN+="/bin/sh -c '/usr/bin/ip link set can_left_arm type can bitrate 1000000 && /usr/bin/ip link set can_left_arm up'"
+# SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="REPLACE_WITH_LEFT_ARM_SERIAL", NAME="can_left_arm", RUN+="/bin/sh -c '/usr/bin/ip link set can_left_arm type can bitrate 1000000 restart-ms 100 2>/dev/null || /usr/bin/ip link set can_left_arm type can bitrate 1000000; /usr/bin/ip link set can_left_arm txqueuelen 1000; /usr/bin/ip link set can_left_arm up'"
 
 # ── Right arm (fill in serial when adapter is acquired) ──────────────────────
-# SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="REPLACE_WITH_RIGHT_ARM_SERIAL", NAME="can_right_arm", RUN+="/bin/sh -c '/usr/bin/ip link set can_right_arm type can bitrate 1000000 && /usr/bin/ip link set can_right_arm up'"
+# SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="REPLACE_WITH_RIGHT_ARM_SERIAL", NAME="can_right_arm", RUN+="/bin/sh -c '/usr/bin/ip link set can_right_arm type can bitrate 1000000 restart-ms 100 2>/dev/null || /usr/bin/ip link set can_right_arm type can bitrate 1000000; /usr/bin/ip link set can_right_arm txqueuelen 1000; /usr/bin/ip link set can_right_arm up'"

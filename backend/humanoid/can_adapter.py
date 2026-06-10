@@ -209,12 +209,16 @@ def _build_udev_rule(usb_serial: str, limb: str) -> str:
     # ATTRS{serial} is the sysfs attribute (from udevadm --attribute-walk);
     # ID_SERIAL_SHORT is a udev ENV property and does not work in ATTRS{} match.
     # Full path for ip is required — udev RUN has no PATH.
+    # restart-ms 100 is tried first; drivers that don't support it (e.g. gs_usb/CANable)
+    # fall back silently so the interface still comes up with correct bitrate and txqueuelen.
     return (
         f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{serial}}=="{usb_serial}", '
         f'NAME="{name}", '
-        f'RUN+="/bin/sh -c \'/usr/bin/ip link set {name} type can bitrate 1000000 && '
-        f'/usr/bin/ip link set {name} up && '
-        f'/usr/bin/ip link set {name} txqueuelen 1000\'"'
+        f'RUN+="/bin/sh -c \''
+        f'/usr/bin/ip link set {name} type can bitrate 1000000 restart-ms 100 2>/dev/null || '
+        f'/usr/bin/ip link set {name} type can bitrate 1000000; '
+        f'/usr/bin/ip link set {name} txqueuelen 1000; '
+        f'/usr/bin/ip link set {name} up\'"'
     )
 
 
@@ -245,12 +249,17 @@ async def assign_adapter(
         if rc != 0:
             raise RuntimeError(f'Rename {current_name!r} → {new_name!r} failed: {err}')
 
-    # Step 3: set CAN parameters
+    # Step 3: set CAN parameters; try with restart-ms 100 first (not all drivers support it)
     rc, _, err = await _run(
-        'ip', 'link', 'set', new_name, 'type', 'can', 'bitrate', '1000000', sudo=True
+        'ip', 'link', 'set', new_name, 'type', 'can', 'bitrate', '1000000',
+        'restart-ms', '100', sudo=True
     )
     if rc != 0:
-        raise RuntimeError(f'Set CAN parameters on {new_name!r} failed: {err}')
+        rc, _, err = await _run(
+            'ip', 'link', 'set', new_name, 'type', 'can', 'bitrate', '1000000', sudo=True
+        )
+        if rc != 0:
+            raise RuntimeError(f'Set CAN parameters on {new_name!r} failed: {err}')
 
     # Step 4: bring up
     rc, _, err = await _run('ip', 'link', 'set', new_name, 'up', sudo=True)

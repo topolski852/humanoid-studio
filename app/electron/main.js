@@ -299,27 +299,41 @@ app.whenReady().then(async () => {
   }
 })
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  if (app.isQuitting) return  // already handled — don't re-enter
   app.isQuitting = true
-  if (backendProcess && !backendProcess.killed) {
-    console.log('[main] Sending SIGTERM to backend...')
-    backendProcess.kill('SIGTERM')
-    setTimeout(() => {
-      if (backendProcess && !backendProcess.killed) {
-        console.log('[main] Backend did not exit, sending SIGKILL')
-        backendProcess.kill('SIGKILL')
+
+  const procs = [
+    { name: 'backend', proc: backendProcess },
+    { name: 'daemon',  proc: daemonProcess  },
+  ].filter(({ proc }) => proc && !proc.killed)
+
+  if (procs.length === 0) return  // nothing to wait for
+
+  // Hold the quit open until both children have exited (or been force-killed).
+  event.preventDefault()
+
+  let remaining = procs.length
+  const done = () => { if (--remaining === 0) app.quit() }
+
+  for (const { name, proc } of procs) {
+    console.log(`[main] Sending SIGTERM to ${name}...`)
+    proc.kill('SIGTERM')
+
+    // Force-kill after 3 s if SIGTERM didn't work, then quit regardless.
+    const timer = setTimeout(() => {
+      if (!proc.killed) {
+        console.log(`[main] ${name} did not exit — sending SIGKILL`)
+        proc.kill('SIGKILL')
       }
+      done()
     }, 3000)
-  }
-  if (daemonProcess && !daemonProcess.killed) {
-    console.log('[main] Sending SIGTERM to daemon...')
-    daemonProcess.kill('SIGTERM')
-    setTimeout(() => {
-      if (daemonProcess && !daemonProcess.killed) {
-        console.log('[main] Daemon did not exit, sending SIGKILL')
-        daemonProcess.kill('SIGKILL')
-      }
-    }, 3000)
+
+    proc.once('exit', () => {
+      clearTimeout(timer)
+      console.log(`[main] ${name} exited`)
+      done()
+    })
   }
 })
 

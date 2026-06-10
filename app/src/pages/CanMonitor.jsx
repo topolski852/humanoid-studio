@@ -106,9 +106,10 @@ function AdapterCard({ meta, iface, hasAdapter, silentSince, onBringUp, onNaviga
   const [bringing, setBringing]   = useState(false)
   const [bringError, setBringError] = useState(null)
   const [resetting, setResetting] = useState(false)
-  const color   = busColor(iface?.state, iface?.bus_error_state)
-  const isDown  = !iface || iface.state !== 'UP'
-  const isUnconfigured = !iface || iface.state === 'UNCONFIGURED'
+  const color          = busColor(iface?.state, iface?.bus_error_state)
+  const isUp           = iface?.state === 'UP'
+  const isDown         = iface?.state === 'DOWN'
+  const isUnconfigured = !iface || iface.state === 'UNCONFIGURED' || iface.state === 'UNKNOWN'
   const totalJoints  = iface?.joints_total ?? 0
   const onlineJoints = iface?.joints_online ?? 0
   const jointPct     = totalJoints > 0 ? (onlineJoints / totalJoints) * 100 : 0
@@ -150,7 +151,7 @@ function AdapterCard({ meta, iface, hasAdapter, silentSince, onBringUp, onNaviga
           <p className="font-medium text-sm leading-none">{meta.label}</p>
           <p className="font-mono text-[10px] text-gray-500 mt-0.5">{meta.name}</p>
         </div>
-        {!isDown && (
+        {isUp && (
           <button
             onClick={handleReset}
             disabled={resetting}
@@ -166,7 +167,7 @@ function AdapterCard({ meta, iface, hasAdapter, silentSince, onBringUp, onNaviga
       </div>
 
       {/* Error state label */}
-      {iface?.state === 'UP' && (
+      {isUp && (
         <div className={`text-[10px] font-medium px-2 py-0.5 rounded self-start ${
           color === 'green' ? 'bg-online/10 text-online' :
           color === 'yellow' ? 'bg-warn/10 text-warn' :
@@ -250,10 +251,17 @@ function AdapterCard({ meta, iface, hasAdapter, silentSince, onBringUp, onNaviga
         </div>
       )}
 
-      {/* DOWN + bring-up */}
-      {hasAdapter && isDown && !isUnconfigured && (
+      {/* Interface not present in OS (no udev rule or adapter not plugged in) */}
+      {hasAdapter && isUnconfigured && (
+        <div className="rounded-lg bg-surface-2 border border-warn/20 px-3 py-2">
+          <span className="text-[10px] text-warn/80">Interface not found — replug adapter or check udev rules</span>
+        </div>
+      )}
+
+      {/* Interface exists but is DOWN — show Bring Up */}
+      {hasAdapter && isDown && (
         <div className="rounded-lg bg-warn/10 border border-warn/20 px-3 py-2 flex items-center gap-2">
-          <span className="text-[10px] text-warn flex-1">Interface down — check USB cable</span>
+          <span className="text-[10px] text-warn flex-1">Interface down</span>
           <button
             onClick={handleBringUp}
             disabled={bringing}

@@ -55,9 +55,10 @@ function StatusBar({ adapters, canHealth }) {
 }
 
 // ── Limb slot card (always-visible 2×2 grid) ─────────────────────────────────
-function LimbSlotCard({ meta, adapter, iface, jointCount, unassigned, onAssign, onUnassign, onRefresh }) {
+function LimbSlotCard({ meta, adapter, iface, jointCount, unassigned, onAssign, onUnassign, onBringUp, onRefresh }) {
   const [selectedSerial, setSelectedSerial] = useState('')
   const [assigning, setAssigning]           = useState(false)
+  const [bringingUp, setBringingUp]         = useState(false)
   const [error, setError]                   = useState(null)
   const [pingResult, setPingResult]         = useState(null)  // {count, device_ids} | null
   const [pinging, setPinging]               = useState(false)
@@ -99,6 +100,19 @@ function LimbSlotCard({ meta, adapter, iface, jointCount, unassigned, onAssign, 
     }
   }
 
+  async function handleBringUp() {
+    setBringingUp(true)
+    setError(null)
+    try {
+      await onBringUp(meta.busName)
+      recheckTimerRef.current = setTimeout(onRefresh, 2000)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBringingUp(false)
+    }
+  }
+
   async function handlePing() {
     setPinging(true)
     setPingResult(null)
@@ -125,11 +139,11 @@ function LimbSlotCard({ meta, adapter, iface, jointCount, unassigned, onAssign, 
     }
   }
 
-  const isAssigned = !!adapter
-  const state      = iface?.state ?? (adapter ? 'UNCONFIGURED' : null)
-  const isUp       = state === 'UP'
-  const isDown     = state === 'DOWN'
-  const isUnconfigured = state === 'UNCONFIGURED' || (isAssigned && !iface)
+  const isAssigned     = !!adapter
+  const state          = iface?.state ?? (adapter ? 'UNCONFIGURED' : null)
+  const isUp           = state === 'UP'
+  const isDown         = state === 'DOWN'
+  const isUnconfigured = state === 'UNCONFIGURED' || state === 'UNKNOWN' || (isAssigned && !iface)
   const msgRate    = iface?.message_rate
   const jOnline    = iface?.joints_online ?? 0
   const jTotal     = jointCount ?? 0
@@ -186,9 +200,22 @@ function LimbSlotCard({ meta, adapter, iface, jointCount, unassigned, onAssign, 
             <span className="text-gray-400">{serialTail}</span>
           </div>
 
+          {isDown && (
+            <div className="flex items-center gap-2 rounded-lg bg-warn/5 border border-warn/20 px-2 py-1.5 mt-1">
+              <span className="text-[9px] text-warn flex-1">Interface down</span>
+              <button
+                onClick={handleBringUp}
+                disabled={bringingUp}
+                className="text-[9px] px-2 py-1 rounded bg-warn/20 text-warn hover:bg-warn/30 disabled:opacity-50 whitespace-nowrap transition-colors"
+              >
+                {bringingUp ? '…' : 'Bring Up'}
+              </button>
+            </div>
+          )}
+
           {isUnconfigured && (
             <p className="text-[9px] text-warn/80 leading-tight">
-              Interface not present — replug adapter or check udev rules
+              Interface not found — replug adapter or check udev rules
             </p>
           )}
 
@@ -585,6 +612,7 @@ export default function CanSetup() {
                 unassigned={unassigned}
                 onAssign={handleAssign}
                 onUnassign={handleUnassign}
+                onBringUp={handleBringUp}
                 onRefresh={refresh}
               />
             ))}

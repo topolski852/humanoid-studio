@@ -62,13 +62,6 @@ export default function TelemetryTable({ state, passiveState = null }) {
 
         <Metric label="TORQUE (est.)" value={fmt(state?.torque, 3)} unit="Nm" />
 
-        {/* Temperature — not available from firmware SDO map */}
-        <div className="flex flex-col gap-0.5">
-          <span className="data-label">TEMPERATURE</span>
-          <span className="font-mono text-lg text-gray-600">N/A</span>
-          <span className="text-[9px] text-gray-700">not exposed by firmware</span>
-        </div>
-
         <Metric label="BUS VOLTAGE" value={fmt(state?.bus_voltage, 2)} unit="V" />
 
         <Divider />

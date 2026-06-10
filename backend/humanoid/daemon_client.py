@@ -17,6 +17,7 @@ import socket
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Callable
 
 from enum import IntEnum
@@ -40,6 +41,21 @@ class Mode(IntEnum):
     DEBUG               = 0x80
 
 _log = logging.getLogger(__name__)
+
+_CANONICAL_BUSES = ['can_left_leg', 'can_right_leg', 'can_left_arm', 'can_right_arm']
+_SYSFS_NET = Path('/sys/class/net')
+
+
+def _sysfs_iface_state(ifname: str) -> str:
+    """Read kernel operstate from sysfs without spawning a subprocess.
+    Returns 'UP', 'DOWN', or 'UNCONFIGURED' (interface not present in OS at all).
+    """
+    operstate_path = _SYSFS_NET / ifname / 'operstate'
+    try:
+        operstate = operstate_path.read_text().strip()
+        return 'UP' if operstate == 'up' else 'DOWN'
+    except OSError:
+        return 'UNCONFIGURED'
 
 _DAEMON_HOST = "127.0.0.1"
 _CMD_TIMEOUT = 5.0   # seconds
@@ -544,7 +560,16 @@ class DaemonClient:
         # Worst case: N_joints × 27 SDO writes × 500 ms/write = several seconds.
         # Use a 60 s timeout so partial-bus setups (some buses unavailable) don't
         # trigger a false DaemonNotRunningError in the Python caller.
-        self._send_command({"type": "APPLY_ALL_CONFIGS"}, timeout=60.0)
+        resp = self._send_command({"type": "APPLY_ALL_CONFIGS"}, timeout=60.0)
+        configured = resp.get("configured", 0)
+        skipped    = resp.get("skipped", 0)
+        failed     = resp.get("failed", 0)
+        if configured == 0 and skipped > 0:
+            _log.warning("apply_all_configs: no motors configured (%d skipped, %d failed)",
+                         skipped, failed)
+        else:
+            _log.info("apply_all_configs: %d configured, %d skipped, %d failed",
+                      configured, skipped, failed)
 
     def store_joint_to_flash(self, joint_name: str) -> None:
         self._send_command({"type": "STORE_TO_FLASH", "joint_name": joint_name})
@@ -797,13 +822,18 @@ class DaemonClient:
 
     def get_interface_stats(self) -> list:
         """
-        Return per-interface health dicts from daemon bus_health telemetry.
+        Return per-interface health dicts for all four canonical CAN buses.
 
-        Shape matches what CanMonitor.jsx expects:
-          state, bus_error_state, rx_packets, tx_packets, rx_errors, tx_errors,
-          rx_dropped, message_rate, rate_history, joints_online (int), joints_total,
-          joints [{name, can_id, status, position_rad, velocity_rads, last_seen_ms}],
-          usb_path
+        Always emits all four buses (can_left_leg, can_right_leg, can_left_arm,
+        can_right_arm) so the frontend never falls back to a stale UNKNOWN default.
+
+        State is derived by cross-checking daemon bus_health with sysfs operstate:
+          - UNCONFIGURED: interface not present in OS (no udev rule / never plugged in)
+          - DOWN:         interface exists in OS but link is down
+          - UP:           interface is up AND daemon has an open socket
+
+        This prevents the "shows UP when STOPPED" bug where the daemon can successfully
+        bind a socket to a STOPPED interface and incorrectly report open=True.
         """
         with self._tel_lock:
             health      = dict(self._bus_health)
@@ -829,14 +859,33 @@ class DaemonClient:
                 })
 
         stats = []
-        for ifname, bh in health.items():
-            is_open     = bh.get("open", False)
-            bus_joints  = joints_by_bus.get(ifname, [])
-            online_cnt  = sum(1 for j in bus_joints if j["status"] == "ONLINE")
+        for ifname in _CANONICAL_BUSES:
+            bh         = health.get(ifname, {})
+            sysfs_state = _sysfs_iface_state(ifname)
+
+            if sysfs_state == 'UNCONFIGURED':
+                # Interface object doesn't exist in the OS — adapter not plugged in
+                # or udev rule never written.
+                final_state     = 'UNCONFIGURED'
+                bus_error_state = 'UNCONFIGURED'
+            elif sysfs_state == 'DOWN':
+                # Interface exists (kernel has it) but link is down/stopped.
+                # Daemon socket may still report open=True if it bound before the
+                # interface went down — trust the kernel, not the daemon.
+                final_state     = 'DOWN'
+                bus_error_state = 'DOWN'
+            else:
+                # Kernel says UP; trust daemon's open flag for CAN-socket status.
+                is_open         = bh.get("open", False)
+                final_state     = 'UP' if is_open else 'DOWN'
+                bus_error_state = 'ERROR-ACTIVE' if is_open else 'DOWN'
+
+            bus_joints = joints_by_bus.get(ifname, [])
+            online_cnt = sum(1 for j in bus_joints if j["status"] == "ONLINE")
             stats.append({
                 "name":             ifname,
-                "state":            "UP" if is_open else "DOWN",
-                "bus_error_state":  "ERROR-ACTIVE" if is_open else "DOWN",
+                "state":            final_state,
+                "bus_error_state":  bus_error_state,
                 "bitrate":          1_000_000,
                 "rx_packets":       bh.get("rx_frames", 0),
                 "tx_packets":       0,

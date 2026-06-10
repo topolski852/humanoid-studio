@@ -251,27 +251,29 @@ async def _run_subprocess(cmd: list[str], cwd: Path) -> tuple[int, str]:
     return proc.returncode, stdout.decode(errors="replace")
 
 
-async def _bounce_can_interface(channel: str) -> None:
-    """Bring the CAN interface down then up to clear bus-off state and flush the kernel TX queue."""
-    async def _run(cmd: list[str]) -> None:
-        p = await asyncio.create_subprocess_exec(
-            'sudo', '-n', *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
+async def _check_can_interface_state(channel: str) -> str | None:
+    """
+    Read the host-side CAN interface state via `ip -details link show`.
+    Returns 'BUS-OFF', 'ERROR-PASSIVE', or None (healthy / unknown).
+    A degraded interface silently drops TX frames, causing all SDO writes
+    to return NO_ACK even when the ESC firmware is perfectly healthy.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ip", "-details", "link", "show", channel,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        try:
-            await asyncio.wait_for(p.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            try:
-                p.kill()
-            except Exception:
-                pass
+        stdout, _ = await proc.communicate()
+        text = stdout.decode(errors="replace")
+        if "BUS-OFF" in text or "bus-off" in text:
+            return "BUS-OFF"
+        if "ERROR-PASSIVE" in text or "error-passive" in text:
+            return "ERROR-PASSIVE"
+    except Exception:
+        pass
+    return None
 
-    await _run(['/sbin/ip', 'link', 'set', channel, 'down'])
-    await asyncio.sleep(0.1)
-    await _run(['/sbin/ip', 'link', 'set', channel, 'type', 'can', 'bitrate', '1000000'])
-    await _run(['/sbin/ip', 'link', 'set', channel, 'txqueuelen', '1000'])
-    await _run(['/sbin/ip', 'link', 'set', channel, 'up'])
 
 
 _FLASH_CONFIG_ADDRESS = 0x0801F800   # STM32G431CB Bank1 page 63 — MotorController config
@@ -738,12 +740,6 @@ class FlashManager:
                 f"Firmware flashed. Device booting at target CAN ID {config.can_id} "
                 f"(config page encodes device_id={config.can_id})...",
                 progress=20)
-            # Bounce the CAN interface NOW while the ESC is not yet connected.
-            # Doing this here (rather than when the user clicks the button) avoids
-            # disrupting the ESC after it is live on the bus — a late bounce can
-            # drive the FDCAN error counter past ERROR_PASSIVE and silence the ESC.
-            self._log("Preparing CAN interface...", progress=22)
-            await _bounce_can_interface(config.can_channel)
         else:
             self._log(
                 "Skipping flash step — using firmware already on the ESC.",
@@ -1038,6 +1034,39 @@ class FlashManager:
             # registering GENERIC_SDO_WRITE futures below.
             await asyncio.sleep(0.05)
 
+        # Host-side CAN interface health check.  ERROR-PASSIVE / BUS-OFF causes
+        # the kernel to silently drop TX frames (ENOBUFS), making all SDO writes
+        # return NO_ACK even when the ESC firmware is perfectly healthy.  This is
+        # usually caused by a damaged ESC CAN transceiver on the same bus.
+        can_iface_state = await _check_can_interface_state(config.can_channel)
+        if can_iface_state:
+            self._log(
+                f"  WARNING: CAN interface {config.can_channel} is in {can_iface_state} state. "
+                f"TX frames will be silently dropped — SDO writes will return NO_ACK. "
+                f"Close the app, run: sudo ip link set {config.can_channel} down && "
+                f"sudo ip link set {config.can_channel} type can bitrate 1000000 restart-ms 100 && "
+                f"sudo ip link set {config.can_channel} txqueuelen 1000 && "
+                f"sudo ip link set {config.can_channel} up, then reopen the app. "
+                f"If this recurs, a damaged CAN transceiver on the bus is the likely cause.")
+
+        # Pre-commission SDO diagnostic: try to read device_id from the ESC.
+        # If this times out the ESC is not responding to SDO at all — all
+        # subsequent SDO writes will also fail.  This is usually caused by:
+        #   • Old commissioning ELF with FDCAN filter fixed at device_id=127
+        #   • Firmware in a wedged state (power-cycle + Flash+Commission required)
+        diag_result = await loop.run_in_executor(
+            None, dc.generic_sdo_read,
+            config.can_channel, active_id, _PARAM_DEVICE_ID, 1.0)
+        if diag_result is None:
+            self._log(
+                f"  WARNING: ESC at ID {active_id} is NOT responding to SDO reads. "
+                f"All SDO writes below will return NO_ACK. "
+                f"If this persists after power-cycling, use 'Flash + Commission' to "
+                f"re-flash the firmware and reset the CAN filter.")
+        else:
+            stored_id = int(diag_result["value_u32"] or 0)
+            self._log(f"  SDO diagnostic: ESC device_id={stored_id} — SDO responding ✓")
+
         sdo_writes = [
             (_PARAM_POSITION_GEAR_RATIO,   "f32", gear_ratio,                   f"gear_ratio={gear_ratio:+.1f}"),
             (_PARAM_CURRENT_I_LIMIT,       "f32", i_limit_val,                  f"i_limit={i_limit_val:.2f}"),
@@ -1206,10 +1235,23 @@ class FlashManager:
                     "Calibration timed out after 90 s." + swd_detail +
                     " Check motor phase wires and encoder connection.")
 
-            # Read flux_offset from the device.
+            # After calibration the ESC transitions CALIBRATION → IDLE.
+            # Wait 800 ms before SDO reads: the firmware writes the flux_offset
+            # into its internal struct and the ESC may not respond to SDO reads
+            # for a brief window immediately after returning to IDLE.
+            await asyncio.sleep(0.8)
+
+            # Read flux_offset from the device — retry once with a long timeout.
             fo_result = await loop.run_in_executor(
                 None, dc.generic_sdo_read,
-                config.can_channel, config.can_id, _PARAM_ENCODER_FLUX_OFFSET)
+                config.can_channel, config.can_id, _PARAM_ENCODER_FLUX_OFFSET, 3.0)
+            if fo_result is None:
+                self._log(
+                    "flux_offset SDO read timed out on first attempt — waiting 1 s and retrying...")
+                await asyncio.sleep(1.0)
+                fo_result = await loop.run_in_executor(
+                    None, dc.generic_sdo_read,
+                    config.can_channel, config.can_id, _PARAM_ENCODER_FLUX_OFFSET, 5.0)
             if fo_result is None:
                 raise FlashError(
                     f"Calibration completed but flux_offset SDO read timed out "

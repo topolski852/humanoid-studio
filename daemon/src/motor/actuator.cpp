@@ -418,11 +418,13 @@ bool Actuator::apply_config(CanBusManager& bus, int timeout_ms) {
         {static_cast<uint16_t>(P::PARAM_ENCODER_FLUX_OFFSET),                       c.electrical_offset},
     };
 
+    bool ok = true;
+
     for (auto& e : f32) {
         if (!sdo_write_f32(bus, e.param, e.val, timeout_ms)) {
             fprintf(stderr, "[Actuator] apply_config: f32 SDO write 0x%03X failed for %s\n",
                     e.param, cfg_.name.c_str());
-            return false;
+            ok = false;
         }
     }
 
@@ -437,7 +439,7 @@ bool Actuator::apply_config(CanBusManager& bus, int timeout_ms) {
         if (!sdo_write_u32(bus, e.param, e.val, timeout_ms)) {
             fprintf(stderr, "[Actuator] apply_config: u32 SDO write 0x%03X failed for %s\n",
                     e.param, cfg_.name.c_str());
-            return false;
+            ok = false;
         }
     }
 
@@ -446,11 +448,12 @@ bool Actuator::apply_config(CanBusManager& bus, int timeout_ms) {
     if (!sdo_write_i32(bus, static_cast<uint16_t>(P::PARAM_MOTOR_PHASE_ORDER), phase_order, timeout_ms)) {
         fprintf(stderr, "[Actuator] apply_config: phase_order SDO write failed for %s\n",
                 cfg_.name.c_str());
-        return false;
+        ok = false;
     }
 
-    fprintf(stderr, "[Actuator] Config applied: %s (id=%d)\n", cfg_.name.c_str(), d);
-    return true;
+    if (ok)
+        fprintf(stderr, "[Actuator] Config applied: %s (id=%d)\n", cfg_.name.c_str(), d);
+    return ok;
 }
 
 // ── store_to_flash ───────────────────────────────────────────────────────────

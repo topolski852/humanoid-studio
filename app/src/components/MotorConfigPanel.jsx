@@ -11,8 +11,8 @@ const PARAMS = [
   { key: 'velocity_ki',             label: 'Velocity Ki',             unit: '',      group: 'Position Controller' },
   { key: 'torque_limit',            label: 'Torque Limit',            unit: 'Nm',    group: 'Position Controller' },
   { key: 'velocity_limit',          label: 'Velocity Limit',          unit: 'rad/s', group: 'Position Controller' },
-  { key: 'position_limit_lower',    label: 'Pos Limit Lower',         unit: 'rad',   group: 'Position Controller' },
-  { key: 'position_limit_upper',    label: 'Pos Limit Upper',         unit: 'rad',   group: 'Position Controller' },
+  { key: 'position_limit_min',      label: 'Pos Limit Lower',         unit: 'rad',   group: 'Position Controller' },
+  { key: 'position_limit_max',      label: 'Pos Limit Upper',         unit: 'rad',   group: 'Position Controller' },
   { key: 'position_offset',         label: 'Position Offset',         unit: 'rad',   group: 'Position Controller' },
   { key: 'torque_filter_alpha',     label: 'Torque Filter α',         unit: '',      group: 'Position Controller' },
   // Current Controller
@@ -45,7 +45,7 @@ const GROUPS = ['Position Controller', 'Current Controller', 'Powerstage', 'Moto
 const PID_KEYS    = ['position_kp', 'position_ki', 'velocity_kp', 'velocity_ki', 'current_kp', 'current_ki', 'current_limit']
 const CAL_KEYS    = ['electrical_offset', 'encoder_position_offset', 'position_offset']
 const DESIGN_KEYS = ['gear_ratio', 'position_kp', 'position_ki', 'velocity_kp', 'velocity_ki',
-                     'torque_limit', 'velocity_limit', 'position_limit_lower', 'position_limit_upper',
+                     'torque_limit', 'velocity_limit', 'position_limit_min', 'position_limit_max',
                      'torque_filter_alpha', 'current_limit', 'current_kp', 'current_ki',
                      'fast_frame_frequency', 'watchdog_timeout']
 

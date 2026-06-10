@@ -259,15 +259,28 @@ async def bring_interface_up(name: str) -> dict | JSONResponse:
 
     await _run(['/sbin/ip', 'link', 'set', name, 'down'])
 
-    rc, err = await _run(['/sbin/ip', 'link', 'set', name, 'type', 'can', 'bitrate', '1000000'])
+    # Try with restart-ms 100 first; some adapters (e.g. gs_usb/CANable) don't
+    # support hardware bus-off restart and will reject the parameter.
+    rc, err = await _run(['/sbin/ip', 'link', 'set', name, 'type', 'can',
+                          'bitrate', '1000000', 'restart-ms', '100'])
+    restart_ms = 100
     if rc != 0:
-        return _err(err or "ip link set type can failed", status=500)
+        rc, err = await _run(['/sbin/ip', 'link', 'set', name, 'type', 'can',
+                               'bitrate', '1000000'])
+        restart_ms = 0
+        if rc != 0:
+            return _err(err or "ip link set type can failed", status=500)
+
+    rc, err = await _run(['/sbin/ip', 'link', 'set', name, 'txqueuelen', '1000'])
+    if rc != 0:
+        return _err(err or "ip link set txqueuelen failed", status=500)
 
     rc, err = await _run(['/sbin/ip', 'link', 'set', name, 'up'])
     if rc != 0:
         return _err(err or "ip link set up failed", status=500)
 
-    return _ok({"interface": name, "state": "UP", "bitrate": 1_000_000})
+    return _ok({"interface": name, "state": "UP", "bitrate": 1_000_000,
+                "restart_ms": restart_ms, "txqueuelen": 1000})
 
 
 # ---------------------------------------------------------------------------

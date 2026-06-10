@@ -329,16 +329,23 @@ std::string Robot::handle_command(const std::string& request) {
         // joint when only a subset of buses are physically connected.  A partial
         // robot (e.g. only left_leg attached) can now apply_config successfully
         // without blocking for up to N_offline × 500 ms seconds.
+        int configured = 0, skipped = 0, failed = 0;
         for (auto& a : actuators_) {
             if (!bus_mgr_->is_open(a->can_channel())) {
                 fprintf(stderr, "[Robot] APPLY_ALL_CONFIGS: skipping %s (bus %s not open)\n",
                         a->name().c_str(), a->can_channel().c_str());
+                ++skipped;
                 continue;
             }
-            if (!a->apply_config(*bus_mgr_))
+            if (a->apply_config(*bus_mgr_)) {
+                ++configured;
+            } else {
                 fprintf(stderr, "[Robot] apply_config failed for %s\n", a->name().c_str());
+                ++failed;
+            }
         }
-        return ack();
+        return json{{"type","ACK"},{"id",id},
+                    {"configured",configured},{"skipped",skipped},{"failed",failed}}.dump();
     }
 
     if (type == "STORE_TO_FLASH") {
@@ -354,6 +361,10 @@ std::string Robot::handle_command(const std::string& request) {
         auto it = actuator_by_name_.find(name);
         if (it == actuator_by_name_.end()) return error("unknown joint: " + name);
 
+        if (!bus_mgr_->is_open(it->second->can_channel()))
+            return error("bus not open for joint " + name +
+                         " (channel: " + it->second->can_channel() + ")");
+
         using P = ParamId;
         static const std::vector<std::pair<std::string, uint16_t>> PARAMS = {
             {"gear_ratio",               static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_GEAR_RATIO)},
@@ -363,8 +374,8 @@ std::string Robot::handle_command(const std::string& request) {
             {"velocity_ki",              static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_KI)},
             {"torque_limit",             static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_LIMIT)},
             {"velocity_limit",           static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_LIMIT)},
-            {"position_limit_lower",     static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_LOWER)},
-            {"position_limit_upper",     static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_UPPER)},
+            {"position_limit_min",       static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_LOWER)},
+            {"position_limit_max",       static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_UPPER)},
             {"position_offset",          static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_OFFSET)},
             {"torque_filter_alpha",      static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_FILTER_ALPHA)},
             {"current_limit",            static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_LIMIT)},
