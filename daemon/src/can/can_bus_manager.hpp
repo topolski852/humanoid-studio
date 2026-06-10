@@ -23,10 +23,11 @@ public:
     // Send a frame on the named interface. No-op (with log) if bus is not open.
     void send(const std::string& ifname, const can_frame& frame);
 
-    // Drain every pending Rx frame across all open buses.
+    // Drain pending Rx frames across all open buses (up to max_frames total per call).
     // Calls on_frame(ifname, frame) for each frame received.
-    // Designed to be called once per control-loop tick.
-    void drain_all(const std::function<void(const std::string&, const can_frame&)>& on_frame);
+    // Capped to prevent control-loop overruns when a large backlog accumulates.
+    void drain_all(const std::function<void(const std::string&, const can_frame&)>& on_frame,
+                   int max_frames = 64);
 
     bool is_open(const std::string& ifname) const;
 

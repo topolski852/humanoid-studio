@@ -112,6 +112,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ config }),
     }),
+  writeMotorGains: (jointName, position_kp, position_ki, torque_limit) =>
+    request(`/motors/${encodeURIComponent(jointName)}/write_gains`, {
+      method: 'POST',
+      body: JSON.stringify({ position_kp, position_ki, torque_limit }),
+    }),
   storeMotorToFlash: (jointName) =>
     request(`/motors/${encodeURIComponent(jointName)}/store_to_flash`, { method: 'POST' }),
   runStepTest: (jointName, params) =>

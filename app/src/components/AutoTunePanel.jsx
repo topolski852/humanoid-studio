@@ -237,11 +237,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
 
   async function applyGains() {
     try {
-      await api.applyMotorConfig(jointName, {
-        position_kp:  testKp,
-        position_ki:  testKi,
-        torque_limit: testTorqueLimit,
-      })
+      await api.writeMotorGains(jointName, testKp, testKi, testTorqueLimit)
     } catch (e) {
       const msg = `Apply gains failed: ${e.message}`
       setRunError(msg)
@@ -260,11 +256,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
   async function applySuggestion(s) {
     setApplyingSuggestion(true)
     try {
-      await api.applyMotorConfig(jointName, {
-        position_kp:  s.kp,
-        position_ki:  s.ki,
-        torque_limit: s.torqueLimit,
-      })
+      await api.writeMotorGains(jointName, s.kp, s.ki, s.torqueLimit)
     } catch (e) {
       const msg = `Apply suggestion failed: ${e.message}`
       setRunError(msg)

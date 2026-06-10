@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 
 enum class JointState {
@@ -82,8 +83,15 @@ public:
     void update_cfg(const nlohmann::json& j);
 
     // --- Blocking SDO write sequence (startup only, not called during real-time loop) ---
-    // Returns false if any write fails or times out.
+    // Returns false on first timeout (fail-fast). Only writes params that changed since
+    // the last successful apply_config (delta writes). Clears last_applied_config_ on
+    // OFFLINE→IDLE so a motor power-cycle forces a full rewrite on next connect.
     bool apply_config(CanBusManager& bus, int timeout_ms = 500);
+
+    // Write only the three tuning gains to device RAM.  ~15 ms vs ~135 ms for full
+    // apply_config.  Does not update cfg_ — gains survive until motor power-cycles.
+    bool write_gains(CanBusManager& bus, float kp, float ki, float torque_limit,
+                     int timeout_ms = 500);
 
     // Send FUNC_FLASH store command; blocks ~150 ms for flash write to complete.
     void store_to_flash(CanBusManager& bus);
@@ -113,6 +121,16 @@ private:
 
     std::chrono::steady_clock::time_point last_heartbeat_sent_{};
     std::chrono::steady_clock::time_point last_pdo4_received_{};
+
+    // Set when a motor first transitions OFFLINE → IDLE (first PDO4/heartbeat received).
+    // Cleared on the next tick() by sending NMT IDLE, waking firmware from boot-time
+    // MODE_DISABLED so SDO reads (voltage/current/torque) start responding.
+    bool needs_idle_wakeup_ = false;
+
+    // Snapshot of the last fully-applied config.  Used by apply_config() to skip
+    // params that haven't changed (delta writes).  Reset to nullopt on OFFLINE→IDLE
+    // so a motor power-cycle always gets a full rewrite on the next connect.
+    std::optional<JointConfig> last_applied_config_;
 
     // Slow-poll counter for periodic SDO telemetry reads (bus_voltage, current, torque).
     uint32_t slow_poll_counter_ = 0;

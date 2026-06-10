@@ -18,6 +18,7 @@ Robot::Robot(RobotConfig cfg, RobotOptions opts)
     : cfg_(std::move(cfg))
     , opts_(opts)
     , udp_server_(opts_.cmd_port)
+    , priority_server_(9002)
     , broadcaster_("127.0.0.1", opts_.telemetry_port)
 {}
 
@@ -53,6 +54,24 @@ bool Robot::start() {
     if (!udp_server_.start()) {
         fprintf(stderr, "[Robot] UDP server failed to start\n");
         return false;
+    }
+
+    // Wire priority E-Stop server (port 9002).
+    // Handles only ESTOP — never blocked by apply_config on port 9001.
+    priority_server_.set_handler([this](const std::string& req) -> std::string {
+        try {
+            auto j = json::parse(req);
+            if (j.value("type", "") == "ESTOP") {
+                estop_pending_.store(true, std::memory_order_release);
+                return R"({"type":"ACK"})";
+            }
+        } catch (...) {}
+        return R"({"type":"ERROR","msg":"priority port: ESTOP only"})";
+    });
+
+    if (!priority_server_.start()) {
+        fprintf(stderr, "[Robot] Priority E-Stop server failed to start on port 9002\n");
+        // Non-fatal — normal E-Stop via port 9001 still works.
     }
 
     running_ = true;
@@ -111,6 +130,7 @@ void Robot::stop() {
     std::this_thread::sleep_for(ms(200));
 
     udp_server_.stop();
+    priority_server_.stop();
     if (telemetry_thread_.joinable()) telemetry_thread_.join();
 
     fprintf(stderr, "[Robot] stopped\n");
@@ -119,6 +139,21 @@ void Robot::stop() {
 // ── Control tick (200 Hz) ────────────────────────────────────────────────────
 
 void Robot::control_tick() {
+    // 0. Instant E-Stop: checked before anything else in the tick.
+    if (estop_pending_.load(std::memory_order_acquire)) {
+        estop_pending_.store(false, std::memory_order_release);
+        for (auto& a : actuators_) {
+            can_frame nmt{};
+            nmt.can_id  = make_arb_id(static_cast<uint8_t>(FuncCode::FUNC_NMT),
+                                      static_cast<uint8_t>(a->device_id()));
+            nmt.can_dlc = 2;
+            nmt.data[0] = static_cast<uint8_t>(MotorMode::MODE_IDLE);
+            nmt.data[1] = static_cast<uint8_t>(a->device_id());
+            bus_mgr_->send(a->can_channel(), nmt);
+            a->request_state(JointState::IDLE);
+        }
+    }
+
     // 1. Drain all pending Rx frames and dispatch to actuators + generic listeners.
     bus_mgr_->drain_all([this](const std::string& ifname, const can_frame& frame) {
         uint32_t arb = frame.can_id & CAN_EFF_MASK;
@@ -732,6 +767,17 @@ std::string Robot::handle_command(const std::string& request) {
         if (it == actuator_by_name_.end()) return error("unknown joint: " + name);
         it->second->set_slow_poll_enabled(true);
         return ack();
+    }
+
+    if (type == "WRITE_GAINS") {
+        std::string name = req.value("joint_name", "");
+        auto it = actuator_by_name_.find(name);
+        if (it == actuator_by_name_.end()) return error("unknown joint: " + name);
+        float kp           = req.value("position_kp",  0.0f);
+        float ki           = req.value("position_ki",  0.0f);
+        float torque_limit = req.value("torque_limit", 0.0f);
+        bool ok = it->second->write_gains(*bus_mgr_, kp, ki, torque_limit);
+        return ok ? ack() : error("write_gains failed for " + name);
     }
 
     return error("unknown command type: " + type);

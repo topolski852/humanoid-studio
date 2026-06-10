@@ -1,5 +1,6 @@
 #include "motor/actuator.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <thread>
@@ -52,8 +53,11 @@ void Actuator::on_rx_frame(const can_frame& frame) {
         last_pdo4_received_ = Clock::now();
 
         // Seeing PDO4 means the device is alive — advance from OFFLINE.
-        if (state_.joint_state == JointState::OFFLINE)
+        if (state_.joint_state == JointState::OFFLINE) {
             state_.joint_state = JointState::IDLE;
+            needs_idle_wakeup_  = true;
+            last_applied_config_ = std::nullopt;  // force full rewrite after power-cycle
+        }
 
     } else if (func == static_cast<int>(FuncCode::FUNC_HEARTBEAT)) {  // NOLINT
         // 5-byte reply: mode(u8) + error(u32 LE) — new firmware.
@@ -69,8 +73,11 @@ void Actuator::on_rx_frame(const can_frame& frame) {
         state_.updated_at = Clock::now();
 
         // Device is alive.
-        if (state_.joint_state == JointState::OFFLINE)
+        if (state_.joint_state == JointState::OFFLINE) {
             state_.joint_state = JointState::IDLE;
+            needs_idle_wakeup_   = true;
+            last_applied_config_ = std::nullopt;  // force full rewrite after power-cycle
+        }
 
         // Calibration complete when firmware returns to IDLE.
         if (state_.joint_state == JointState::CALIBRATING &&
@@ -171,6 +178,21 @@ void Actuator::send_pdo2(CanBusManager& bus, float display_pos, float vel_ff) {
 }
 
 void Actuator::tick(CanBusManager& bus) {
+    // On first detection, send NMT IDLE to wake firmware from boot-time MODE_DISABLED.
+    // DISABLED firmware won't respond to SDO reads, so voltage/current/torque stay zero
+    // until this runs.  Safe if already IDLE: firmware treats it as a no-op.
+    if (needs_idle_wakeup_) {
+        needs_idle_wakeup_ = false;
+        can_frame wake{};
+        wake.can_id  = make_arb_id(
+            static_cast<uint8_t>(FuncCode::FUNC_NMT),
+            static_cast<uint8_t>(cfg_.device_id));
+        wake.can_dlc = 2;
+        wake.data[0] = static_cast<uint8_t>(MotorMode::MODE_IDLE);
+        wake.data[1] = static_cast<uint8_t>(cfg_.device_id);
+        bus.send(cfg_.can_channel, wake);
+    }
+
     // Apply any pending state change request from the UDP command queue.
     JointState current_state;
     {
@@ -193,6 +215,18 @@ void Actuator::tick(CanBusManager& bus) {
 
             bool send_nmt = false;
             if (target == JointState::ENABLED && current_state == JointState::IDLE) {
+                // Pre-send NMT IDLE — firmware may still be in DISABLED at this point
+                // (e.g. needs_idle_wakeup_ fired but heartbeat hasn't confirmed IDLE yet).
+                // Firmware rejects DISABLED→POSITION; IDLE→POSITION always succeeds.
+                can_frame pre_idle{};
+                pre_idle.can_id  = make_arb_id(
+                    static_cast<uint8_t>(FuncCode::FUNC_NMT),
+                    static_cast<uint8_t>(cfg_.device_id));
+                pre_idle.can_dlc = 2;
+                pre_idle.data[0] = static_cast<uint8_t>(MotorMode::MODE_IDLE);
+                pre_idle.data[1] = static_cast<uint8_t>(cfg_.device_id);
+                bus.send(cfg_.can_channel, pre_idle);
+
                 nmt.data[0] = static_cast<uint8_t>(MotorMode::MODE_POSITION);
                 nmt.data[1] = static_cast<uint8_t>(cfg_.device_id);
                 send_nmt = true;
@@ -390,70 +424,100 @@ void Actuator::update_cfg(const nlohmann::json& j) {
 bool Actuator::apply_config(CanBusManager& bus, int timeout_ms) {
     using P = ParamId;
     const JointConfig& c = cfg_;
-    int d = c.device_id;
+    const JointConfig* prev = last_applied_config_.has_value() ? &(*last_applied_config_) : nullptr;
 
-    struct F32Entry { uint16_t param; float val; };
+    struct F32Entry { uint16_t param; float val; const float* prev_val; };
     const F32Entry f32[] = {
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_GEAR_RATIO),            c.gear_ratio},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_KP),           c.position_kp},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_KI),           c.position_ki},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_KP),           c.velocity_kp},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_KI),           c.velocity_ki},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_LIMIT),          c.torque_limit},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_LIMIT),        c.velocity_limit},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_LOWER),  c.position_limit_min},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_UPPER),  c.position_limit_max},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_OFFSET),       c.position_offset},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_FILTER_ALPHA),   c.torque_filter_alpha},
-        {static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_LIMIT),                c.current_limit},
-        {static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_KP),                   c.current_kp},
-        {static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_KI),                   c.current_ki},
-        {static_cast<uint16_t>(P::PARAM_POWERSTAGE_UNDERVOLTAGE_THRESHOLD),         c.undervoltage_threshold},
-        {static_cast<uint16_t>(P::PARAM_POWERSTAGE_OVERVOLTAGE_THRESHOLD),          c.overvoltage_threshold},
-        {static_cast<uint16_t>(P::PARAM_POWERSTAGE_BUS_VOLTAGE_FILTER_ALPHA),       c.bus_voltage_filter_alpha},
-        {static_cast<uint16_t>(P::PARAM_MOTOR_TORQUE_CONSTANT),                     c.torque_constant},
-        {static_cast<uint16_t>(P::PARAM_MOTOR_MAX_CALIBRATION_CURRENT),             c.max_calibration_current},
-        {static_cast<uint16_t>(P::PARAM_ENCODER_POSITION_OFFSET),                   c.encoder_position_offset},
-        {static_cast<uint16_t>(P::PARAM_ENCODER_VELOCITY_FILTER_ALPHA),             c.velocity_filter_alpha},
-        {static_cast<uint16_t>(P::PARAM_ENCODER_FLUX_OFFSET),                       c.electrical_offset},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_GEAR_RATIO),            c.gear_ratio,               prev ? &prev->gear_ratio               : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_KP),           c.position_kp,              prev ? &prev->position_kp              : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_KI),           c.position_ki,              prev ? &prev->position_ki              : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_KP),           c.velocity_kp,              prev ? &prev->velocity_kp              : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_KI),           c.velocity_ki,              prev ? &prev->velocity_ki              : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_LIMIT),          c.torque_limit,             prev ? &prev->torque_limit             : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_LIMIT),        c.velocity_limit,           prev ? &prev->velocity_limit           : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_LOWER),  c.position_limit_min,       prev ? &prev->position_limit_min       : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_UPPER),  c.position_limit_max,       prev ? &prev->position_limit_max       : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_OFFSET),       c.position_offset,          prev ? &prev->position_offset          : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_FILTER_ALPHA),   c.torque_filter_alpha,      prev ? &prev->torque_filter_alpha      : nullptr},
+        {static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_LIMIT),                c.current_limit,            prev ? &prev->current_limit            : nullptr},
+        {static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_KP),                   c.current_kp,               prev ? &prev->current_kp               : nullptr},
+        {static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_KI),                   c.current_ki,               prev ? &prev->current_ki               : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POWERSTAGE_UNDERVOLTAGE_THRESHOLD),         c.undervoltage_threshold,   prev ? &prev->undervoltage_threshold   : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POWERSTAGE_OVERVOLTAGE_THRESHOLD),          c.overvoltage_threshold,    prev ? &prev->overvoltage_threshold    : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POWERSTAGE_BUS_VOLTAGE_FILTER_ALPHA),       c.bus_voltage_filter_alpha, prev ? &prev->bus_voltage_filter_alpha : nullptr},
+        {static_cast<uint16_t>(P::PARAM_MOTOR_TORQUE_CONSTANT),                     c.torque_constant,          prev ? &prev->torque_constant          : nullptr},
+        {static_cast<uint16_t>(P::PARAM_MOTOR_MAX_CALIBRATION_CURRENT),             c.max_calibration_current,  prev ? &prev->max_calibration_current  : nullptr},
+        {static_cast<uint16_t>(P::PARAM_ENCODER_POSITION_OFFSET),                   c.encoder_position_offset,  prev ? &prev->encoder_position_offset  : nullptr},
+        {static_cast<uint16_t>(P::PARAM_ENCODER_VELOCITY_FILTER_ALPHA),             c.velocity_filter_alpha,    prev ? &prev->velocity_filter_alpha    : nullptr},
+        {static_cast<uint16_t>(P::PARAM_ENCODER_FLUX_OFFSET),                       c.electrical_offset,        prev ? &prev->electrical_offset        : nullptr},
     };
 
-    bool ok = true;
-
     for (auto& e : f32) {
+        if (e.prev_val && fabsf(e.val - *e.prev_val) < 1e-6f) continue;
         if (!sdo_write_f32(bus, e.param, e.val, timeout_ms)) {
             fprintf(stderr, "[Actuator] apply_config: f32 SDO write 0x%03X failed for %s\n",
                     e.param, cfg_.name.c_str());
-            ok = false;
+            return false;
         }
     }
 
-    struct U32Entry { uint16_t param; uint32_t val; };
+    struct U32Entry { uint16_t param; uint32_t val; uint32_t prev_val; bool has_prev; };
     const U32Entry u32[] = {
-        {static_cast<uint16_t>(P::PARAM_FAST_FRAME_FREQUENCY), static_cast<uint32_t>(c.fast_frame_frequency)},
-        {static_cast<uint16_t>(P::PARAM_WATCHDOG_TIMEOUT),     static_cast<uint32_t>(c.watchdog_timeout_ms)},
-        {static_cast<uint16_t>(P::PARAM_MOTOR_POLE_PAIRS),     static_cast<uint32_t>(c.pole_pairs)},
-        {static_cast<uint16_t>(P::PARAM_ENCODER_CPR),          static_cast<uint32_t>(c.cpr)},
+        {static_cast<uint16_t>(P::PARAM_FAST_FRAME_FREQUENCY), static_cast<uint32_t>(c.fast_frame_frequency),
+            prev ? static_cast<uint32_t>(prev->fast_frame_frequency) : 0u, prev != nullptr},
+        {static_cast<uint16_t>(P::PARAM_WATCHDOG_TIMEOUT),     static_cast<uint32_t>(c.watchdog_timeout_ms),
+            prev ? static_cast<uint32_t>(prev->watchdog_timeout_ms)  : 0u, prev != nullptr},
+        {static_cast<uint16_t>(P::PARAM_MOTOR_POLE_PAIRS),     static_cast<uint32_t>(c.pole_pairs),
+            prev ? static_cast<uint32_t>(prev->pole_pairs)           : 0u, prev != nullptr},
+        {static_cast<uint16_t>(P::PARAM_ENCODER_CPR),          static_cast<uint32_t>(c.cpr),
+            prev ? static_cast<uint32_t>(prev->cpr)                  : 0u, prev != nullptr},
     };
     for (auto& e : u32) {
+        if (e.has_prev && e.val == e.prev_val) continue;
         if (!sdo_write_u32(bus, e.param, e.val, timeout_ms)) {
             fprintf(stderr, "[Actuator] apply_config: u32 SDO write 0x%03X failed for %s\n",
                     e.param, cfg_.name.c_str());
-            ok = false;
+            return false;
         }
     }
 
     // phase_order: -1 if phase_inverted, else +1
     int32_t phase_order = c.phase_inverted ? -1 : 1;
-    if (!sdo_write_i32(bus, static_cast<uint16_t>(P::PARAM_MOTOR_PHASE_ORDER), phase_order, timeout_ms)) {
-        fprintf(stderr, "[Actuator] apply_config: phase_order SDO write failed for %s\n",
-                cfg_.name.c_str());
-        ok = false;
+    bool phase_unchanged = prev && (c.phase_inverted == prev->phase_inverted);
+    if (!phase_unchanged) {
+        if (!sdo_write_i32(bus, static_cast<uint16_t>(P::PARAM_MOTOR_PHASE_ORDER), phase_order, timeout_ms)) {
+            fprintf(stderr, "[Actuator] apply_config: phase_order SDO write failed for %s\n",
+                    cfg_.name.c_str());
+            return false;
+        }
     }
 
-    if (ok)
-        fprintf(stderr, "[Actuator] Config applied: %s (id=%d)\n", cfg_.name.c_str(), d);
-    return ok;
+    last_applied_config_ = cfg_;
+    fprintf(stderr, "[Actuator] Config applied: %s (id=%d)\n", cfg_.name.c_str(), c.device_id);
+    return true;
+}
+
+// ── write_gains ──────────────────────────────────────────────────────────────
+
+bool Actuator::write_gains(CanBusManager& bus, float kp, float ki, float torque_limit,
+                           int timeout_ms) {
+    using P = ParamId;
+    if (!sdo_write_f32(bus, static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_KP),
+                       kp, timeout_ms)) {
+        fprintf(stderr, "[Actuator] write_gains: Kp write failed for %s\n", cfg_.name.c_str());
+        return false;
+    }
+    if (!sdo_write_f32(bus, static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_KI),
+                       ki, timeout_ms)) {
+        fprintf(stderr, "[Actuator] write_gains: Ki write failed for %s\n", cfg_.name.c_str());
+        return false;
+    }
+    if (!sdo_write_f32(bus, static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_LIMIT),
+                       torque_limit, timeout_ms)) {
+        fprintf(stderr, "[Actuator] write_gains: torque_limit write failed for %s\n", cfg_.name.c_str());
+        return false;
+    }
+    return true;
 }
 
 // ── store_to_flash ───────────────────────────────────────────────────────────

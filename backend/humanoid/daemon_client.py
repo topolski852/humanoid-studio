@@ -184,9 +184,16 @@ class DaemonActuatorProxy:
         await loop.run_in_executor(None, self._client.set_mode, self._name, "IDLE")
 
     async def estop(self) -> None:
-        """Emergency stop — daemon maps DISABLED to IDLE (motor stops, firmware stays alive)."""
+        """Emergency stop — sends ESTOP to the priority port (9002), bypassing apply_config."""
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._client.set_mode, self._name, "DISABLED")
+        await loop.run_in_executor(None, self._client.estop_all)
+
+    async def write_gains(self, kp: float, ki: float, torque_limit: float) -> None:
+        """Write only Kp, Ki, torque_limit (~3 SDOs, ~15 ms) instead of full apply_config."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, self._client.write_gains, self._name, kp, ki, torque_limit
+        )
 
     async def clear_error(self) -> None:
         loop = asyncio.get_running_loop()
@@ -358,6 +365,11 @@ class DaemonClient:
         self._cmd_sock: socket.socket | None = None
         self._cmd_lock = threading.Lock()
 
+        # Priority E-Stop socket — separate from _cmd_sock so it is never blocked
+        # by an in-progress apply_config holding _cmd_lock on port 9001.
+        self._estop_sock: socket.socket | None = None
+        self._estop_lock = threading.Lock()
+
         # Telemetry receive thread
         self._tel_sock: socket.socket | None = None
         self._tel_thread: threading.Thread | None = None
@@ -398,6 +410,10 @@ class DaemonClient:
         self._cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._cmd_sock.settimeout(self._cmd_timeout)
 
+        # Priority E-Stop socket — sends to port 9002, short timeout (250 ms)
+        self._estop_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._estop_sock.settimeout(0.25)
+
         # Telemetry listen socket on port 9000
         self._tel_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._tel_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -419,7 +435,7 @@ class DaemonClient:
         self._stop_event.set()
         if self._tel_thread and self._tel_thread.is_alive():
             self._tel_thread.join(timeout=3.0)
-        for sock in (self._cmd_sock, self._tel_sock):
+        for sock in (self._cmd_sock, self._tel_sock, self._estop_sock):
             if sock is not None:
                 try:
                     sock.close()
@@ -427,6 +443,7 @@ class DaemonClient:
                     pass
         self._cmd_sock = None
         self._tel_sock = None
+        self._estop_sock = None
         _log.info("DaemonClient stopped")
 
     # ------------------------------------------------------------------ #
@@ -606,6 +623,42 @@ class DaemonClient:
             self._send_command({"type": "SHUTDOWN"})
         except DaemonError:
             pass  # daemon may already be gone
+
+    def estop_all(self) -> None:
+        """
+        Send ESTOP to the daemon's priority port (9002).
+        Never blocked by an in-progress apply_config on port 9001.
+        Fire-and-forget with a 250 ms ACK wait; does not raise on timeout
+        so the UI E-Stop button always completes immediately.
+        """
+        if self._estop_sock is None:
+            _log.warning("estop_all: socket not open, falling back to set_all_mode IDLE")
+            try:
+                self.set_all_mode("IDLE")
+            except DaemonError:
+                pass
+            return
+        payload = json.dumps({"type": "ESTOP", "id": str(uuid.uuid4())}).encode()
+        with self._estop_lock:
+            try:
+                self._estop_sock.sendto(payload, (self._daemon_host, 9002))
+                try:
+                    self._estop_sock.recv(1024)   # consume ACK; ignore content
+                except socket.timeout:
+                    pass  # no ACK is fine — the flag was still set atomically
+            except OSError as exc:
+                _log.warning("estop_all: send error: %s", exc)
+
+    def write_gains(self, joint_name: str, kp: float, ki: float, torque_limit: float,
+                    timeout: float = 3.0) -> None:
+        """Write only position_kp, position_ki, torque_limit (~3 SDOs, ~15 ms)."""
+        self._send_command({
+            "type":         "WRITE_GAINS",
+            "joint_name":   joint_name,
+            "position_kp":  float(kp),
+            "position_ki":  float(ki),
+            "torque_limit": float(torque_limit),
+        }, timeout=timeout)
 
     def disable_slow_poll(self, joint_name: str) -> None:
         """Stop slow-poll SDO telemetry reads for a joint.

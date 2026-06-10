@@ -263,6 +263,34 @@ async def apply_motor_config(
         return _err(str(exc))
 
 
+class WriteGainsBody(BaseModel):
+    position_kp: float
+    position_ki: float
+    torque_limit: float
+
+
+@router.post("/motors/{joint_name}/write_gains", response_model=None)
+async def write_motor_gains(
+    joint_name: str, body: WriteGainsBody, request: Request
+) -> dict | JSONResponse:
+    """
+    Write only position_kp, position_ki, torque_limit to device RAM (~3 SDOs, ~15 ms).
+    Does not persist to flash or update the JSON config file.
+    Use apply_config for a full commit.
+    """
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    cached_state = actuator.get_cached_state()
+    if cached_state is None:
+        return _err("Motor is OFFLINE — cannot write gains.", status=409)
+    try:
+        await actuator.write_gains(body.position_kp, body.position_ki, body.torque_limit)
+        return _ok({"applied": True})
+    except DaemonError as exc:
+        return _err(str(exc))
+
+
 class PositionCalibrateBody(BaseModel):
     hardstop_lower_rad: float   # recorded state.position at lower hardstop
     limits_min: float           # desired lower limit in rad

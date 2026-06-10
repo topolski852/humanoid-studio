@@ -25,13 +25,16 @@ void CanBusManager::send(const std::string& ifname, const can_frame& frame) {
 }
 
 void CanBusManager::drain_all(
-    const std::function<void(const std::string&, const can_frame&)>& on_frame)
+    const std::function<void(const std::string&, const can_frame&)>& on_frame,
+    int max_frames)
 {
+    int count = 0;
     for (auto& [name, bus] : buses_) {
         if (!bus->is_open()) continue;
         can_frame frame;
-        while (bus->recv(frame)) {
+        while (count < max_frames && bus->recv(frame)) {
             on_frame(name, frame);
+            ++count;
         }
     }
 }

@@ -8,6 +8,7 @@
 //   - Control thread (200 Hz, SCHED_FIFO):  drain_all → tick all joints → snapshot telemetry
 //   - Telemetry thread (10–100 Hz, normal): read telemetry snapshot → broadcast JSON
 //   - UDP server thread (normal):           receive commands → enqueue to command_queue_
+//   - Priority thread (normal):             port 9002 — ESTOP only, never blocked by apply_config
 //   - Main thread:                          start / stop only
 
 #include "config/config_loader.hpp"
@@ -71,9 +72,11 @@ private:
 
     ControlLoop  control_loop_;
     UdpServer    udp_server_;
+    UdpServer    priority_server_;   // port 9002 — ESTOP only
     UdpBroadcaster broadcaster_;
 
-    std::atomic<bool> running_ = false;
+    std::atomic<bool> running_       = false;
+    std::atomic<bool> estop_pending_ = false;
 
     // Telemetry thread
     std::thread telemetry_thread_;
