@@ -230,15 +230,21 @@ void Actuator::tick(CanBusManager& bus) {
                 nmt.data[0] = static_cast<uint8_t>(MotorMode::MODE_POSITION);
                 nmt.data[1] = static_cast<uint8_t>(cfg_.device_id);
                 send_nmt = true;
-                // Send hold position immediately after NMT so firmware doesn't snap to 0.
                 float hold;
                 { std::lock_guard<std::mutex> slk(state_mutex_); hold = state_.position; }
-                // Seed position_target_ so all subsequent ticks hold this position
-                // until the first SET_POSITION command arrives.  Without this, the
-                // default 0.0 would be sent on tick +1 causing an immediate large error.
+                // Seed daemon-side position_target_ so all subsequent ticks send the
+                // correct hold position until the first SET_POSITION command arrives.
                 position_target_ = hold;
-                if (send_nmt) bus.send(cfg_.can_channel, nmt);
+                // Pre-seed the FIRMWARE's position_target before entering position mode.
+                // PositionController_setPositionTarget() is called unconditionally in the
+                // FUNC_RECEIVE_PDO_2 handler (no mode guard), so sending PDO2 while still
+                // in IDLE writes hold+offset into position_target.  When NMT POSITION then
+                // fires MotorController_reset(), the target is already correct and the very
+                // first control tick sees zero error.  Without this, position_target stays
+                // at its init value of 0.0 for 0–1 control cycles, causing a large torque
+                // spike on motors with a non-zero position_offset (e.g. left_hip_pitch).
                 send_pdo2(bus, hold);
+                if (send_nmt) bus.send(cfg_.can_channel, nmt);
                 { std::lock_guard<std::mutex> slk(state_mutex_); state_.joint_state = JointState::ENABLED; }
                 return;
             } else if (target == JointState::IDLE) {
