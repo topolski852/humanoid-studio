@@ -132,9 +132,9 @@ def _compute_metrics(
         target   = step_samples[0]["commanded"]
         going_up = (step_idx % 2 == 0)   # step_idx 0 → pos_b (up); 1 → pos_a (down)
         t0_ms    = step_samples[0]["t_ms"]
-        settled  = False
+        last_outside_idx = None
 
-        for s in step_samples:
+        for i, s in enumerate(step_samples):
             pos = s.get("position")
             if pos is None:
                 continue
@@ -143,10 +143,9 @@ def _compute_metrics(
             overshoot = max(0.0, pos - target) if going_up else max(0.0, target - pos)
             max_overshoot_rad = max(max_overshoot_rad, overshoot)
 
-            # First sample within the settling band.
-            if not settled and abs(pos - target) <= threshold:
-                settling_times.append(float(s["t_ms"] - t0_ms))
-                settled = True
+            # Track last sample outside the settling band (for accurate settling time).
+            if abs(pos - target) > threshold:
+                last_outside_idx = i
 
             torque = s.get("torque")
             if torque is not None:
@@ -159,6 +158,14 @@ def _compute_metrics(
             if current is not None:
                 max_current_a = max(max_current_a, abs(current))
 
+        # Settling time = time after which the motor stays continuously in the ±2% band.
+        # Using the last-exit-from-band approach avoids falsely short times for oscillatory responses.
+        if last_outside_idx is None:
+            settling_times.append(0.0)
+        elif last_outside_idx < len(step_samples) - 1:
+            settling_times.append(float(step_samples[last_outside_idx + 1]["t_ms"] - t0_ms))
+        # else: still outside band at last sample — never settled; omit from settling_times
+
         # Steady-state error: mean over the last 20% of dwell samples.
         n_tail     = max(1, len(step_samples) // 5)
         valid_tail = [s for s in step_samples[-n_tail:] if s.get("position") is not None]
@@ -169,7 +176,7 @@ def _compute_metrics(
 
     return {
         "max_overshoot_rad": round(max_overshoot_rad, 4),
-        "max_overshoot_pct": round(max_overshoot_rad / offset_rad * 100, 1) if offset_rad > 0 else 0.0,
+        "max_overshoot_pct": round(max_overshoot_rad / (2 * offset_rad) * 100, 1) if offset_rad > 0 else 0.0,
         "settling_time_ms":  round(sum(settling_times) / len(settling_times)) if settling_times else None,
         "steady_state_error_rad": round(sum(ss_errors) / len(ss_errors), 4) if ss_errors else None,
         "max_torque_nm":    round(max_torque_nm, 3),

@@ -68,8 +68,8 @@ function computeSuggestion(metrics, params) {
     newTorqueLimit = round1(max_torque_nm * 1.5)
     quality        = 'poor'
   } else if (overshoot > 20) {
-    rationale.push(`High overshoot (${overshoot.toFixed(1)}%) — reduce Kp significantly`)
-    newKp    = round1(kp * 0.65)
+    rationale.push(`High overshoot (${overshoot.toFixed(1)}%) — reduce Kp`)
+    newKp    = round1(kp * 0.70)
     quality  = 'poor'
   } else if (overshoot > 10) {
     rationale.push(`Overshoot ${overshoot.toFixed(1)}% — reduce Kp moderately`)
@@ -84,8 +84,8 @@ function computeSuggestion(metrics, params) {
       rationale.push(`Overshoot ${overshoot.toFixed(1)}%, settling ${settling} ms — response is good`)
       quality = 'good'
     } else if (settling != null && settling > 1000) {
-      rationale.push(`Low overshoot but slow settling (${settling} ms) — can increase Kp`)
-      newKp   = round1(kp * 1.15)
+      rationale.push(`Low overshoot but slow settling (${settling} ms) — can increase Kp slightly`)
+      newKp   = round1(kp * 1.10)
       quality = 'marginal'
     } else {
       rationale.push(`Overshoot ${overshoot.toFixed(1)}% — within target range`)
@@ -97,7 +97,7 @@ function computeSuggestion(metrics, params) {
       rationale.push(settling == null
         ? 'Never settled within 2% band — increase Kp'
         : `Low overshoot, slow settling (${settling} ms) — increase Kp`)
-      newKp   = round1(kp * 1.30)
+      newKp   = round1(kp * 1.20)
       quality = 'marginal'
     } else {
       rationale.push(`Low overshoot (${overshoot.toFixed(1)}%), fast settle — critically damped`)
@@ -105,17 +105,12 @@ function computeSuggestion(metrics, params) {
     }
   }
 
-  // ── Ki suggestion (independent; only when response readable) ─────────────
-  if (!torque_saturated && overshoot < 15 && sseRad != null) {
+  // Ki is held constant — integral wind-up risk is high without knowing firmware integrator limits.
+  // Tune Ki manually in the Tune tab after Kp is satisfactory.
+  if (sseRad != null) {
     const sseDeg = sseRad * R2D
-    if (sseDeg > 1.0) {
-      const suggestedKi = Math.max(0.05, round2(sseRad * kp / offset_rad * 0.3))
-      if (ki < suggestedKi * 0.5) {
-        rationale.push(`Steady-state error ${sseDeg.toFixed(1)}° — add small Ki`)
-        newKi = suggestedKi
-      }
-    } else if (sseDeg < 0.3 && ki > 0) {
-      rationale.push(`Steady-state error ${sseDeg.toFixed(1)}° — Ki may not be needed`)
+    if (sseDeg > 2.0 && ki === 0) {
+      rationale.push(`Steady-state error ${sseDeg.toFixed(1)}° — consider adding a small Ki in the Tune tab once Kp is set`)
     }
   }
 
@@ -530,6 +525,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
               suggestion={suggestion}
               tried={triedSuggestion}
               applying={applyingSuggestion}
+              canApply={isConnected}
               onTry={() => trySuggestion(suggestion)}
               onApply={() => applySuggestion(suggestion)}
             />
@@ -587,7 +583,7 @@ function MetricRow({ label, value, warn = false }) {
   )
 }
 
-function SuggestionCard({ suggestion, tried, applying, onTry, onApply }) {
+function SuggestionCard({ suggestion, tried, applying, canApply, onTry, onApply }) {
   const { kp, ki, torqueLimit, rationale, quality } = suggestion
 
   const borderCls = quality === 'good'     ? 'border-online/40'
@@ -647,7 +643,8 @@ function SuggestionCard({ suggestion, tried, applying, onTry, onApply }) {
         </button>
         <button
           onClick={onApply}
-          disabled={applying}
+          disabled={applying || !canApply}
+          title={!canApply ? 'Motor must be connected (not E-stopped) to apply gains' : undefined}
           className="flex-1 py-1.5 rounded-lg text-xs font-medium transition-colors
             bg-accent/20 text-accent border border-accent/30
             hover:bg-accent/30 disabled:opacity-40"
@@ -655,6 +652,11 @@ function SuggestionCard({ suggestion, tried, applying, onTry, onApply }) {
           {applying ? 'Applying…' : 'Apply to ESC'}
         </button>
       </div>
+      {!canApply && (
+        <p className="text-[9px] text-gray-600 text-center">
+          Motor must be connected (not E-stopped) to apply gains directly
+        </p>
+      )}
 
       {tried && (
         <p className="text-[9px] text-accent text-center">

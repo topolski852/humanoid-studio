@@ -239,6 +239,15 @@ async def apply_motor_config(
     actuator, error = _resolve_actuator(request, joint_name)
     if error:
         return error
+    # Refuse early if motor is offline — avoids a 20-second wait while 27 SDO
+    # writes all time out one-by-one against an unresponsive device.
+    cached_state = actuator.get_cached_state()
+    if cached_state is None:
+        return _err(
+            "Motor is OFFLINE — cannot apply config. "
+            "Enable the motor (or at least connect it) before applying gains.",
+            status=409,
+        )
     try:
         updated = actuator.config.model_copy(update=body.config)
         actuator.update_config(updated)

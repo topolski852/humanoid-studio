@@ -240,7 +240,7 @@ class DaemonActuatorProxy:
             "cpr":                      int(cfg.cpr),
             "phase_inverted":           bool(cfg.phase_inverted),
         }
-        await loop.run_in_executor(None, self._client.apply_config, self._name, config_dict)
+        await loop.run_in_executor(None, self._client.apply_config, self._name, config_dict, 20.0)
 
     async def feed_watchdog(self) -> None:
         """No-op — daemon feeds watchdogs from its 200 Hz control loop."""
@@ -478,19 +478,40 @@ class DaemonClient:
         Send a JSON command to the daemon and wait for a matching response.
         Thread-safe via _cmd_lock.  Raises on timeout or daemon error.
         Pass timeout to override the default _cmd_timeout for slow commands.
+
+        Verifies the response ID matches the request to discard stale responses
+        left in the socket buffer by previously timed-out commands.
         """
+        import time as _time
         if self._cmd_sock is None:
             raise DaemonNotRunningError("DaemonClient not started — call start() first")
 
         msg.setdefault("id", str(uuid.uuid4()))
+        msg_id  = msg["id"]
         payload = json.dumps(msg).encode()
 
         with self._cmd_lock:
             effective_timeout = timeout if timeout is not None else self._cmd_timeout
+            deadline = _time.monotonic() + effective_timeout
             try:
-                self._cmd_sock.settimeout(effective_timeout)
                 self._cmd_sock.sendto(payload, (self._daemon_host, self._cmd_port))
-                raw, _ = self._cmd_sock.recvfrom(65535)
+                # Loop until we get the response for THIS command (discards stale
+                # responses from previously timed-out commands that are still
+                # buffered in the socket).
+                while True:
+                    remaining = deadline - _time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout()
+                    self._cmd_sock.settimeout(remaining)
+                    raw, _ = self._cmd_sock.recvfrom(65535)
+                    try:
+                        resp = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue  # ignore malformed packets
+                    if resp.get("id") == msg_id:
+                        break
+                    _log.debug("Discarding stale response id=%s (expected %s type=%s)",
+                               resp.get("id"), msg_id, msg.get("type"))
             except socket.timeout:
                 raise DaemonNotRunningError(
                     f"Daemon did not respond within {effective_timeout}s "
@@ -500,11 +521,6 @@ class DaemonClient:
                 raise DaemonNotRunningError(f"Daemon socket error: {exc}") from exc
             finally:
                 self._cmd_sock.settimeout(self._cmd_timeout)
-
-        try:
-            resp = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise DaemonCommandError(f"Invalid JSON response: {raw!r}") from exc
 
         if resp.get("type") == "ERROR":
             raise DaemonCommandError(resp.get("msg", "unknown daemon error"))
@@ -549,11 +565,14 @@ class DaemonClient:
     def clear_error(self, joint_name: str) -> None:
         self._send_command({"type": "CLEAR_ERROR", "joint_name": joint_name})
 
-    def apply_config(self, joint_name: str, config: dict | None = None) -> None:
+    def apply_config(self, joint_name: str, config: dict | None = None,
+                     timeout: float = 20.0) -> None:
+        # 27 SDO writes × 500 ms timeout each = 13.5 s worst case (motor offline).
+        # Use 20 s to avoid the Python side timing out while the daemon is still writing.
         cmd: dict = {"type": "APPLY_CONFIG", "joint_name": joint_name}
         if config is not None:
             cmd["config"] = config
-        self._send_command(cmd)
+        self._send_command(cmd, timeout=timeout)
 
     def apply_all_configs(self) -> None:
         # Daemon applies config to every joint on every open CAN bus.
