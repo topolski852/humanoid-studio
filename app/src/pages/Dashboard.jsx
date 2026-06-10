@@ -1,21 +1,15 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useTelemetry } from '../context/TelemetryContext'
-import { busColor, busErrorLabel, radToDeg } from '../utils/canDisplay'
+import { busColor } from '../utils/canDisplay'
 import { api } from '../api'
 import MotorCard from '../components/MotorCard'
 import RobotDiagram from '../components/RobotDiagram'
-
-const KNOWN_BUSES = [
-  { name: 'can_left_leg',  label: 'Left Leg' },
-  { name: 'can_right_leg', label: 'Right Leg' },
-  { name: 'can_left_arm',  label: 'Left Arm' },
-  { name: 'can_right_arm', label: 'Right Arm' },
-]
+import { BUSES } from '../constants'
 
 function CanHealthBar({ canHealth, onNavigate }) {
   const byName = Object.fromEntries((canHealth ?? []).map((i) => [i.name, i]))
-  const unconfiguredCount = KNOWN_BUSES.filter(b => {
+  const unconfiguredCount = BUSES.filter(b => {
     const s = byName[b.name]?.state
     return !s || s === 'UNCONFIGURED'
   }).length
@@ -23,7 +17,7 @@ function CanHealthBar({ canHealth, onNavigate }) {
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2 flex-wrap">
-        {KNOWN_BUSES.map((bus) => {
+        {BUSES.map((bus) => {
           const iface    = byName[bus.name]
           const color    = busColor(iface?.state, iface?.bus_error_state)
           const isUnconfigured = !iface || iface.state === 'UNCONFIGURED'

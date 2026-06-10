@@ -1,11 +1,10 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react'
+import { BUSES } from '../constants'
 
 const WS_URL = 'ws://localhost:8765/ws/telemetry'
 
-const ALL_BUSES = ['can_left_leg', 'can_right_leg', 'can_left_arm', 'can_right_arm']
-
 function makeDefaultHealth() {
-  return ALL_BUSES.map((name) => ({
+  return BUSES.map(({ name }) => ({
     name,
     state: 'UNKNOWN',
     bus_error_state: 'UNKNOWN',

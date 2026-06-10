@@ -62,7 +62,7 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
   // ── Power controls ─────────────────────────────────────────────────────────
   async function enable() {
     setBusy(true)
-    try { await api.enableMotor(jointName, 'POSITION') } catch (e) { console.error(e) }
+    try { await api.enableMotor(jointName, 'POSITION') } catch (e) { onLogError?.(e.message, 'Enable') }
     setBusy(false)
   }
 
@@ -70,7 +70,7 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
     setBusy(true)
     if (sineRunning) stopSine()
     if (isRunning)   { setIsRunning(false); setRunTarget(null) }
-    try { await api.disableMotor(jointName) } catch (e) { console.error(e) }
+    try { await api.disableMotor(jointName) } catch (e) { onLogError?.(e.message, 'Disable') }
     setBusy(false)
   }
 
@@ -78,7 +78,7 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
     setBusy(true)
     if (sineRunning) stopSine()
     if (isRunning)   { setIsRunning(false); setRunTarget(null) }
-    try { await api.estopMotor(jointName) } catch (e) { console.error(e) }
+    try { await api.estopMotor(jointName) } catch (e) { onLogError?.(e.message, 'E-Stop') }
     setBusy(false)
   }
 

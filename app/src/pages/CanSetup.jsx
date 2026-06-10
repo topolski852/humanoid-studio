@@ -3,13 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useTelemetry } from '../context/TelemetryContext'
 import { busErrorLabel } from '../utils/canDisplay'
 import { api } from '../api'
-
-const LIMB_META = [
-  { limb: 'left_arm',  label: 'Left Arm',  busName: 'can_left_arm' },
-  { limb: 'right_arm', label: 'Right Arm', busName: 'can_right_arm' },
-  { limb: 'left_leg',  label: 'Left Leg',  busName: 'can_left_leg' },
-  { limb: 'right_leg', label: 'Right Leg', busName: 'can_right_leg' },
-]
+import { BUSES } from '../constants'
 
 // ── Status bar ────────────────────────────────────────────────────────────────
 function StatusBar({ adapters, canHealth }) {
@@ -104,7 +98,7 @@ function LimbSlotCard({ meta, adapter, iface, jointCount, unassigned, onAssign, 
     setBringingUp(true)
     setError(null)
     try {
-      await onBringUp(meta.busName)
+      await onBringUp(meta.name)
       recheckTimerRef.current = setTimeout(onRefresh, 2000)
     } catch (e) {
       setError(e.message)
@@ -117,7 +111,7 @@ function LimbSlotCard({ meta, adapter, iface, jointCount, unassigned, onAssign, 
     setPinging(true)
     setPingResult(null)
     try {
-      const result = await api.pingBus(meta.busName)
+      const result = await api.pingBus(meta.name)
       setPingResult(result)
     } catch (e) {
       setPingResult({ error: e.message })
@@ -130,7 +124,7 @@ function LimbSlotCard({ meta, adapter, iface, jointCount, unassigned, onAssign, 
     setScanning(true)
     setScanResult(null)
     try {
-      const result = await api.scanBus(meta.busName)
+      const result = await api.scanBus(meta.name)
       setScanResult(result)
     } catch (e) {
       setScanResult({ error: e.message })
@@ -172,7 +166,7 @@ function LimbSlotCard({ meta, adapter, iface, jointCount, unassigned, onAssign, 
         <span className={`w-2 h-2 rounded-full flex-shrink-0 ${dotClass}`} />
         <div className="flex-1 min-w-0">
           <p className="text-sm font-medium leading-none">{meta.label}</p>
-          <p className="text-[10px] font-mono text-gray-600 mt-0.5">{meta.busName}</p>
+          <p className="text-[10px] font-mono text-gray-600 mt-0.5">{meta.name}</p>
         </div>
         {isAssigned && (
           <button
@@ -602,12 +596,12 @@ export default function CanSetup() {
             Limb Assignment Slots
           </p>
           <div className="grid grid-cols-2 gap-4">
-            {LIMB_META.map(meta => (
+            {BUSES.map(meta => (
               <LimbSlotCard
                 key={meta.limb}
                 meta={meta}
                 adapter={adapterByLimb[meta.limb] ?? null}
-                iface={healthByName[meta.busName] ?? null}
+                iface={healthByName[meta.name] ?? null}
                 jointCount={jointCount[meta.limb] ?? 0}
                 unassigned={unassigned}
                 onAssign={handleAssign}

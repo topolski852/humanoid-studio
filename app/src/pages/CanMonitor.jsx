@@ -4,20 +4,9 @@ import { AreaChart, Area, ResponsiveContainer, Tooltip } from 'recharts'
 import { useTelemetry } from '../context/TelemetryContext'
 import { busErrorLabel, busColor } from '../utils/canDisplay'
 import { api } from '../api'
+import { BUSES } from '../constants'
 
-const BUS_TO_LIMB = {
-  can_left_leg:  'left_leg',
-  can_right_leg: 'right_leg',
-  can_left_arm:  'left_arm',
-  can_right_arm: 'right_arm',
-}
-
-const ALL_BUSES = [
-  { name: 'can_left_leg',  label: 'Left Leg' },
-  { name: 'can_right_leg', label: 'Right Leg' },
-  { name: 'can_left_arm',  label: 'Left Arm' },
-  { name: 'can_right_arm', label: 'Right Arm' },
-]
+const BUS_TO_LIMB = Object.fromEntries(BUSES.map((b) => [b.name, b.limb]))
 
 const COLOR_DOT = {
   green:  'bg-online',
@@ -442,7 +431,7 @@ export default function CanMonitor() {
       <div className="flex-1 overflow-y-auto">
         {/* ── Adapter cards ── */}
         <div className="px-6 pt-6 pb-4 grid grid-cols-2 xl:grid-cols-4 gap-4">
-          {ALL_BUSES.map((meta) => {
+          {BUSES.map((meta) => {
             const limb = BUS_TO_LIMB[meta.name]
             const hasAdapter = limb ? limbSlots[limb] != null : false
             const isSilentLong = silentSince[meta.name] != null &&
@@ -468,7 +457,7 @@ export default function CanMonitor() {
           <div className="bg-surface-1 border border-surface-3 rounded-xl overflow-hidden">
             {/* Tab bar */}
             <div className="flex border-b border-surface-3">
-              {ALL_BUSES.map((meta) => {
+              {BUSES.map((meta) => {
                 const iface = healthByName[meta.name]
                 const color = busColor(iface?.state, iface?.bus_error_state)
                 return (

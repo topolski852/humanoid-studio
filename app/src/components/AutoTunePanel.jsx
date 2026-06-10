@@ -184,13 +184,13 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
   // ── Motor control ───────────────────────────────────────────────────────────
   async function enable() {
     setBusy(true)
-    try { await api.enableMotor(jointName, 'POSITION') } catch (e) { console.error(e) }
+    try { await api.enableMotor(jointName, 'POSITION') } catch (e) { onLogError?.(e.message, 'Enable') }
     setBusy(false)
   }
 
   async function toIdle() {
     setBusy(true)
-    try { await api.disableMotor(jointName) } catch (e) { console.error(e) }
+    try { await api.disableMotor(jointName) } catch (e) { onLogError?.(e.message, 'Disable') }
     setBusy(false)
   }
 
@@ -198,7 +198,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
     setBusy(true)
     // If a step test is running, interrupt it immediately
     setRunning(false)
-    try { await api.estopMotor(jointName) } catch (e) { console.error(e) }
+    try { await api.estopMotor(jointName) } catch (e) { onLogError?.(e.message, 'E-Stop') }
     setBusy(false)
   }
 
