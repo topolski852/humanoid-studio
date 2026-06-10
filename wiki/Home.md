@@ -19,6 +19,7 @@ Humanoid Studio is a desktop application for commissioning, calibrating, and ope
 | Flux-offset (electrical) calibration | Working |
 | Position limit calibration via hardstop recording | Working |
 | ESC config read-back, parameter tuning, and flash persistence | Working |
+| Auto-Tune tab: step test, live metrics, and gain suggestion algorithm | Working |
 | Flash wizard for firmware programming and motor commissioning | Working |
 | Robot configuration editor (JSON + table view) | Working |
 | Passive motor detection (shows motors that are broadcasting without connecting) | Working |
@@ -72,6 +73,6 @@ Humanoid Studio is a desktop application for commissioning, calibrating, and ope
 
 ## Project status
 
-Active development. The left leg (6 joints) has been fully commissioned: electrical calibration complete, telemetry clean, position jog tested. The right leg, left arm, and right arm exist in the configuration file but have not yet been calibrated — the hardware was not connected during the development sessions that built this codebase.
+Active development. The left leg (6 joints) has been fully commissioned: electrical calibration complete, telemetry clean, position jog tested, and gain tuning verified via the Auto-Tune tab. The right leg, left arm, and right arm exist in the configuration file but have not yet been calibrated — the hardware was not connected during the development sessions that built this codebase.
 
-The core communication stack is stable and production-quality. The UI is functional and has been tested end-to-end with real hardware. Flash wizard, position calibration, and ESC config sync have all been verified working.
+The core communication stack is stable and production-quality. The UI is functional and has been tested end-to-end with real hardware. Flash wizard, position calibration, ESC config sync, and Auto-Tune have all been verified working.

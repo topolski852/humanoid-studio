@@ -19,6 +19,13 @@ These features are functional and have been tested with physical hardware.
 - Position mode enable, position jog (slider, numeric entry, +/− step), and sine wave work
 - E-STOP sends Mode 0 (DISABLED) and blocks further commands until the error is cleared
 - IDLE transition returns the motor to no-torque state
+- Enable-time jerk eliminated: PDO2 (position target) is sent before NMT POSITION, pre-seeding the firmware's position target so the first control tick sees zero error
+
+**Auto-Tune — left hip pitch joint (verified)**
+- Step test: commands a configurable amplitude step and records the live position response
+- Metrics panel: rise time, overshoot, settling time, and steady-state error extracted per test
+- Gain suggestion algorithm: proposes Kp and Ki adjustments based on response metrics (rise time, overshoot), capped to ±12% per suggestion to prevent large jumps
+- Apply gains fast path: writes only position_kp, position_ki, and torque_limit (3 SDO writes) instead of a full 27-param apply_config; confirmed ~15 ms round-trip
 
 **Calibration — left hip roll joint**
 - Flux offset calibration (electrical calibration) runs via NMT MODE_CALIBRATION and saves to Flash

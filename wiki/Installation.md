@@ -43,7 +43,7 @@ sudo apt-get install can-utils iproute2
 Install the C++ build tools for the daemon:
 
 ```bash
-sudo apt-get install cmake build-essential
+sudo apt-get install build-essential
 ```
 
 For the Flash Wizard (optional — only needed if reflashing ESC firmware):
@@ -69,17 +69,12 @@ The daemon is a standalone C++ binary that owns all SocketCAN interfaces. It mus
 
 ```bash
 cd daemon
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
 
-The first build fetches `nlohmann/json` via CMake's FetchContent (requires internet access). Subsequent builds use the cached download.
-
 Expected output ends with:
 ```
-[100%] Linking CXX executable humanoid_daemon
-[100%] Built target humanoid_daemon
+g++ ... -o build/humanoid_daemon
 ```
 
 The binary is placed at `daemon/build/humanoid_daemon`.

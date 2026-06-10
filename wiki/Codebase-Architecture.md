@@ -15,14 +15,18 @@ humanoid-studio/
 │   ├── src/
 │   │   ├── App.jsx         HashRouter, tab state management
 │   │   ├── api.js          Fetch wrapper for all REST calls to localhost:8765
+│   │   ├── constants.js    Shared BUSES constant (name/limb/label for all four CAN buses)
 │   │   ├── main.jsx        React 18 createRoot entry point
 │   │   ├── index.css       Tailwind directives + scrollbar + component classes
 │   │   ├── context/
-│   │   │   └── TelemetryContext.jsx  WebSocket state distribution
+│   │   │   └── TelemetryContext.jsx  WebSocket state distribution (states, canHealth, passiveTelemetry)
+│   │   ├── hooks/
+│   │   │   └── useControlWebSocket.js  Low-latency WebSocket hook for position commands
 │   │   ├── components/
 │   │   │   ├── MotorControlsPanel.jsx  Enable/Idle/E-STOP, position jog, sine wave
 │   │   │   ├── MotorCalibrationPanel.jsx  Flux cal, position cal, Flash Wizard link
 │   │   │   ├── MotorConfigPanel.jsx  Tune tab: PID gains, limits, SDO sync
+│   │   │   ├── AutoTunePanel.jsx     Auto tab: step test, metrics, gain suggestion
 │   │   │   ├── MotorTab.jsx          Route /motor/:jointName, tab container
 │   │   │   ├── MotorCard.jsx         Dashboard grid card per joint
 │   │   │   ├── FlashWizard.jsx       Flash modal: step strip, log, direction confirm
@@ -65,22 +69,27 @@ humanoid-studio/
 │       ├── routes_settings.py GET/PUT /settings
 │       └── routes_debug.py    Debug utilities
 ├── daemon/                 C++ real-time CAN daemon (owns all SocketCAN interfaces)
-│   ├── CMakeLists.txt      CMake 3.16+, C++17, FetchContent for nlohmann/json
+│   ├── Makefile            C++17, -O2; builds to daemon/build/humanoid_daemon
+│   ├── third_party/        nlohmann/json header (vendored)
 │   ├── build/
-│   │   └── humanoid_daemon Compiled binary (run make -j$(nproc) to build)
+│   │   └── humanoid_daemon Compiled binary (run cd daemon && make -j$(nproc))
 │   └── src/
-│       ├── main.cpp            Entry point; parse args, load config, start daemon
-│       ├── protocol.h          CAN frame constants, param IDs, enums (Mode, Function, ErrorCode)
-│       ├── types.h             Shared structs: ActuatorState, JointConfig, CANFrame
-│       ├── can_bus.cpp/.h      Single CAN interface: raw socket, reader thread, epoll, Tx queue
-│       ├── bus_manager.cpp/.h  Owns N CANBus instances; routes frames to/from joints by device_id
-│       ├── actuator.cpp/.h     Per-joint state machine, config apply, position conversions
-│       ├── robot.cpp/.h        Multi-joint coordinator: load config, fan-out commands, PDO4 monitor
-│       ├── control_loop.cpp/.h 200 Hz SCHED_FIFO thread: drive all joints, feed watchdog
-│       ├── udp_server.cpp/.h   UDP RPC server: receive commands, dispatch to Robot, push telemetry
-│       ├── config_loader.cpp/.h Load humanoid_lite.json → vector<JointConfig>
-│       ├── loop_func.h         Real-time loop utility (period, CPU affinity, SCHED_FIFO priority)
-│       └── signal_handler.cpp/.h SIGINT/SIGTERM → atomic stop flag + graceful shutdown
+│       ├── main.cpp             Entry point; parse args, load config, start daemon
+│       ├── can/
+│       │   ├── socket_can.cpp/.h      Single CAN interface: raw socket, epoll, Tx queue
+│       │   ├── can_bus_manager.cpp/.h Owns N SocketCAN instances; drain_all(); routes frames
+│       │   └── generic_listener.cpp/.h  Passive frame listener (for CAN Monitor, passive PDO poll)
+│       ├── config/
+│       │   └── config_loader.cpp/.h   Load humanoid_lite.json → vector<JointConfig>
+│       ├── control/
+│       │   ├── robot.cpp/.h     Multi-joint coordinator: load config, fan-out commands
+│       │   └── control_loop.hpp 200 Hz SCHED_FIFO real-time loop utility
+│       ├── ipc/
+│       │   ├── udp_server.cpp/.h      UDP RPC server: receive JSON commands, dispatch to Robot
+│       │   └── udp_broadcaster.cpp/.h Push telemetry JSON to port 9000 at configured Hz
+│       └── motor/
+│           ├── actuator.cpp/.h        Per-joint state machine, config apply, position conversions
+│           └── recoil_protocol.hpp    CAN frame constants, param IDs, enums (Mode, Function, ErrorCode)
 ├── configs/
 │   ├── humanoid_lite.json  22-joint robot configuration (flat schema)
 │   └── 99-humanoid-can.rules  Stable udev rules written by the CAN Setup page
@@ -219,16 +228,16 @@ Python's GIL and asyncio cannot guarantee < 1 ms CAN frame latency at 200 Hz acr
 ### Threading model
 
 ```
-Main thread          — config load, signal handling, graceful shutdown
-Control loop (200Hz) — drain Rx rings, tick all actuators, watchdog feed, telemetry snapshot
+Main thread           — config load, signal handling, graceful shutdown
+Control loop (200 Hz) — drain Rx rings, tick all actuators, watchdog feed, telemetry snapshot
   CPU 0, SCHED_FIFO prio 80
-Reader threads (×4)  — one per CAN bus; epoll → SPSC ring buffer
+Reader threads (×4)   — one per CAN bus; epoll → SPSC ring buffer
   CPU 0, SCHED_FIFO prio 70
-Tx threads (×4)      — drain Tx deque via ::write(); retry on ENOBUFS
+Tx threads (×4)       — drain Tx deque via ::write(); retry on ENOBUFS
   CPU 0, SCHED_FIFO prio 75
-UDP command thread   — listen on 9001; parse JSON; enqueue command for control loop
+UDP command thread    — UdpServer on 9001; parse JSON; dispatch Robot methods directly
   SCHED_OTHER
-UDP telemetry thread — read snapshot buffer; push JSON to 9000 at configured Hz
+UDP telemetry thread  — UdpBroadcaster; read snapshot; push JSON to 9000 at configured Hz
   SCHED_OTHER
 ```
 
