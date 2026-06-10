@@ -62,48 +62,58 @@ function computeSuggestion(metrics, params) {
   let quality        = 'good'
 
   // ── Kp / torque-limit decision (priority order) ───────────────────────────
+  // All adjustments are intentionally small and incremental.  Multiple test
+  // iterations are needed to converge — that is safer than large single jumps.
+  // Hard cap: never suggest more than −12% or +8% in one step regardless of
+  // what the heuristic computes.
+  const kpFloor = round1(kp * 0.88)   // max reduction per step: −12%
+  const kpCeil  = round1(kp * 1.08)   // max increase per step:  +8%
+
   if (torque_saturated) {
     rationale.push('Torque saturated — response shape unreliable; raise limit or reduce Kp')
-    newKp          = round1(kp * 0.80)
+    newKp          = round1(kp * 0.90)   // −10%
     newTorqueLimit = round1(max_torque_nm * 1.5)
     quality        = 'poor'
   } else if (overshoot > 20) {
     rationale.push(`High overshoot (${overshoot.toFixed(1)}%) — reduce Kp`)
-    newKp    = round1(kp * 0.70)
+    newKp    = round1(kp * 0.88)         // −12%
     quality  = 'poor'
   } else if (overshoot > 10) {
-    rationale.push(`Overshoot ${overshoot.toFixed(1)}% — reduce Kp moderately`)
-    newKp   = round1(kp * 0.82)
+    rationale.push(`Overshoot ${overshoot.toFixed(1)}% — reduce Kp`)
+    newKp   = round1(kp * 0.92)          // −8%
     quality = 'marginal'
   } else if (overshoot > 8) {
-    rationale.push(`Overshoot ${overshoot.toFixed(1)}% — minor Kp reduction`)
-    newKp   = round1(kp * 0.92)
+    rationale.push(`Overshoot ${overshoot.toFixed(1)}% — small Kp reduction`)
+    newKp   = round1(kp * 0.96)          // −4%
     quality = 'marginal'
   } else if (overshoot >= 2 && overshoot <= 8) {
     if (settling != null && settling < 500) {
       rationale.push(`Overshoot ${overshoot.toFixed(1)}%, settling ${settling} ms — response is good`)
       quality = 'good'
     } else if (settling != null && settling > 1000) {
-      rationale.push(`Low overshoot but slow settling (${settling} ms) — can increase Kp slightly`)
-      newKp   = round1(kp * 1.10)
+      rationale.push(`Low overshoot but slow settling (${settling} ms) — increase Kp slightly`)
+      newKp   = round1(kp * 1.05)        // +5%
       quality = 'marginal'
     } else {
       rationale.push(`Overshoot ${overshoot.toFixed(1)}% — within target range`)
       quality = 'good'
     }
   } else {
-    // overshoot < 2% — overdamped or very slow
+    // overshoot < 2% — overdamped or slow
     if (settling == null || settling > 800) {
       rationale.push(settling == null
         ? 'Never settled within 2% band — increase Kp'
         : `Low overshoot, slow settling (${settling} ms) — increase Kp`)
-      newKp   = round1(kp * 1.20)
+      newKp   = round1(kp * 1.08)        // +8%
       quality = 'marginal'
     } else {
       rationale.push(`Low overshoot (${overshoot.toFixed(1)}%), fast settle — critically damped`)
       quality = 'good'
     }
   }
+
+  // Hard safety cap — clamp to ±12%/+8% regardless of heuristic above
+  newKp = Math.max(kpFloor, Math.min(kpCeil, newKp))
 
   // Ki is held constant — integral wind-up risk is high without knowing firmware integrator limits.
   // Tune Ki manually in the Tune tab after Kp is satisfactory.
@@ -135,6 +145,10 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
   const [clearing,          setClearing]          = useState(false)
   const [applyingSuggestion, setApplyingSuggestion] = useState(false)
   const [triedSuggestion,    setTriedSuggestion]    = useState(false)
+  // Gains and offset that were ACTUALLY USED for the last test run.
+  // Suggestion is computed from these — not from the current form values —
+  // so clicking "Try These Gains" cannot cascade the suggestion.
+  const [lastTestParams, setLastTestParams] = useState(null)
 
   const cfgInit = useRef(false)
   const posInit = useRef(false)
@@ -192,6 +206,16 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
     setRunError(null)
     setResult(null)
     setTriedSuggestion(false)
+    // Snapshot the gains and offset at the moment this test starts.
+    // The suggestion card uses this snapshot, not the live form values,
+    // so "Try These Gains" cannot cascade the suggestion without a new test.
+    const params = {
+      position_kp:  testKp,
+      position_ki:  testKi,
+      torque_limit: testTorqueLimit,
+      offset_rad:   offsetDeg * DEG,
+    }
+    setLastTestParams(params)
     try {
       const res = await api.runStepTest(jointName, {
         position_kp:   testKp,
@@ -251,13 +275,9 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
 
   const metrics        = result?.metrics ?? null
   const displaySamples = toDisplaySamples(result?.samples ?? [])
-  const suggestion     = metrics
-    ? computeSuggestion(metrics, {
-        position_kp:  testKp,
-        position_ki:  testKi,
-        torque_limit: testTorqueLimit,
-        offset_rad:   offsetDeg * DEG,
-      })
+  // Use the frozen snapshot from the last test run — never the live form values.
+  const suggestion     = (metrics && lastTestParams)
+    ? computeSuggestion(metrics, lastTestParams)
     : null
 
   return (
@@ -520,9 +540,10 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
           )}
 
           {/* Suggestion card */}
-          {suggestion && (
+          {suggestion && lastTestParams && (
             <SuggestionCard
               suggestion={suggestion}
+              testedKp={lastTestParams.position_kp}
               tried={triedSuggestion}
               applying={applyingSuggestion}
               canApply={isConnected}
@@ -583,7 +604,7 @@ function MetricRow({ label, value, warn = false }) {
   )
 }
 
-function SuggestionCard({ suggestion, tried, applying, canApply, onTry, onApply }) {
+function SuggestionCard({ suggestion, testedKp, tried, applying, canApply, onTry, onApply }) {
   const { kp, ki, torqueLimit, rationale, quality } = suggestion
 
   const borderCls = quality === 'good'     ? 'border-online/40'
@@ -600,7 +621,14 @@ function SuggestionCard({ suggestion, tried, applying, canApply, onTry, onApply 
     <div className={`rounded-xl border p-3 space-y-3 bg-surface-2 ${borderCls}`}>
       {/* Header */}
       <div className="flex items-center justify-between">
-        <SectionLabel>Suggested Gains</SectionLabel>
+        <div>
+          <SectionLabel>Suggested Gains</SectionLabel>
+          {testedKp != null && (
+            <p className="text-[9px] text-gray-600 mt-0.5 font-mono">
+              based on test at Kp {testedKp}
+            </p>
+          )}
+        </div>
         <span className={`flex items-center gap-1.5 text-[9px] font-medium px-2 py-0.5 rounded ${badgeCls}`}>
           <span className={`w-1.5 h-1.5 rounded-full ${dotCls}`} />
           {quality.toUpperCase()}
