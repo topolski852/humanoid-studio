@@ -56,9 +56,3 @@ Full documentation is in the [GitHub Wiki](../../wiki):
 
 - [Berkeley Humanoid Lite](https://github.com/HybridRobotics/Berkeley-Humanoid-Lite) — the robot hardware and original Python control scripts
 - [Recoil Motor Controller](https://github.com/rxdu/Recoil-Motor-Controller-B-G431B-ESC1) — the STM32G431 ESC firmware
-
----
-
-## License
-
-MIT
