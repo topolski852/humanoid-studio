@@ -45,6 +45,10 @@
         "to": "backend"
       },
       {
+        "from": "../configs",
+        "to": "configs"
+      },
+      {
         "from": "../daemon/build/humanoid_daemon",
         "to": "daemon/humanoid_daemon"
       }
