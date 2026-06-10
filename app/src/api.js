@@ -1,8 +1,9 @@
 const BASE = 'http://localhost:8765'
 
-async function request(path, options = {}) {
+async function request(path, options = {}, signal = undefined) {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
+    signal,
     ...options,
   })
   const ct = res.headers.get('content-type') ?? ''
@@ -119,11 +120,11 @@ export const api = {
     }),
   storeMotorToFlash: (jointName) =>
     request(`/motors/${encodeURIComponent(jointName)}/store_to_flash`, { method: 'POST' }),
-  runStepTest: (jointName, params) =>
+  runStepTest: (jointName, params, signal = undefined) =>
     request(`/motors/${encodeURIComponent(jointName)}/step_test`, {
       method: 'POST',
       body: JSON.stringify(params),
-    }),
+    }, signal),
 
   // ── App settings ───────────────────────────────────────────────────────────
   getSettings: () => request('/settings'),

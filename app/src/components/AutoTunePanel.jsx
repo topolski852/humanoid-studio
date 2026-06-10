@@ -150,8 +150,16 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
   // so clicking "Try These Gains" cannot cascade the suggestion.
   const [lastTestParams, setLastTestParams] = useState(null)
 
-  const cfgInit = useRef(false)
-  const posInit = useRef(false)
+  const cfgInit    = useRef(false)
+  const posInit    = useRef(false)
+  // AbortController for the in-flight step test fetch.
+  // Aborted on component unmount (tab switch / navigate away) so the fetch
+  // cannot keep running in the background and leave running=true stuck true.
+  const abortRef   = useRef(null)
+
+  useEffect(() => {
+    return () => { abortRef.current?.abort() }
+  }, [])
 
   const isConnected = state != null
   const isEnabled   = ACTIVE_MODES.has(state?.mode_name)
@@ -202,6 +210,9 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
 
   // ── Step test ───────────────────────────────────────────────────────────────
   async function runTest() {
+    abortRef.current?.abort()
+    abortRef.current = new AbortController()
+
     setRunning(true)
     setRunError(null)
     setResult(null)
@@ -225,9 +236,10 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
         offset_rad:    offsetDeg * DEG,
         step_hold_s:   stepHoldS,
         num_steps:     numSteps,
-      })
+      }, abortRef.current.signal)
       setResult(res)
     } catch (e) {
+      if (e.name === 'AbortError') return  // tab switch or navigate — don't set error state
       const msg = `Step test failed: ${e.message}`
       setRunError(msg)
       onLogError?.(msg, 'Auto-Tune')
@@ -273,7 +285,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
     : null
 
   return (
-    <div className="flex-1 overflow-y-auto p-3 space-y-4">
+    <div className="flex-1 min-w-0 overflow-y-auto p-3 space-y-4">
 
       {/* ── Motor not connected notice ───────────────────────────────────── */}
       {!isConnected && (
@@ -428,8 +440,9 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
             </div>
           </section>
 
-          {/* Chart */}
-          <section>
+          {/* Chart — overflow-hidden prevents the SVG event-capture rect from
+               escaping its container and blocking clicks on the sidebar/tab bar */}
+          <section className="w-full overflow-hidden">
             <ResponsiveContainer width="100%" height={240}>
               <ComposedChart
                 data={displaySamples}
