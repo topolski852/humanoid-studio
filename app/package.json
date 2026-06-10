@@ -43,6 +43,10 @@
       {
         "from": "../backend",
         "to": "backend"
+      },
+      {
+        "from": "../daemon/build/humanoid_daemon",
+        "to": "daemon/humanoid_daemon"
       }
     ]
   }
