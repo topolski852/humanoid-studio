@@ -9,39 +9,57 @@ import {
 } from 'recharts'
 import { api } from '../api'
 
-// Firmware POSITION mode (0x13 = 19)
-const MODE_POSITION = 0x13
+const DEG = Math.PI / 180
+const R2D = 180 / Math.PI
 
 const SIGNAL_CONFIG = [
-  { key: 'commanded',   label: 'Position Cmd',  color: '#3b82f6', yAxisId: 'pos',   strokeDasharray: '4 2' },
-  { key: 'position',    label: 'Position Meas', color: '#22c55e', yAxisId: 'pos' },
-  { key: 'velocity',    label: 'Velocity',      color: '#eab308', yAxisId: 'other' },
-  { key: 'torque',      label: 'Torque',        color: '#f97316', yAxisId: 'other' },
-  { key: 'current',     label: 'Current',       color: '#ef4444', yAxisId: 'other' },
-  { key: 'bus_voltage', label: 'Bus Voltage',   color: '#94a3b8', yAxisId: 'other' },
+  { key: 'commanded',   label: 'Position Cmd (°)',  color: '#3b82f6', yAxisId: 'pos',   strokeDasharray: '4 2' },
+  { key: 'position',    label: 'Position Meas (°)', color: '#22c55e', yAxisId: 'pos' },
+  { key: 'velocity',    label: 'Velocity (°/s)',    color: '#eab308', yAxisId: 'other' },
+  { key: 'torque',      label: 'Torque (Nm)',       color: '#f97316', yAxisId: 'other' },
+  { key: 'current',     label: 'Current (A)',       color: '#ef4444', yAxisId: 'other' },
+  { key: 'bus_voltage', label: 'Bus Voltage (V)',   color: '#94a3b8', yAxisId: 'other' },
 ]
 
 const DEFAULT_VISIBLE = new Set(['commanded', 'position', 'velocity', 'torque'])
+
+// Convert raw samples (rad) to display units (deg) for chart
+function toDisplaySamples(samples) {
+  return samples.map((s) => ({
+    ...s,
+    commanded:   s.commanded   != null ? s.commanded   * R2D : null,
+    position:    s.position    != null ? s.position    * R2D : null,
+    velocity:    s.velocity    != null ? s.velocity    * R2D : null,
+  }))
+}
+
+const ACTIVE_MODES = new Set(['POSITION', 'VELOCITY', 'TORQUE', 'CURRENT'])
 
 export default function AutoTunePanel({ jointName, state, config, onLogError }) {
   const [testKp,          setTestKp]          = useState(20.0)
   const [testKi,          setTestKi]          = useState(0.0)
   const [testTorqueLimit, setTestTorqueLimit] = useState(2.0)
-  const [centerRad,       setCenterRad]       = useState(0.0)
-  const [offsetRad,       setOffsetRad]       = useState(0.45)
+  const [centerDeg,       setCenterDeg]       = useState(0.0)
+  const [offsetDeg,       setOffsetDeg]       = useState(25.0)
   const [stepHoldS,       setStepHoldS]       = useState(1.5)
   const [numSteps,        setNumSteps]        = useState(4)
   const [signals, setSignals] = useState(
     Object.fromEntries(SIGNAL_CONFIG.map((s) => [s.key, DEFAULT_VISIBLE.has(s.key)]))
   )
-  const [running,  setRunning]  = useState(false)
-  const [result,   setResult]   = useState(null)
-  const [runError, setRunError] = useState(null)
+  const [running,   setRunning]   = useState(false)
+  const [result,    setResult]    = useState(null)
+  const [runError,  setRunError]  = useState(null)
+  const [busy,      setBusy]      = useState(false)
+  const [clearing,  setClearing]  = useState(false)
 
   const cfgInit = useRef(false)
   const posInit = useRef(false)
 
-  // Seed gains from robot config once on first load.
+  const isConnected = state != null
+  const isEnabled   = ACTIVE_MODES.has(state?.mode_name)
+  const motorEnabled = state?.mode_name === 'POSITION'
+
+  // Seed gains from robot config once on first load
   useEffect(() => {
     if (cfgInit.current || !config) return
     cfgInit.current = true
@@ -50,28 +68,54 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
     if (config.torque_limit != null) setTestTorqueLimit(Number(config.torque_limit))
   }, [config])
 
-  // Seed center_rad from current motor position once telemetry arrives.
+  // Seed center from current motor position (in degrees) once telemetry arrives
   useEffect(() => {
     if (posInit.current || state?.position == null) return
     posInit.current = true
-    setCenterRad(parseFloat(state.position.toFixed(3)))
+    setCenterDeg(parseFloat((state.position * R2D).toFixed(1)))
   }, [state])
 
-  const motorEnabled = state?.mode === MODE_POSITION
+  // ── Motor control ───────────────────────────────────────────────────────────
+  async function enable() {
+    setBusy(true)
+    try { await api.enableMotor(jointName, 'POSITION') } catch (e) { console.error(e) }
+    setBusy(false)
+  }
 
+  async function toIdle() {
+    setBusy(true)
+    try { await api.disableMotor(jointName) } catch (e) { console.error(e) }
+    setBusy(false)
+  }
+
+  async function doEstop() {
+    setBusy(true)
+    // If a step test is running, interrupt it immediately
+    setRunning(false)
+    try { await api.estopMotor(jointName) } catch (e) { console.error(e) }
+    setBusy(false)
+  }
+
+  async function clearError() {
+    setClearing(true)
+    try { await api.clearMotorError(jointName) } catch (e) { onLogError?.(e.message, 'ClearError') }
+    setClearing(false)
+  }
+
+  // ── Step test ───────────────────────────────────────────────────────────────
   async function runTest() {
     setRunning(true)
     setRunError(null)
     setResult(null)
     try {
       const res = await api.runStepTest(jointName, {
-        position_kp: testKp,
-        position_ki: testKi,
-        torque_limit: testTorqueLimit,
-        center_rad: centerRad,
-        offset_rad: offsetRad,
-        step_hold_s: stepHoldS,
-        num_steps: numSteps,
+        position_kp:   testKp,
+        position_ki:   testKi,
+        torque_limit:  testTorqueLimit,
+        center_rad:    centerDeg * DEG,
+        offset_rad:    offsetDeg * DEG,
+        step_hold_s:   stepHoldS,
+        num_steps:     numSteps,
       })
       setResult(res)
     } catch (e) {
@@ -85,8 +129,8 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
   async function applyGains() {
     try {
       await api.applyMotorConfig(jointName, {
-        position_kp: testKp,
-        position_ki: testKi,
+        position_kp:  testKp,
+        position_ki:  testKi,
         torque_limit: testTorqueLimit,
       })
     } catch (e) {
@@ -96,40 +140,116 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
     }
   }
 
-  const metrics = result?.metrics ?? null
-  const samples = result?.samples ?? []
+  const metrics        = result?.metrics ?? null
+  const displaySamples = toDisplaySamples(result?.samples ?? [])
 
   return (
     <div className="flex-1 overflow-y-auto p-3 space-y-4">
-      {/* ── Gains ───────────────────────────────────────────────────── */}
+
+      {/* ── Motor not connected notice ───────────────────────────────────── */}
+      {!isConnected && (
+        <div className="px-3 py-2.5 rounded-lg bg-surface-2 border border-surface-3">
+          <p className="text-xs text-gray-400">Motor visible via passive CAN.</p>
+          <p className="text-[10px] text-gray-600 mt-0.5">
+            Connect the robot (top-right) to send commands.
+          </p>
+        </div>
+      )}
+
+      {/* ── ESC error banner ─────────────────────────────────────────────── */}
+      {isConnected && state?.error !== 0 && state?.error != null && (
+        <div className="px-3 py-2.5 rounded-lg bg-danger/10 border border-danger/30">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-xs font-medium text-danger">ESC Error: {state.error}</p>
+              {state.error_names?.length > 0 && (
+                <p className="text-[10px] text-danger/70 mt-0.5 font-mono">
+                  {state.error_names.join(', ')}
+                </p>
+              )}
+            </div>
+            <button
+              onClick={clearError}
+              disabled={clearing}
+              className="shrink-0 px-3 py-1 rounded text-xs font-medium bg-danger/20 text-danger
+                border border-danger/30 hover:bg-danger/30 disabled:opacity-40 transition-colors"
+            >
+              {clearing ? 'Clearing…' : 'Clear ESC Error'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Power (Enable / Idle / E-Stop) ───────────────────────────────── */}
+      <section className="space-y-1.5">
+        <SectionLabel>Power</SectionLabel>
+        {isEnabled ? (
+          <div className="flex gap-2">
+            <button
+              onClick={toIdle}
+              disabled={busy || !isConnected}
+              className="flex-1 py-2 rounded-lg text-sm font-medium transition-colors
+                bg-surface-2 text-gray-300 border border-surface-3
+                hover:border-accent/40 hover:text-accent disabled:opacity-40"
+            >
+              {busy ? '…' : 'To Idle'}
+            </button>
+            <button
+              onClick={doEstop}
+              disabled={busy || !isConnected}
+              className="flex-[2] py-2 rounded-lg text-sm font-medium transition-colors
+                bg-danger/20 text-danger border border-danger/30
+                hover:bg-danger/30 disabled:opacity-40"
+            >
+              {busy ? '…' : '⛔ E-STOP'}
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={enable}
+            disabled={busy || !isConnected}
+            className="w-full py-2 rounded-lg text-sm font-medium transition-colors
+              bg-accent/20 text-accent border border-accent/30
+              hover:bg-accent/30 disabled:opacity-40"
+          >
+            {busy ? '…' : '▶ Enable (Position)'}
+          </button>
+        )}
+        {isConnected && (
+          <p className="text-[10px] text-gray-600 text-center font-mono">
+            {state?.mode_name ?? '—'}
+          </p>
+        )}
+      </section>
+
+      {/* ── Gains ────────────────────────────────────────────────────────── */}
       <section className="space-y-2">
         <SectionLabel>Gains for Test</SectionLabel>
         <div className="grid grid-cols-3 gap-2">
-          <Field label="Position Kp" value={testKp}          onChange={(v) => setTestKp(Number(v))} />
-          <Field label="Position Ki" value={testKi}          onChange={(v) => setTestKi(Number(v))} />
+          <Field label="Position Kp"      value={testKp}          onChange={(v) => setTestKp(Number(v))} />
+          <Field label="Position Ki"      value={testKi}          onChange={(v) => setTestKi(Number(v))} />
           <Field label="Torque Limit (Nm)" value={testTorqueLimit} onChange={(v) => setTestTorqueLimit(Number(v))} />
         </div>
       </section>
 
-      {/* ── Step parameters ─────────────────────────────────────────── */}
+      {/* ── Step parameters ──────────────────────────────────────────────── */}
       <section className="space-y-2">
         <SectionLabel>Step Parameters</SectionLabel>
         <div className="grid grid-cols-2 gap-2">
-          <Field label="Center (rad)" value={centerRad} onChange={(v) => setCenterRad(Number(v))} />
-          <Field label="Offset (rad)" value={offsetRad} onChange={(v) => setOffsetRad(Number(v))} />
+          <Field label="Center (°)"    value={centerDeg} onChange={(v) => setCenterDeg(Number(v))} />
+          <Field label="Offset (°)"    value={offsetDeg} onChange={(v) => setOffsetDeg(Number(v))} />
           <Field label="Hold time (s)" value={stepHoldS} onChange={(v) => setStepHoldS(Number(v))} />
-          <Field label="Steps" value={numSteps} onChange={(v) => setNumSteps(Math.max(1, Math.round(Number(v))))} />
+          <Field label="Steps"         value={numSteps}  onChange={(v) => setNumSteps(Math.max(1, Math.round(Number(v))))} />
         </div>
         <p className="text-[10px] text-gray-600">
           Moves between{' '}
-          <span className="font-mono text-gray-400">{(centerRad - offsetRad).toFixed(3)}</span>
+          <span className="font-mono text-gray-400">{(centerDeg - offsetDeg).toFixed(1)}°</span>
           {' '}and{' '}
-          <span className="font-mono text-gray-400">{(centerRad + offsetRad).toFixed(3)}</span>
-          {' '}rad
+          <span className="font-mono text-gray-400">{(centerDeg + offsetDeg).toFixed(1)}°</span>
         </p>
       </section>
 
-      {/* ── Run button ──────────────────────────────────────────────── */}
+      {/* ── Run button ───────────────────────────────────────────────────── */}
       <div className="space-y-1.5">
         <button
           onClick={runTest}
@@ -141,9 +261,9 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
             ? `Running… (${numSteps} steps × ${stepHoldS}s)`
             : 'Run Step Test'}
         </button>
-        {!motorEnabled && !running && (
+        {!motorEnabled && !running && isConnected && (
           <p className="text-[10px] text-warn text-center">
-            Motor must be in POSITION mode (Enable in Move tab)
+            Enable motor in Position mode above to run test
           </p>
         )}
         {runError && (
@@ -151,7 +271,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
         )}
       </div>
 
-      {/* ── Results ─────────────────────────────────────────────────── */}
+      {/* ── Results ──────────────────────────────────────────────────────── */}
       {result && (
         <>
           {/* Signal toggles */}
@@ -183,7 +303,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
           <section>
             <ResponsiveContainer width="100%" height={240}>
               <ComposedChart
-                data={samples}
+                data={displaySamples}
                 margin={{ top: 4, right: 48, bottom: 4, left: 0 }}
               >
                 <XAxis
@@ -195,9 +315,10 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
                 <YAxis
                   yAxisId="pos"
                   tick={{ fontSize: 9, fill: '#6b7280' }}
-                  tickFormatter={(v) => v.toFixed(2)}
+                  tickFormatter={(v) => v.toFixed(1)}
                   stroke="#374151"
                   width={42}
+                  unit="°"
                 />
                 <YAxis
                   yAxisId="other"
@@ -215,7 +336,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
                         {payload.map((p) => (
                           <p key={p.dataKey} style={{ color: p.stroke }}>
                             {p.name}:{' '}
-                            {typeof p.value === 'number' ? p.value.toFixed(4) : '—'}
+                            {typeof p.value === 'number' ? p.value.toFixed(2) : '—'}
                           </p>
                         ))}
                       </div>
@@ -264,7 +385,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
                   label="Steady-state error"
                   value={
                     metrics.steady_state_error_rad != null
-                      ? `${metrics.steady_state_error_rad.toFixed(4)} rad`
+                      ? `${(metrics.steady_state_error_rad * R2D).toFixed(2)}°`
                       : 'N/A'
                   }
                 />
