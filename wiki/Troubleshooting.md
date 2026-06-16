@@ -10,15 +10,14 @@ Organized by symptom. Every issue listed here was encountered during actual deve
 
 Electron spawns the daemon before the Python backend. If the daemon binary is missing or fails, Electron will report "Failed to Start Backend" even though Python is fine.
 
-1. **Daemon not built:** Build it first:
+1. **Daemon not built (dev mode only):** In dev mode Electron looks for `daemon/build/humanoid_daemon`. Build it first:
    ```bash
    cd humanoid-studio/daemon
-   mkdir -p build && cd build
-   cmake .. -DCMAKE_BUILD_TYPE=Release
    make -j$(nproc)
    ```
+   In the packaged AppImage the daemon binary is bundled and does not need to be built.
 
-2. **Daemon binary not found:** Electron looks for `daemon/build/humanoid_daemon` relative to the project root. Confirm:
+2. **Daemon binary not found:** In dev mode, confirm the binary exists:
    ```bash
    ls -lh humanoid-studio/daemon/build/humanoid_daemon
    ```
@@ -28,6 +27,7 @@ Electron spawns the daemon before the Python backend. If the daemon binary is mi
    pkill -9 humanoid_daemon 2>/dev/null
    fuser -k 9000/udp 2>/dev/null
    fuser -k 9001/udp 2>/dev/null
+   fuser -k 9002/udp 2>/dev/null
    ```
 
 4. **SocketCAN interfaces not up:** The daemon tries to open the CAN interfaces listed in `humanoid_lite.json`. Missing interfaces are logged as warnings and those joints are marked OFFLINE — the daemon still starts. If the daemon exits immediately, check its stderr output for a fatal error (e.g., invalid config JSON).
@@ -181,7 +181,7 @@ The CAN Monitor reads bus health from daemon telemetry. If the daemon has not se
 
 In earlier builds, the error register displayed in the motor tab would briefly show nonsensical values (WATCHDOG_TIMEOUT, ENCODER_FAULT) on motors with no actual fault. This was the SDO race condition: two concurrent SDO reads to the same motor consumed each other's responses.
 
-This is fixed with per-device asyncio locks in `can_bus.py`. If you see this symptom, you are running an old build. Update to the current version.
+This is fixed in the C++ daemon. The daemon's `actuator.cpp` uses a mutex + condition variable mailbox (`sdo_ack_mutex_`, `sdo_ack_cv_`) to serialize SDO transactions per motor. If you see this symptom, you are running an old build. Update to the current version.
 
 ### Motor makes grinding noise or vibrates when enabled
 

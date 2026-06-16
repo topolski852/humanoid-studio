@@ -171,7 +171,7 @@ Run:
 ./release/"Humanoid Studio-0.1.0.AppImage"
 ```
 
-The AppImage is self-contained. It embeds the frontend assets and the Python backend source. Python, all Python packages, and the compiled daemon binary must still be present on the host system — they are not bundled inside the AppImage.
+The AppImage bundles the frontend assets, Python backend source, robot config (`configs/humanoid_lite.json`), and the compiled C++ daemon binary. Python 3 and the Python packages must still be installed on the host — they are not bundled inside the AppImage.
 
 ---
 

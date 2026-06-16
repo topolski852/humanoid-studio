@@ -1,21 +1,20 @@
 # CAN Monitor
 
-The CAN Monitor page shows real-time health information for all four CAN buses. It reads directly from the Linux kernel's SocketCAN sysfs interface and from a passive traffic sniffer that runs independently of the robot connection state.
+The CAN Monitor page shows real-time health information for all four CAN buses. Bus health data comes from daemon telemetry (the daemon's `bus_health` JSON pushed on port 9000). A passive traffic sniffer runs independently of the robot connection state to populate the traffic table.
 
 ---
 
 ## Interface status indicators
 
-Each bus panel shows a status derived from the kernel's CAN error state machine. The raw state names from the kernel map to friendlier labels in the app:
+Each bus panel shows a status. The daemon reports whether each CAN socket is open and tracks TX drops; the Python backend checks `/sys/class/net/{ifname}/operstate` for final UP/DOWN resolution. The app maps these to the following labels:
 
-| App label | Kernel state | Meaning |
-|---|---|---|
-| **Healthy** | ERROR-ACTIVE | Normal operating state. Transmit Error Counter (TEC) and Receive Error Counter (REC) are both below 96. |
-| **Degraded** | ERROR-WARNING | Elevated error count. At least one of TEC or REC has exceeded 96. The interface is still operational but frames are being dropped or corrupted at some rate. |
-| **High Errors** | ERROR-PASSIVE | Serious error condition. TEC or REC has exceeded 127. The controller is backing off — it transmits error frames as recessive rather than dominant, reducing its ability to signal errors to other nodes. |
-| **Bus Off** | BUS-OFF | The controller has shut itself off. TEC exceeded 255. All transmission has stopped. A reset is required to recover. |
-| **Down** | — | The Linux interface exists but is not in UP state. Either it was never brought up, or it went down after a USB disconnect. |
-| **Not Configured** | — | The interface name (e.g., `can_left_arm`) does not exist in `/sys/class/net/`. The udev rule for this bus has not been written or the adapter is not plugged in. |
+| App label | Meaning |
+|---|---|
+| **Healthy** | Interface is UP and the daemon has an open socket on it. |
+| **Down** | The Linux interface exists but is not in UP state — not brought up, or dropped after a USB disconnect. |
+| **Not Configured** | The interface name (e.g., `can_left_arm`) does not exist in `/sys/class/net/`. The udev rule has not been written or the adapter is not plugged in. |
+
+Note: The kernel CAN error state machine states (ERROR-WARNING, ERROR-PASSIVE, BUS-OFF) are not currently reported by the daemon — TEC/REC counters are not surfaced. If a bus enters BUS-OFF you will see it go DOWN rather than a specific BUS-OFF label.
 
 ### What to do for each state
 
@@ -37,13 +36,11 @@ sudo ip link set can_left_leg up
 
 ---
 
-## Message rate sparkline
+## Message rate
 
-Each bus panel shows a sparkline of the message rate over the past 60 seconds (30 samples at 2-second poll intervals). The current rate in msg/s is also shown numerically.
+Each bus panel shows the current message rate in msg/s from daemon telemetry. At 6 joints × 100 Hz TX_PDO4, a fully active left leg or right leg bus carries approximately 600 msg/s of motor broadcasts plus host command frames.
 
-At 6 joints × 100 Hz TX_PDO4, a fully active left leg or right leg bus carries approximately 600 msg/s of motor broadcasts plus the host command frames. The total depends on how many joints are active and what commands are being sent.
-
-A sudden drop in the sparkline indicates either motors powered down, the CAN chain was broken, or the USB adapter lost contact. The drop log records the exact timestamp and error counts.
+A sudden drop to 0 msg/s indicates motors powered down, a CAN chain break, or the USB adapter losing contact.
 
 ---
 
@@ -88,7 +85,6 @@ Each event records:
 - **Interface:** which bus (e.g., `can_left_leg`)
 - **Timestamp:** ISO 8601 UTC
 - **Event:** `down` or `up`
-- **rx_errors / tx_errors:** the error counters at the time of the state change
 
 The drop log is in-memory and resets when the backend restarts. It is intended for diagnosing intermittent USB cable problems and CAN chain reliability issues during a session.
 
@@ -121,4 +117,4 @@ If a motor shows up in the traffic table with a different ID than expected (e.g.
 
 ### Random garbage error values in motor tab (historical)
 
-This was caused by the SDO race condition where two concurrent SDO reads to the same motor consumed each other's responses. It has been fixed with per-device asyncio locks. If you see this symptom on a build from before May 2026, upgrade to the current version.
+This was caused by the SDO race condition where two concurrent SDO reads to the same motor consumed each other's responses. It has been fixed in the C++ daemon using per-motor mutex/condition-variable mailboxes. If you see this symptom, upgrade to the current version.

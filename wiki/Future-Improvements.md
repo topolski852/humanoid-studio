@@ -40,8 +40,32 @@ if (config->magic != 0xDEAD6431) {
 
 ## Daemon / CAN Protocol
 
-*(No pending items at this time.)*
+### Position limits coordinate frame bug in apply_config
+
+**Priority:** Medium  
+**Effort:** Small (2 lines in `actuator.cpp`)
+
+**Current behavior:** `configs/humanoid_lite.json` stores `position_limits` in the display frame (degrees converted to radians, zero-referenced to the calibrated joint zero). `apply_config` writes `position_limit_lower` and `position_limit_upper` directly to the firmware via SDO. The firmware's position controller operates in its internal frame (`display_position + position_offset`). For joints with a non-zero `position_offset`, the applied limits are `position_offset` radians too strict: a joint with `position_offset = 0.375 rad` and `max = 1.57 rad` has its firmware upper limit set to 1.57 rad instead of the correct 1.945 rad.
+
+**Proposed fix:** In `actuator.cpp` `apply_config`, add `position_offset` to each limit before the SDO write:
+```cpp
+sdo_write_f32(bus, PARAM_POSITION_LIMIT_LOWER, cfg_.position_limits.min + cfg_.position_offset, ...);
+sdo_write_f32(bus, PARAM_POSITION_LIMIT_UPPER, cfg_.position_limits.max + cfg_.position_offset, ...);
+```
 
 ---
 
-*Last updated: 2026-05-27*
+## Flash Wizard / Frontend
+
+### FlashWizard errors silently swallowed
+
+**Priority:** Low  
+**Effort:** Small
+
+**Current behavior:** `FlashWizard.jsx` `handleCanConnected` and `handleConfirm` catch errors with `console.error` only. If the underlying daemon call fails (e.g., CAN socket timeout during the post-flash parameter write), the user sees no error message in the UI — the wizard appears to stall silently.
+
+**Proposed fix:** Route these errors through the wizard's existing log panel (`addLogEntry`) so the user sees the failure reason and can retry or abort.
+
+---
+
+*Last updated: 2026-06-16*

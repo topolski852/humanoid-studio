@@ -1,6 +1,6 @@
 # CAN Bus Architecture
 
-This page is a technical reference for the CAN communication layer. It covers the network topology, the Recoil protocol frame formats, and important implementation details in the Python library.
+This page is a technical reference for the CAN communication layer. It covers the network topology, the Recoil protocol frame formats, and important implementation details in the C++ daemon and Python bridge.
 
 ---
 
@@ -104,13 +104,21 @@ Request:
   data[1:3]:  uint16 little-endian  parameter_id
   data[3:7]:  0x00 0x00 0x00 0x00
 
-Response (TX_SDO):
+Response (TX_SDO) — current firmware (8-byte):
+  CAN ID: (0xB << 7) | node_id
+  DLC: 8
+  data[0]:    0x43  (SDO_READ_RESP)
+  data[1:3]:  uint16 little-endian  parameter_id (echo of the requested param)
+  data[3]:    0x00
+  data[4:8]:  4 raw bytes (interpret as float32 or uint32 or int32)
+
+Response (TX_SDO) — legacy firmware (4-byte, fallback):
   CAN ID: (0xB << 7) | node_id
   DLC: 4
-  data[0:4]:  4 raw bytes (interpret as float32 or uint32 or int32)
+  data[0:4]:  4 raw bytes only, no parameter_id echo
 ```
 
-The firmware SDO response contains only the 4 raw bytes of the value — there is no echo of the parameter ID in the response. This has important concurrency implications; see the SDO Race Condition section below.
+Current firmware echoes the parameter ID in the response, eliminating the race condition described below. The daemon handles both formats — 8-byte responses are matched by param_id; 4-byte responses rely on the mutex/condition-variable mailbox to ensure only one SDO transaction is in flight per motor at a time.
 
 ### Data encoding
 
@@ -150,9 +158,9 @@ data[0]: 0x01 = store MotorController struct to Flash page 63
 
 The firmware has a safety watchdog timer with a default timeout of 1000 ms. If no PDO2 command or HEARTBEAT frame is received within the timeout window, the firmware transitions the motor to DAMPING mode and sets the `WATCHDOG_TIMEOUT` error bit.
 
-In Humanoid Studio, the backend feeds the watchdog automatically at 5 Hz (every 200 ms) via a background asyncio task. This runs regardless of whether any WebSocket client is connected. You do not need to send continuous position commands to keep the motors alive.
+In Humanoid Studio, the **C++ daemon** feeds the watchdog from its 200 Hz control loop — it sends HEARTBEAT frames to all IDLE joints every 200 ms (5 Hz), and PDO2 position commands to all ENABLED joints at 200 Hz. This is independent of the Python backend, WebSocket clients, or any asyncio scheduling. Python has no watchdog responsibility.
 
-If you stop the backend process (Ctrl+C or crash), the watchdog will fire approximately 1 second later and all motors will enter DAMPING mode. This is intentional safety behavior.
+If you stop the **daemon** process, the watchdog will fire approximately 1 second later and all motors will enter DAMPING mode. Stopping the Python backend alone does not trigger the watchdog — the daemon continues running.
 
 ---
 
@@ -170,19 +178,13 @@ The firmware SDO response frame (`TX_SDO`, func_code 0xB) contains only 4 raw by
 
 ### The fix
 
-Each `CANBus` instance maintains a dictionary of per-device asyncio locks:
+The C++ daemon's `actuator.cpp` uses a mutex and condition variable to serialize SDO transactions per motor:
 
-```python
-self._device_sdo_locks: dict[int, asyncio.Lock] = {}
+```cpp
+std::mutex      sdo_ack_mutex_;
+std::condition_variable sdo_ack_cv_;
 ```
 
-Before any SDO read or write, the code acquires the lock for that device ID. This guarantees only one SDO transaction is in flight per motor at a time, regardless of how many coroutines are trying to communicate with it.
+Before transmitting an SDO read, the daemon sets a pending flag and waits on `sdo_ack_cv_` with a timeout. When the CAN reader thread receives a TX_SDO response for this motor, it stores the value and notifies the CV. Only one SDO transaction is in flight per motor at a time — the control loop processes them sequentially per actuator tick.
 
-```python
-async def _sdo_read(self, device_id: int, param_id: int, timeout: float) -> bytes | None:
-    async with self._sdo_lock(device_id):
-        # register waiter, transmit request, await response
-        ...
-```
-
-The lock is not needed for TX_PDO4 frames because autonomous broadcasts use func_code 0x9 (TRANSMIT_PDO4), which does not match the TRANSMIT_SDO (0xB) waiter — they are different CAN IDs and the dispatcher never confuses them.
+With current firmware (8-byte responses that echo the parameter_id), the daemon additionally validates that the incoming param_id matches what was requested, catching any stale or misrouted responses before they reach the caller.

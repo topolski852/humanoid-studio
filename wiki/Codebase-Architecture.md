@@ -164,7 +164,8 @@ Humanoid Studio runs as three cooperating processes:
 5. Window opens
 
 **UDP ports:**
-- **9001**: Python → daemon commands (JSON request/response)
+- **9001**: Python → daemon commands (JSON request/response); handled by the main UDP command thread; can be blocked by long operations like `apply_config`
+- **9002**: Python → daemon priority E-Stop (ESTOP command only); handled by a dedicated lightweight thread that is never blocked by port 9001 operations; guaranteed delivery within one control tick (5 ms)
 - **9000**: daemon → Python telemetry push (10 Hz default, max 100 Hz)
 
 ---
@@ -228,16 +229,18 @@ Python's GIL and asyncio cannot guarantee < 1 ms CAN frame latency at 200 Hz acr
 ### Threading model
 
 ```
-Main thread           — config load, signal handling, graceful shutdown
-Control loop (200 Hz) — drain Rx rings, tick all actuators, watchdog feed, telemetry snapshot
+Main thread             — config load, signal handling, graceful shutdown
+Control loop (200 Hz)   — drain Rx rings, tick all actuators, watchdog feed, telemetry snapshot
   CPU 0, SCHED_FIFO prio 80
-Reader threads (×4)   — one per CAN bus; epoll → SPSC ring buffer
+Reader threads (×4)     — one per CAN bus; epoll → SPSC ring buffer
   CPU 0, SCHED_FIFO prio 70
-Tx threads (×4)       — drain Tx deque via ::write(); retry on ENOBUFS
+Tx threads (×4)         — drain Tx deque via ::write(); retry on ENOBUFS
   CPU 0, SCHED_FIFO prio 75
-UDP command thread    — UdpServer on 9001; parse JSON; dispatch Robot methods directly
+UDP command thread      — UdpServer on 9001; parse JSON; dispatch Robot methods directly
   SCHED_OTHER
-UDP telemetry thread  — UdpBroadcaster; read snapshot; push JSON to 9000 at configured Hz
+UDP priority thread     — UdpServer on 9002; ESTOP only; sets estop_pending_ atomic flag;
+  SCHED_OTHER             control loop checks this flag at the very first line of each tick
+UDP telemetry thread    — UdpBroadcaster; read snapshot; push JSON to 9000 at configured Hz
   SCHED_OTHER
 ```
 
@@ -245,10 +248,14 @@ UDP telemetry thread  — UdpBroadcaster; read snapshot; push JSON to 9000 at co
 
 Each joint has a `JointState` enum: `OFFLINE`, `IDLE`, `ENABLED`, `CALIBRATING`, `FAULT`.
 
-- `OFFLINE` → `IDLE`: HEARTBEAT received from device (device is alive)
-- `IDLE` → `ENABLED`: user `SET_MODE POSITION/TORQUE/VELOCITY` command
+- `OFFLINE` → `IDLE`: first PDO4 or HEARTBEAT received (device is alive); daemon immediately sends NMT IDLE to wake firmware from boot-time `MODE_DISABLED`, enabling SDO reads
+- `IDLE` → `ENABLED`: user `SET_MODE POSITION/TORQUE/VELOCITY` command; daemon sends PDO2 with the current hold position **before** NMT POSITION to pre-seed the firmware's `position_target`, eliminating enable-time position jerk
 - `ENABLED` → `FAULT`: EMCY frame received or watchdog timeout
 - `FAULT` → `IDLE`: user `CLEAR_ERROR` + `SET_MODE IDLE` command
+
+**Delta apply_config:** `apply_config` compares each parameter against `last_applied_config_` and skips SDO writes for unchanged values. This reduces bus time from ~135 ms (27 writes) to near-zero on repeat calls. A full write is forced after any OFFLINE → IDLE transition (motor power cycle). The first timeout in a write sequence aborts the remainder (fail-fast), limiting the worst-case block to 500 ms instead of 13.5 s.
+
+**Fast gain write:** The `WRITE_GAINS` daemon command writes only `position_kp`, `position_ki`, and `torque_limit` (3 SDO writes, ~15 ms). The Auto-Tune "Apply Gains" button uses this path instead of a full `apply_config`.
 
 ### Position frame conversion
 
