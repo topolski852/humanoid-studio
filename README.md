@@ -13,7 +13,7 @@ Screenshot placeholder — add a screenshot of the Dashboard here once the robot
 - **Linux** (Ubuntu 22.04 or 24.04 recommended) — required for SocketCAN
 - **Berkeley Humanoid Lite** robot hardware — B-G431B-ESC1 ESCs running Recoil firmware
 - **USB-CAN adapters** — up to 4 (one per limb: left leg, right leg, left arm, right arm)
-- **ST-LINK** — only needed for the Flash Wizard (firmware flashing)
+- **ST-LINK** — only needed for the Flash Wizard; the B-G431B-ESC1 board has an integrated STLINK-V3 so no separate adapter is required
 
 ---
 
