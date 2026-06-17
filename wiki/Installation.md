@@ -1,29 +1,57 @@
 # Installation
 
-This page walks through installing Humanoid Studio from a fresh checkout on Ubuntu. These instructions have been tested on Ubuntu 22.04 and 24.04.
+These instructions have been tested on Ubuntu 22.04 and 24.04.
 
 ---
 
-## Prerequisites
+## Install from release
 
-### Python
+Download the AppImage from the [releases page](https://github.com/topolski852/humanoid-studio/releases/latest). The AppImage bundles the frontend, Python backend, robot config, and C++ daemon binary — no compilation needed.
 
-Python 3.10 or newer is required. Ubuntu 22.04 ships Python 3.10; Ubuntu 24.04 ships Python 3.12. Verify:
+### 1. Install system dependencies
+
+```bash
+sudo apt-get install libfuse2 can-utils iproute2
+```
+
+`libfuse2` is required to run AppImages on Ubuntu 22.04+. `can-utils` and `iproute2` are needed for CAN adapter setup.
+
+For the Flash Wizard (optional — only needed if reflashing ESC firmware):
+
+```bash
+sudo apt-get install gcc-arm-none-eabi make openocd
+```
+
+### 2. Install Python dependencies
+
+```bash
+pip install fastapi "uvicorn[standard]" python-can "pydantic>=2.7" websockets
+```
+
+### 3. Run the AppImage
+
+```bash
+chmod +x "Humanoid Studio-0.1.0.AppImage"
+./"Humanoid Studio-0.1.0.AppImage"
+```
+
+The app will start, automatically spawn the daemon and backend, and open the UI. If you see a `GLIBCXX_3.4.29 not found` error, see [the GLIBCXX error](#the-glibcxx_3429-error) below.
+
+---
+
+## Developer install
+
+Clone the repo and build from source to modify the code, rebuild the daemon, or contribute to the project.
+
+### Prerequisites
+
+**Python** — 3.10 or newer. Ubuntu 22.04 ships Python 3.10; Ubuntu 24.04 ships Python 3.12.
 
 ```bash
 python3 --version
 ```
 
-### Node.js
-
-Node.js 20.x is required. The project was developed with v20.20.2 via nvm. If you are using nvm:
-
-```bash
-export PATH="$HOME/.nvm/versions/node/v20.20.2/bin:$PATH"
-node --version  # should show v20.x.x
-```
-
-If Node.js is not installed:
+**Node.js** — 20.x required. Install via nvm:
 
 ```bash
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
@@ -32,73 +60,48 @@ nvm install 20
 nvm use 20
 ```
 
-### System packages
-
-Install CAN utilities and the sudo tools used by the CAN adapter setup:
+**System packages:**
 
 ```bash
-sudo apt-get install can-utils iproute2
+sudo apt-get install build-essential can-utils iproute2
 ```
 
-Install the C++ build tools for the daemon:
-
-```bash
-sudo apt-get install build-essential
-```
-
-For the Flash Wizard (optional — only needed if reflashing ESC firmware):
+For the Flash Wizard (optional):
 
 ```bash
 sudo apt-get install gcc-arm-none-eabi make openocd
 ```
 
----
-
-## Clone the repository
+### Clone the repository
 
 ```bash
 git clone https://github.com/topolski852/humanoid-studio.git
 cd humanoid-studio
 ```
 
----
-
-## Build the C++ daemon
-
-The daemon is a standalone C++ binary that owns all SocketCAN interfaces. It must be built before running the app.
+### Build the C++ daemon
 
 ```bash
 cd daemon
 make -j$(nproc)
 ```
 
-Expected output ends with:
-```
-g++ ... -o build/humanoid_daemon
-```
-
 The binary is placed at `daemon/build/humanoid_daemon`.
 
-### Real-time scheduling (optional)
-
-The daemon uses SCHED_FIFO for its control loop. On most Linux systems this requires either running as root or setting the `cap_sys_nice` capability on the binary:
+**Real-time scheduling (optional):** The daemon uses SCHED_FIFO for its control loop. Grant the capability without running as root:
 
 ```bash
 sudo setcap cap_sys_nice+ep daemon/build/humanoid_daemon
 ```
 
-Without this, the daemon falls back to SCHED_OTHER, which is sufficient for development but may introduce jitter under system load.
+Without this, the daemon falls back to SCHED_OTHER — sufficient for development but may introduce jitter under load.
 
----
-
-## Install Python dependencies
+### Install Python dependencies
 
 ```bash
 cd backend
 pip install -r requirements.txt
 ```
-
-All five packages are required. `uvicorn[standard]` includes WebSocket support and the uvloop event loop. `python-can` is retained for the Flash Wizard's direct CAN socket access.
 
 Verify:
 
@@ -106,22 +109,16 @@ Verify:
 python3 -c "import fastapi, uvicorn, can, pydantic, websockets; print('OK')"
 ```
 
----
-
-## Install Node dependencies
+### Install Node dependencies
 
 ```bash
 cd ../app
 npm install
 ```
 
-This installs Electron, React, Vite, Tailwind, and all other frontend dependencies into `app/node_modules/`. The install takes 1–2 minutes on first run.
+Takes 1–2 minutes on first run.
 
----
-
-## Run in development mode
-
-Development mode runs the React UI on Vite's dev server (port 5173). The Electron process spawns the daemon and the Python backend automatically.
+### Run in development mode
 
 ```bash
 cd humanoid-studio/app
@@ -138,25 +135,14 @@ Electron starts and:
 Expected backend log:
 ```
 INFO:     Started server process [...]
-INFO:     Waiting for application startup.
 INFO:humanoid.daemon_client:DaemonClient: connected to daemon v1.0
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://localhost:8765 (Press CTRL+C to quit)
 ```
 
-In dev mode, the Chrome DevTools panel opens automatically in a detached window. Close it if you do not need it.
+> **VS Code terminal:** VS Code sets `ELECTRON_RUN_AS_NODE=1`. The `npm run dev` script clears this automatically via `cross-env` — no action needed.
 
-### Launching from a VS Code terminal
-
-VS Code sets `ELECTRON_RUN_AS_NODE=1` in its integrated terminal. The `npm run dev` script includes `ELECTRON_RUN_AS_NODE=` in its `cross-env` call to clear this variable. No action needed — this is already handled.
-
----
-
-## Run in production mode
-
-The production build packages the React app into static files and bundles them inside the Electron AppImage. The backend and daemon are spawned automatically from within the package.
-
-Build:
+### Build the AppImage
 
 ```bash
 cd humanoid-studio/app
@@ -165,47 +151,11 @@ npm run build
 
 Output: `app/release/Humanoid Studio-0.1.0.AppImage`
 
-Run:
+The AppImage bundles the frontend, backend source, config, and daemon binary. Python 3 and the Python packages must still be installed on the host.
 
-```bash
-./release/"Humanoid Studio-0.1.0.AppImage"
-```
+### Verify the installation
 
-The AppImage bundles the frontend assets, Python backend source, robot config (`configs/humanoid_lite.json`), and the compiled C++ daemon binary. Python 3 and the Python packages must still be installed on the host — they are not bundled inside the AppImage.
-
----
-
-## The GLIBCXX_3.4.29 error
-
-On Ubuntu systems where Electron was installed via Snap, you may see:
-
-```
-/snap/core20/current/lib/x86_64-linux-gnu/libstdc++.so.6: version 'GLIBCXX_3.4.29' not found
-```
-
-This is a library version conflict between Snap's older bundled `libstdc++` and the version Electron requires. The fix is to ensure the system's own `libstdc++` is used instead of Snap's:
-
-```bash
-# Find the system libstdc++
-find /usr/lib -name "libstdc++.so.6" 2>/dev/null
-
-# Set LD_LIBRARY_PATH before launching
-export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
-npm run dev
-```
-
-If you installed `node` via Snap instead of nvm, the cleanest fix is to switch to the nvm-managed Node.js installation:
-
-```bash
-nvm install 20
-nvm use 20
-```
-
----
-
-## Verify the installation
-
-With the daemon and backend running, confirm each layer:
+With the app running, confirm each layer from a terminal:
 
 ```bash
 # Daemon is alive
@@ -216,9 +166,6 @@ curl http://localhost:8765/devices
 
 # Config loaded correctly (should show 22 joints)
 curl http://localhost:8765/robot/config | python3 -m json.tool | grep -c '"joint_name"'
-
-# Flash wizard endpoint is alive
-curl http://localhost:8765/flash/status
 ```
 
 For the WebSocket telemetry stream:
@@ -234,3 +181,28 @@ asyncio.run(t())"
 ```
 
 This should print `connected: False` if the robot is not yet connected, or `connected: True` if it is.
+
+---
+
+## The GLIBCXX_3.4.29 error
+
+On Ubuntu systems where Node or Electron was installed via Snap, you may see:
+
+```
+/snap/core20/current/lib/x86_64-linux-gnu/libstdc++.so.6: version 'GLIBCXX_3.4.29' not found
+```
+
+**Fix 1 — use nvm instead of snap node:**
+
+```bash
+nvm install 20
+nvm use 20
+```
+
+**Fix 2 — override LD_LIBRARY_PATH:**
+
+```bash
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+```
+
+Then relaunch the app or run `npm run dev`.
