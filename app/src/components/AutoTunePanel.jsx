@@ -287,6 +287,14 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
   return (
     <div className="flex-1 min-w-0 overflow-y-auto p-3 space-y-4">
 
+      {/* ── Safety warning ───────────────────────────────────────────────── */}
+      <div className="px-3 py-2.5 rounded-lg bg-warn/10 border border-warn/30">
+        <p className="text-xs font-semibold text-warn">⚠ Auto-Tune Safety Warning</p>
+        <p className="text-[10px] text-warn/80 mt-1 leading-relaxed">
+          Gain changes can cause sudden, forceful movement. Keep clear of the joint's range of motion before running a step test or applying new gains. PID suggestions are estimates — verify each change before applying to the full robot.
+        </p>
+      </div>
+
       {/* ── Motor not connected notice ───────────────────────────────────── */}
       {!isConnected && (
         <div className="px-3 py-2.5 rounded-lg bg-surface-2 border border-surface-3">
