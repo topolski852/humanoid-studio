@@ -467,7 +467,14 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
 
               {/* Error display */}
               {startError && (
-                startError.includes('apt install') ? (
+                startError.includes('stlink-firmware-outdated') ? (
+                  <div className="rounded-lg bg-warn/10 border border-warn/20 px-4 py-3 space-y-1.5">
+                    <p className="text-xs text-warn font-medium">ST-LINK firmware is out of date</p>
+                    <p className="text-[11px] text-warn/80 leading-relaxed">
+                      Open STM32CubeIDE and connect the board — it will automatically detect the outdated firmware and offer to update it. Once updated, return here and try again.
+                    </p>
+                  </div>
+                ) : startError.includes('apt install') ? (
                   <div className="rounded-lg bg-warn/10 border border-warn/20 px-4 py-3 space-y-1">
                     <p className="text-xs text-warn font-medium">Missing tools — run in terminal:</p>
                     <code className="block text-xs font-mono text-warn/80 select-all">

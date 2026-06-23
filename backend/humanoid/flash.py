@@ -411,6 +411,10 @@ async def _flash_prebuilt(
     ) or out[-500:]
     log_fn(f"openocd output:\n{_openocd_summary}")
     if rc != 0:
+        out_lower = out.lower()
+        if ("stlink" in out_lower or "st-link" in out_lower) and \
+           any(kw in out_lower for kw in ("outdated", "upgrade", "too old", "does not support")):
+            raise FlashError("stlink-firmware-outdated")
         raise FlashError(f"Flash failed:\n{out[-3000:]}")
     log_fn(f"Flash written and config page verified — device is resetting (will boot at ID {target_device_id}).")
 
