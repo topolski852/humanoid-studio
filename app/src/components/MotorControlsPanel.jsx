@@ -30,9 +30,11 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
   // Sine wave
   const [sineRunning,   setSineRunning]   = useState(false)
   const [sineFreq,      setSineFreq]      = useState(0.5)
-  const [sineAmpDeg,    setSineAmpDeg]    = useState(30)
-  const [sineOffsetDeg, setSineOffsetDeg] = useState(0.0)
+  const [sineAmpDeg,    setSineAmpDeg]    = useState('30')
+  const [sineOffsetDeg, setSineOffsetDeg] = useState('0')
   const sineRef = useRef(null)
+  const sineOffsetNum = parseFloat(sineOffsetDeg) || 0
+  const sineAmpNum    = Math.max(1, parseFloat(sineAmpDeg) || 30)
 
   const minRad = config?.position_limits?.min ?? null
   const maxRad = config?.position_limits?.max ?? null
@@ -107,15 +109,15 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
 
   // ── Sine wave ──────────────────────────────────────────────────────────────
   const sineMaxAmpDeg = minRad != null && maxRad != null
-    ? Math.min(maxDeg - sineOffsetDeg, sineOffsetDeg - minDeg)
+    ? Math.min(maxDeg - sineOffsetNum, sineOffsetNum - minDeg)
     : 180
 
   function startSine() {
     if (sineRef.current) return
     setSineRunning(true)
-    const offsetRad = sineOffsetDeg * DEG
+    const offsetRad = sineOffsetNum * DEG
     sineRef.current = setInterval(() => {
-      const clampedAmp = Math.min(sineAmpDeg, Math.max(0, sineMaxAmpDeg - 0.1))
+      const clampedAmp = Math.min(sineAmpNum, Math.max(0, sineMaxAmpDeg - 0.1))
       const target = offsetRad + Math.sin(2 * Math.PI * sineFreq * (Date.now() / 1000)) * (clampedAmp * DEG)
       const sent = sendPositionCommand(jointName, target)
       if (!sent) api.setPosition(jointName, target).catch(() => {})
@@ -126,7 +128,7 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
     clearInterval(sineRef.current)
     sineRef.current = null
     setSineRunning(false)
-    const offsetRad = sineOffsetDeg * DEG
+    const offsetRad = sineOffsetNum * DEG
     const sent = sendPositionCommand(jointName, offsetRad)
     if (!sent) api.setPosition(jointName, offsetRad).catch(() => {})
   }
@@ -306,10 +308,11 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
           <div className="flex items-center gap-3">
             <span className="text-[10px] text-gray-500 w-16 shrink-0">Center</span>
             <input
-              type="number"
-              step={1}
+              type="text"
+              inputMode="decimal"
               value={sineOffsetDeg}
-              onChange={(e) => setSineOffsetDeg(parseFloat(e.target.value) || 0)}
+              onChange={(e) => setSineOffsetDeg(e.target.value)}
+              onBlur={(e) => { const n = parseFloat(e.target.value); if (!isNaN(n)) setSineOffsetDeg(String(n)) }}
               disabled={sineRunning}
               className="flex-1 bg-surface-2 border border-surface-3 rounded px-2 py-1 text-xs font-mono text-center disabled:opacity-40"
             />
@@ -330,17 +333,18 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
           <div className="flex items-center gap-3">
             <span className="text-[10px] text-gray-500 w-16 shrink-0">Amplitude</span>
             <input
-              type="number"
-              min={1} max={180} step={1}
+              type="text"
+              inputMode="decimal"
               value={sineAmpDeg}
-              onChange={(e) => setSineAmpDeg(Math.max(1, Math.min(180, parseInt(e.target.value) || 1)))}
+              onChange={(e) => setSineAmpDeg(e.target.value)}
+              onBlur={(e) => { const n = parseFloat(e.target.value); if (!isNaN(n)) setSineAmpDeg(String(Math.max(1, Math.min(180, n)))) }}
               disabled={sineRunning}
               className="flex-1 bg-surface-2 border border-surface-3 rounded px-2 py-1 text-xs font-mono text-center disabled:opacity-40"
             />
             <span className="font-mono text-xs text-gray-300 w-12 text-right">° pk</span>
           </div>
         </div>
-        {sineAmpDeg > sineMaxAmpDeg && (
+        {sineAmpNum > sineMaxAmpDeg && (
           <p className="text-[10px] text-amber-400 mb-2">
             Exceeds joint limits at this center — max safe amplitude: {Math.max(0, sineMaxAmpDeg).toFixed(0)}°
           </p>

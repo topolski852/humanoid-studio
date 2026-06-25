@@ -152,6 +152,20 @@ class JointConfig(BaseModel):
     watchdog_timeout: int = 1000          # ms
     fast_frame_frequency: int = 0         # Hz; 0 = disabled
 
+    @field_validator('watchdog_timeout', 'fast_frame_frequency', 'pole_pairs', 'cpr', mode='before')
+    @classmethod
+    def _coerce_int_fields(cls, v: Any) -> Any:
+        # Device READ_CONFIG returns integer SDO params as their f32 bit-patterns
+        # (e.g. 1000 ms stored as firmware ticks → tiny denormalized float).
+        # Accept ints directly; round floats only if they're exact integers.
+        if isinstance(v, float):
+            rounded = round(v)
+            if abs(v - rounded) < 1e-6:
+                return rounded
+            # Non-integer float — return 0 rather than crashing the whole config load.
+            return 0
+        return v
+
     # ------------------------------------------------------------------
     # Derived properties (not persisted)
     # ------------------------------------------------------------------

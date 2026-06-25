@@ -49,6 +49,24 @@ async def run_step_test(
             f"(current mode 0x{state.mode:02X})"
         )
 
+    # Clip step range to stay within position limits so the motor doesn't
+    # oscillate against a hard limit during the test.
+    lim = actuator.config.position_limits
+    lim_lo = lim.lower_bound
+    lim_hi = lim.upper_bound
+    margin = 0.02  # 2 rad safety margin from soft limits
+    pos_a = max(center_rad - offset_rad, lim_lo + margin)
+    pos_b = min(center_rad + offset_rad, lim_hi - margin)
+    if pos_b - pos_a < 0.08:
+        raise ValueError(
+            f"Step range [{pos_a:.3f}, {pos_b:.3f}] rad is too small after clipping to "
+            f"position limits [{lim_lo:.3f}, {lim_hi:.3f}]. "
+            f"Move the motor closer to the center of its range before tuning."
+        )
+    # Recompute symmetric offset from clipped range.
+    center_rad = (pos_a + pos_b) / 2.0
+    offset_rad = (pos_b - pos_a) / 2.0
+
     # Write test gains via SDO before motion starts.
     for param, value in [
         (_PARAM_POSITION_KP,  position_kp),
@@ -56,9 +74,6 @@ async def run_step_test(
         (_PARAM_TORQUE_LIMIT, torque_limit),
     ]:
         await actuator.sdo_write_f32(param, value)
-
-    pos_a = center_rad - offset_rad
-    pos_b = center_rad + offset_rad
 
     # Pre-settle at pos_a before sampling starts.
     await actuator.set_position(pos_a)
@@ -110,9 +125,16 @@ def _compute_metrics(
         "max_torque_nm": 0.0,
         "torque_saturated": False,
         "max_current_a": 0.0,
+        "no_motion_detected": False,
     }
     if not samples:
         return empty
+
+    # Check whether the motor moved at all across the entire test.
+    all_positions = [s["position"] for s in samples if s.get("position") is not None]
+    motion_range = (max(all_positions) - min(all_positions)) if len(all_positions) >= 2 else 0.0
+    # Flag as no-motion if range is < 15% of the expected step size (2 × offset).
+    no_motion_detected = motion_range < offset_rad * 0.30
 
     steps: dict[int, list[dict]] = {}
     for s in samples:
@@ -133,6 +155,12 @@ def _compute_metrics(
         going_up = (step_idx % 2 == 0)   # step_idx 0 → pos_b (up); 1 → pos_a (down)
         t0_ms    = step_samples[0]["t_ms"]
         last_outside_idx = None
+
+        # Detect degenerate steps where the motor was already at the target at t=0
+        # (i.e. it never had to travel there). These can arise when the motor is stuck
+        # and alternating steps happen to land on the motor's frozen position.
+        first_pos = next((s["position"] for s in step_samples if s.get("position") is not None), None)
+        pre_settled = first_pos is not None and abs(first_pos - target) <= threshold
 
         for i, s in enumerate(step_samples):
             pos = s.get("position")
@@ -159,17 +187,24 @@ def _compute_metrics(
                 max_current_a = max(max_current_a, abs(current))
 
         # Settling time = time after which the motor stays continuously in the ±2% band.
-        # Using the last-exit-from-band approach avoids falsely short times for oscillatory responses.
-        if last_outside_idx is None:
+        dwell_ms = float(step_samples[-1]["t_ms"] - t0_ms) if len(step_samples) > 1 else 0.0
+        if pre_settled:
+            # Motor was already at the target — not meaningful settling; skip this step.
+            pass
+        elif last_outside_idx is None:
+            # Every sample was within the band from the start (genuine fast settling).
             settling_times.append(0.0)
         elif last_outside_idx < len(step_samples) - 1:
             settling_times.append(float(step_samples[last_outside_idx + 1]["t_ms"] - t0_ms))
-        # else: still outside band at last sample — never settled; omit from settling_times
+        else:
+            # Never settled within the dwell period — count as dwell_ms so the average
+            # reflects the failure rather than silently omitting this step.
+            settling_times.append(dwell_ms)
 
         # Steady-state error: mean over the last 20% of dwell samples.
         n_tail     = max(1, len(step_samples) // 5)
         valid_tail = [s for s in step_samples[-n_tail:] if s.get("position") is not None]
-        if valid_tail:
+        if valid_tail and not pre_settled:
             ss_errors.append(
                 sum(abs(s["position"] - target) for s in valid_tail) / len(valid_tail)
             )
@@ -182,4 +217,5 @@ def _compute_metrics(
         "max_torque_nm":    round(max_torque_nm, 3),
         "torque_saturated": torque_saturated,
         "max_current_a":    round(max_current_a, 3),
+        "no_motion_detected": no_motion_detected,
     }

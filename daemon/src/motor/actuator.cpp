@@ -49,8 +49,8 @@ void Actuator::on_rx_frame(const can_frame& frame) {
         float vel      = get_f32(frame.data + 4);
         state_.position = wire_pos;  // firmware already subtracts position_offset in getPositionMeasured()
         state_.velocity = vel;
-        state_.updated_at = Clock::now();
-        last_pdo4_received_ = Clock::now();
+        state_.updated_at    = Clock::now();
+        last_alive_received_ = Clock::now();
 
         // Seeing PDO4 means the device is alive — advance from OFFLINE.
         if (state_.joint_state == JointState::OFFLINE) {
@@ -70,7 +70,8 @@ void Actuator::on_rx_frame(const can_frame& frame) {
             memcpy(&err, frame.data + 1, 4);
             state_.error = err;
         }
-        state_.updated_at = Clock::now();
+        state_.updated_at    = Clock::now();
+        last_alive_received_ = Clock::now();
 
         // Device is alive.
         if (state_.joint_state == JointState::OFFLINE) {
@@ -99,11 +100,18 @@ void Actuator::on_rx_frame(const can_frame& frame) {
             state_.joint_state = JointState::FAULT;
         }
 
+    } else if (func == static_cast<int>(FuncCode::FUNC_TRANSMIT_PDO_2)) {
+        // PDO2 feedback — unambiguous arb_id, raw [pos f32, vel f32] (firmware v3.0.7+).
+        if (frame.can_dlc < 8) return;
+        state_.position   = get_f32(frame.data);
+        state_.velocity   = get_f32(frame.data + 4);
+        state_.updated_at = Clock::now();
+
     } else if (func == static_cast<int>(FuncCode::FUNC_TRANSMIT_SDO)) {  // NOLINT
-        // All three response types are DLC=8 (standard CANopen):
-        //   byte0 = 0x60 (SDO_WRITE_ACK)  → write ACK    (bytes 1-2: param_id; bytes 4-7: zeros)
-        //   byte0 = 0x43 (SDO_READ_RESP)  → read response (bytes 1-2: param_id; bytes 4-7: value)
-        //   other byte0                   → PDO2 feedback (bytes 0-3: pos float; bytes 4-7: vel)
+        // Firmware v3.0.6 and earlier send PDO2 feedback on this arb_id by mistake.
+        // byte0 = 0x60 (SDO_WRITE_ACK)  → write ACK    (bytes 1-2: param_id; bytes 4-7: zeros)
+        // byte0 = 0x43 (SDO_READ_RESP)  → read response (bytes 1-2: param_id; bytes 4-7: value)
+        // other byte0                   → PDO2 feedback (legacy; use FUNC_TRANSMIT_PDO_2 in v3.0.7+)
         if (frame.can_dlc < 8) return;
 
         if (frame.data[0] == SDO_WRITE_ACK) {
@@ -193,6 +201,23 @@ void Actuator::tick(CanBusManager& bus) {
         bus.send(cfg_.can_channel, wake);
     }
 
+    // Mark motor OFFLINE if no CAN frame (PDO4 or heartbeat) has arrived in 1500 ms.
+    // 1500 ms = ~98 missed PDO4 frames at 65 Hz, or 3 missed heartbeats at 2 Hz.
+    // Using last_alive_received_ (updated by both PDO4 and heartbeat) keeps motors
+    // that have no PDO4 (e.g. FAST_FRAME_FREQUENCY=0 during commissioning) from
+    // oscillating OFFLINE→IDLE→OFFLINE every 500 ms.
+    {
+        std::lock_guard<std::mutex> lk(state_mutex_);
+        if (state_.joint_state != JointState::OFFLINE) {
+            auto stale_ms = std::chrono::duration_cast<ms>(
+                Clock::now() - last_alive_received_).count();
+            if (stale_ms > 1500) {
+                state_.joint_state = JointState::OFFLINE;
+                last_applied_config_ = std::nullopt;  // force full reconfigure on reconnect
+            }
+        }
+    }
+
     // Apply any pending state change request from the UDP command queue.
     JointState current_state;
     {
@@ -266,28 +291,18 @@ void Actuator::tick(CanBusManager& bus) {
         }
     }
 
-    auto now = Clock::now();
-
     if (current_state == JointState::ENABLED) {
         float target;
         { std::lock_guard<std::mutex> lk(cmd_mutex_); target = position_target_; }
         send_pdo2(bus, target);
 
-    } else if (current_state == JointState::IDLE) {
-        // Feed watchdog via HEARTBEAT every 200 ms.
-        auto elapsed = std::chrono::duration_cast<ms>(now - last_heartbeat_sent_);
-        if (elapsed.count() >= 200) {
-            can_frame hb{};
-            hb.can_id  = make_arb_id(
-                static_cast<uint8_t>(FuncCode::FUNC_HEARTBEAT),
-                static_cast<uint8_t>(cfg_.device_id));
-            hb.can_dlc = 8;
-            memset(hb.data, 0, 8);
-            bus.send(cfg_.can_channel, hb);
-            last_heartbeat_sent_ = now;
-        }
     }
-    // OFFLINE, CALIBRATING, FAULT: no outbound frames from tick().
+    // IDLE, OFFLINE, CALIBRATING, FAULT: no outbound frames from tick().
+    // NOTE: Do NOT send FUNC_HEARTBEAT (0x700+device_id) to IDLE motors.
+    // That arb_id is used by the motor itself to BROADCAST its heartbeat.
+    // Sending on the same arb_id from the host causes CAN bus collisions that
+    // accumulate error counts on both sides and can corrupt adjacent SDO frames.
+    // The firmware watchdog does not fire in IDLE mode, so no feed is needed.
 
     // Slow-poll telemetry via SDO reads (~3 Hz per field at 200 Hz / 60 ticks).
     // Skipped when slow_poll_enabled_ is false (e.g. during Flash Wizard commissioning)
@@ -324,7 +339,10 @@ void Actuator::set_position_target(float pos_rad) {
     position_target_ = pos_rad;
 }
 
-void Actuator::clear_fault() {
+void Actuator::clear_fault(CanBusManager& bus) {
+    using P = ParamId;
+    // Zero the error register on the hardware so slow-poll reads don't re-surface the fault.
+    sdo_write_u32(bus, static_cast<uint16_t>(P::PARAM_ERROR), 0, 200);
     {
         std::lock_guard<std::mutex> lk(state_mutex_);
         state_.error       = 0;
@@ -432,6 +450,15 @@ bool Actuator::apply_config(CanBusManager& bus, int timeout_ms) {
     const JointConfig& c = cfg_;
     const JointConfig* prev = last_applied_config_.has_value() ? &(*last_applied_config_) : nullptr;
 
+    // Limits are stored in display frame (user-facing rad) but the firmware compares them
+    // against position_target = (display_command + position_offset), i.e. the internal frame.
+    // Adjust by adding position_offset so the firmware's clamp operates in the correct frame.
+    // Pre-compute offset-adjusted values and previous-run equivalents for correct delta detection.
+    const float lim_min_adj  = c.position_limit_min + c.position_offset;
+    const float lim_max_adj  = c.position_limit_max + c.position_offset;
+    const float prev_lim_min = prev ? (prev->position_limit_min + prev->position_offset) : 0.0f;
+    const float prev_lim_max = prev ? (prev->position_limit_max + prev->position_offset) : 0.0f;
+
     struct F32Entry { uint16_t param; float val; const float* prev_val; };
     const F32Entry f32[] = {
         {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_GEAR_RATIO),            c.gear_ratio,               prev ? &prev->gear_ratio               : nullptr},
@@ -441,8 +468,8 @@ bool Actuator::apply_config(CanBusManager& bus, int timeout_ms) {
         {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_KI),           c.velocity_ki,              prev ? &prev->velocity_ki              : nullptr},
         {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_LIMIT),          c.torque_limit,             prev ? &prev->torque_limit             : nullptr},
         {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_LIMIT),        c.velocity_limit,           prev ? &prev->velocity_limit           : nullptr},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_LOWER),  c.position_limit_min,       prev ? &prev->position_limit_min       : nullptr},
-        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_UPPER),  c.position_limit_max,       prev ? &prev->position_limit_max       : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_LOWER),  lim_min_adj,                prev ? &prev_lim_min                   : nullptr},
+        {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_LIMIT_UPPER),  lim_max_adj,                prev ? &prev_lim_max                   : nullptr},
         {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_OFFSET),       c.position_offset,          prev ? &prev->position_offset          : nullptr},
         {static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_FILTER_ALPHA),   c.torque_filter_alpha,      prev ? &prev->torque_filter_alpha      : nullptr},
         {static_cast<uint16_t>(P::PARAM_CURRENT_CONTROLLER_I_LIMIT),                c.current_limit,            prev ? &prev->current_limit            : nullptr},

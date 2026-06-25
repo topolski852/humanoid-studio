@@ -340,7 +340,7 @@ std::string Robot::handle_command(const std::string& request) {
         std::string name = req.value("joint_name", "");
         auto it = actuator_by_name_.find(name);
         if (it == actuator_by_name_.end()) return error("unknown joint: " + name);
-        it->second->clear_fault();
+        it->second->clear_fault(*bus_mgr_);
         return ack();
     }
 
@@ -425,6 +425,7 @@ std::string Robot::handle_command(const std::string& request) {
             {"electrical_offset",        static_cast<uint16_t>(P::PARAM_ENCODER_FLUX_OFFSET)},
             {"fast_frame_frequency",     static_cast<uint16_t>(P::PARAM_FAST_FRAME_FREQUENCY)},
             {"watchdog_timeout",         static_cast<uint16_t>(P::PARAM_WATCHDOG_TIMEOUT)},
+            {"max_calibration_current",  static_cast<uint16_t>(P::PARAM_MOTOR_MAX_CALIBRATION_CURRENT)},
         };
 
         nlohmann::json cfg_j;
@@ -511,9 +512,6 @@ std::string Robot::handle_command(const std::string& request) {
         if (device_id < 0 || device_id > 127 || param_id < 0)
             return error("invalid device_id or param_id");
 
-        auto fut = generic_listener_.expect_once(channel,
-            static_cast<uint8_t>(device_id), FUNC_TRANSMIT_SDO);
-
         can_frame f{};
         f.can_id  = make_arb_id(FUNC_RECEIVE_SDO, static_cast<uint8_t>(device_id));
         f.can_dlc = 8;
@@ -521,15 +519,57 @@ std::string Robot::handle_command(const std::string& request) {
         f.data[1] = static_cast<uint8_t>(param_id & 0xFF);
         f.data[2] = static_cast<uint8_t>((param_id >> 8) & 0xFF);
         std::memset(f.data + 3, 0, 5);
-        bus_mgr_->send(channel, f);
 
-        auto stat = fut.wait_for(ms(timeout_ms));
-        if (stat != std::future_status::ready) {
-            generic_listener_.cancel_stale(channel,
+        // Diagnostic sniff: captures every FUNC_TRANSMIT_SDO from this device across
+        // all retry attempts. If one-shots all time out but sniff is non-empty, frames
+        // arrived but the dispatcher didn't fire (bug). If sniff is empty, no response
+        // reached the host at all (TX loss or ESC not responding).
+        uint64_t sniff_id = generic_listener_.begin_sniff(
+            channel, static_cast<uint8_t>(device_id), FUNC_TRANSMIT_SDO);
+
+        static constexpr int MAX_SDO_ATTEMPTS = 3;
+        // Divide per-attempt budget so total time ≤ timeout_ms + 100 ms (fits the
+        // Python socket timeout of timeout + 1.0 s).
+        const int per_attempt_ms = std::max(100, timeout_ms / MAX_SDO_ATTEMPTS);
+        can_frame rx{};
+        bool rx_ok = false;
+
+        for (int attempt = 0; attempt < MAX_SDO_ATTEMPTS && !rx_ok; ++attempt) {
+            if (attempt > 0) std::this_thread::sleep_for(ms(50));
+
+            auto fut = generic_listener_.expect_once(channel,
                 static_cast<uint8_t>(device_id), FUNC_TRANSMIT_SDO);
+            bus_mgr_->send(channel, f);
+
+            if (fut.wait_for(ms(per_attempt_ms)) == std::future_status::ready) {
+                rx    = fut.get();
+                rx_ok = true;
+            } else {
+                generic_listener_.cancel_stale(channel,
+                    static_cast<uint8_t>(device_id), FUNC_TRANSMIT_SDO);
+                fprintf(stderr,
+                    "[GENERIC_SDO_READ] attempt %d/%d TIMEOUT: device=%d channel=%s "
+                    "param=0x%04X arb_tx=0x%03X arb_rx=0x%03X per_attempt=%dms\n",
+                    attempt + 1, MAX_SDO_ATTEMPTS, device_id, channel.c_str(), param_id,
+                    (FUNC_RECEIVE_SDO << 7) | device_id,
+                    (FUNC_TRANSMIT_SDO << 7) | device_id,
+                    per_attempt_ms);
+            }
+        }
+
+        auto sniff_frames = generic_listener_.end_sniff(sniff_id);
+
+        if (!rx_ok) {
+            const char* diag = sniff_frames.empty()
+                ? "no FUNC_TRANSMIT_SDO frames seen on bus — TX loss or ESC not responding"
+                : "SDO response frames arrived but one-shot was not fulfilled — dispatcher bug";
+            fprintf(stderr,
+                "[GENERIC_SDO_READ] FAILED after %d attempts: device=%d channel=%s "
+                "param=0x%04X — %s (sniff captured %zu frames)\n",
+                MAX_SDO_ATTEMPTS, device_id, channel.c_str(), param_id,
+                diag, sniff_frames.size());
             return json{{"type","SDO_READ_RESULT"},{"id",id},{"status","TIMEOUT"}}.dump();
         }
-        can_frame rx = fut.get();
 
         // Production firmware: 8-byte response, value at bytes 4-7.
         // Commissioning ELF v3.0.0: 4-byte response, value at bytes 0-3.
@@ -655,10 +695,16 @@ std::string Robot::handle_command(const std::string& request) {
         if (device_id < 0 || device_id > 127)
             return error("invalid device_id");
 
+        // Send NMT IDLE instead of FUNC_HEARTBEAT.
+        // FUNC_HEARTBEAT (0x700+id) is the motor's OWN outgoing arb_id — sending on it
+        // from the host causes bus collisions.  NMT uses 0x000+id, which is safe.
+        // The firmware's watchdog only fires in motion modes (not IDLE/DAMPING/DISABLED),
+        // so a true watchdog feed is unnecessary here; NMT IDLE keeps the motor responsive.
         can_frame f{};
-        f.can_id  = make_arb_id(FUNC_HEARTBEAT, static_cast<uint8_t>(device_id));
-        f.can_dlc = 8;
-        std::memset(f.data, 0, 8);
+        f.can_id  = make_arb_id(FUNC_NMT, static_cast<uint8_t>(device_id));
+        f.can_dlc = 2;
+        f.data[0] = static_cast<uint8_t>(MotorMode::MODE_IDLE);
+        f.data[1] = static_cast<uint8_t>(device_id);
         bus_mgr_->send(channel, f);
         return ack();
     }
@@ -720,7 +766,13 @@ std::string Robot::handle_command(const std::string& request) {
         }
 
         // Phase 2: Wait for calibration to complete — motor returns to IDLE or DISABLED.
-        auto deadline = Clock::now() + ms(timeout_ms);
+        // The motor's main loop is blocked inside calibration (~15 s) and sends no
+        // heartbeats during that time.  After calibration it resumes heartbeats every
+        // ~500 ms.  As a safety net, once the expected calibration window has passed
+        // (~20 s) we send NMT IDLE every second to provoke a heartbeat ACK so Phase 2
+        // doesn't rely purely on autonomous heartbeats.
+        auto deadline   = Clock::now() + ms(timeout_ms);
+        auto cal_expected_done = Clock::now() + ms(20000);
         while (Clock::now() < deadline) {
             int remaining = static_cast<int>(
                 std::chrono::duration_cast<ms>(deadline - Clock::now()).count());
@@ -728,11 +780,21 @@ std::string Robot::handle_command(const std::string& request) {
 
             auto fut = generic_listener_.expect_once(channel,
                 static_cast<uint8_t>(device_id), FUNC_HEARTBEAT);
-            auto stat = fut.wait_for(ms(std::min(remaining, 2000)));
+            auto stat = fut.wait_for(ms(std::min(remaining, 1000)));
 
             if (stat != std::future_status::ready) {
                 generic_listener_.cancel_stale(channel,
                     static_cast<uint8_t>(device_id), FUNC_HEARTBEAT);
+                // Past the expected calibration window — nudge the motor with NMT IDLE
+                // to provoke a heartbeat ACK revealing its current mode.
+                if (Clock::now() > cal_expected_done) {
+                    can_frame nmt_idle{};
+                    nmt_idle.can_id  = make_arb_id(FUNC_NMT, static_cast<uint8_t>(device_id));
+                    nmt_idle.can_dlc = 2;
+                    nmt_idle.data[0] = MODE_IDLE;
+                    nmt_idle.data[1] = static_cast<uint8_t>(device_id);
+                    bus_mgr_->send(channel, nmt_idle);
+                }
                 continue;
             }
 

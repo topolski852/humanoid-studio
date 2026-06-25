@@ -70,7 +70,8 @@ public:
     void set_position_target(float pos_rad);
 
     // Clear fault and return to IDLE.
-    void clear_fault();
+    // Sends SDO write to zero the error register on the hardware, then clears local state.
+    void clear_fault(CanBusManager& bus);
 
     // Enable or disable slow-poll SDO telemetry reads.
     // Disable during Flash Wizard commissioning to avoid generic_listener_ interference.
@@ -119,8 +120,7 @@ private:
     bool          state_change_pending_ = false;
     float         position_target_   = 0.0f;   // display-frame
 
-    std::chrono::steady_clock::time_point last_heartbeat_sent_{};
-    std::chrono::steady_clock::time_point last_pdo4_received_{};
+    std::chrono::steady_clock::time_point last_alive_received_{};
 
     // Set when a motor first transitions OFFLINE → IDLE (first PDO4/heartbeat received).
     // Cleared on the next tick() by sending NMT IDLE, waking firmware from boot-time

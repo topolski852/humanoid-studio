@@ -7,7 +7,12 @@
 
 using json = nlohmann::json;
 
-static float limit_or_sentinel(const json& val) {
+// min null → -NO_LIMIT_RAD, max null → +NO_LIMIT_RAD, matching Python's lower_bound/upper_bound.
+static float limit_or_sentinel_min(const json& val) {
+    if (val.is_null()) return -NO_LIMIT_RAD;
+    return val.get<float>();
+}
+static float limit_or_sentinel_max(const json& val) {
     if (val.is_null()) return NO_LIMIT_RAD;
     return val.get<float>();
 }
@@ -50,8 +55,8 @@ RobotConfig load_config(const std::string& path) {
         jc.gear_ratio                = j.at("gear_ratio").get<float>();
 
         const json& lim = j.at("position_limits");
-        jc.position_limit_min = limit_or_sentinel(lim.at("min"));
-        jc.position_limit_max = limit_or_sentinel(lim.at("max"));
+        jc.position_limit_min = limit_or_sentinel_min(lim.at("min"));
+        jc.position_limit_max = limit_or_sentinel_max(lim.at("max"));
 
         jc.position_kp  = j.value("position_kp", 0.0f);
         jc.position_ki  = j.value("position_ki", 0.0f);

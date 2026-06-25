@@ -281,7 +281,7 @@ _FLASH_CONFIG_SIZE    = 0x800        # 2 KB (one page)
 
 # RAM address of the `controller` global (MotorController struct).
 # Offsets match the Parameter enum byte offsets (DEVICE_ID=0x000, MODE=0x010, ERROR=0x014).
-_CONTROLLER_BASE = 0x20000228
+_CONTROLLER_BASE = 0x20000210
 
 _COMMISSIONING_CONFIG_PATH = Path("/tmp/esc_commissioning_config.bin")
 
@@ -448,7 +448,7 @@ async def _read_controller_state_via_swd(firmware_dir: Path) -> dict | None:
     if rc != 0:
         return None
 
-    m = re.search(r'0x20000228:\s+([0-9a-fA-F ]+)', out)
+    m = re.search(r'0x20000210:\s+([0-9a-fA-F ]+)', out)
     if not m:
         return None
     words_str = m.group(1).split()[:6]
@@ -809,6 +809,8 @@ class FlashManager:
         _hb_count_comm = 0
         _hb_last_mode: int | None = None
         _hb_last_error: int | None = None
+        _hb_target_mode: int | None = None
+        _hb_target_error: int | None = None
         _frame_counts: dict[tuple[int, int], int] = {}
         for fr in raw_frames:
             dev  = fr.get("device_id", -1)
@@ -828,6 +830,15 @@ class FlashManager:
                             pass
             if dev == config.can_id and func == 0xE and config.can_id != comm_id:
                 _sniff_saw_target_id = True
+                if _hb_target_mode is None:
+                    data_hex = fr.get("data", "")
+                    if len(data_hex) >= 10:
+                        try:
+                            raw_bytes = bytes.fromhex(data_hex)
+                            _hb_target_mode = raw_bytes[0]
+                            _hb_target_error = struct.unpack_from("<I", raw_bytes, 1)[0]
+                        except Exception:
+                            pass
             if func == 0x1 and dev not in _sniff_emcy_by_device:
                 try:
                     raw_bytes = bytes.fromhex(fr.get("data", ""))
@@ -856,7 +867,9 @@ class FlashManager:
                     f"  ↳ ID {comm_id} (unexpected — ESC booted with stale device_id=127): "
                     f"{_hb_count_comm} heartbeat(s) — mode={mode_str}, error={err_str}")
             if _sniff_saw_target_id:
-                self._log(f"  ↳ ID {config.can_id} (target): heartbeat seen")
+                mode_str = _mode_name(_hb_target_mode) if _hb_target_mode is not None else "?"
+                err_str  = _error_str(_hb_target_error) if _hb_target_error is not None else "?"
+                self._log(f"  ↳ ID {config.can_id} (target): heartbeat seen — mode={mode_str}, error={err_str}")
             for emcy_dev, emcy_err in sorted(_sniff_emcy_by_device.items()):
                 if emcy_dev == config.can_id:
                     self._log(
@@ -993,6 +1006,23 @@ class FlashManager:
             else:
                 self._log(
                     "No heartbeat after recovery (ESC may not broadcast in IDLE — continuing)")
+        else:
+            # Fresh-flash ESC boots with mode=DISABLED (config page stores 0x00 at mode
+            # offset 0x010).  In MODE_DISABLED the firmware does not process SDO frames, so
+            # all SDO reads and writes silently time out.
+            #
+            # The daemon's needs_idle_wakeup_ flag normally handles this, but it only fires
+            # when the daemon sees a PDO4 (fast frame) from the motor.  A freshly flashed
+            # ESC has fast_frame_frequency=0 in its config page and never sends PDO4 until
+            # that param is written via SDO — so the daemon never detects it and never sends
+            # NMT IDLE.  The flash wizard must send NMT IDLE explicitly before any SDO I/O.
+            self._log(
+                f"Sending NMT IDLE to ID {active_id} — "
+                f"waking ESC from MODE_DISABLED so SDO reads/writes are processed...",
+                progress=44)
+            await loop.run_in_executor(
+                None, dc.send_nmt, config.can_channel, active_id, 0x01)  # 0x01 = MODE_IDLE
+            await asyncio.sleep(0.3)
 
         self._log(
             f"ESC at ID {active_id}. "
@@ -1062,14 +1092,13 @@ class FlashManager:
             None, dc.generic_sdo_read,
             config.can_channel, active_id, _PARAM_DEVICE_ID, 1.0)
         if diag_result is None:
-            self._log(
-                f"  WARNING: ESC at ID {active_id} is NOT responding to SDO reads. "
-                f"All SDO writes below will return NO_ACK. "
-                f"If this persists after power-cycling, use 'Flash + Commission' to "
-                f"re-flash the firmware and reset the CAN filter.")
-        else:
-            stored_id = int(diag_result["value_u32"] or 0)
-            self._log(f"  SDO diagnostic: ESC device_id={stored_id} — SDO responding ✓")
+            raise FlashError(
+                f"ESC at ID {active_id} is NOT responding to SDO reads — "
+                f"commissioning aborted to avoid calibration with wrong parameters. "
+                f"Power-cycle the ESC, then use 'Flash + Commission' to re-flash "
+                f"the firmware and reset the motor parameters from scratch.")
+        stored_id = int(diag_result["value_u32"] or 0)
+        self._log(f"  SDO diagnostic: ESC device_id={stored_id} — SDO responding ✓")
 
         sdo_writes = [
             (_PARAM_POSITION_GEAR_RATIO,   "f32", gear_ratio,                   f"gear_ratio={gear_ratio:+.1f}"),

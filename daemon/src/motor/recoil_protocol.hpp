@@ -80,7 +80,7 @@ enum ErrorCode : uint32_t {
     ERROR_CAN_RX_FAULT         = 0x0400u,
     ERROR_CAN_TX_FAULT         = 0x0800u,
     ERROR_I2C_FAULT            = 0x1000u,
-    ERROR_ENCODER_FAULT        = 0x2000u,  // Python adds this; not in firmware header
+    ERROR_ENCODER_FAULT        = 0x2000u,
 };
 
 // ─── SDO parameter addresses ──────────────────────────────────────────────────

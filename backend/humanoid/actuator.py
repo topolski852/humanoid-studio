@@ -13,7 +13,7 @@ import logging
 import time
 from typing import Callable, Coroutine, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
 
 from .can_bus import CANBus, CANBusError, Function, Mode, ErrorCode, Parameter
 from .robot_config import JointConfig
@@ -57,12 +57,10 @@ class ActuatorState(BaseModel):
     def has_error(self) -> bool:
         return self.error != 0
 
+    @computed_field
+    @property
     def error_names(self) -> list[str]:
-        names = []
-        for member in ErrorCode:
-            if member != ErrorCode.NO_ERROR and (self.error & member):
-                names.append(member.name)
-        return names
+        return [m.name for m in ErrorCode if m != ErrorCode.NO_ERROR and (self.error & m)]
 
 
 # ---------------------------------------------------------------------------
@@ -543,8 +541,8 @@ class Actuator:
             (Parameter.POSITION_CONTROLLER_VELOCITY_KI,           c.velocity_ki),
             (Parameter.POSITION_CONTROLLER_TORQUE_LIMIT,          c.torque_limit),
             (Parameter.POSITION_CONTROLLER_VELOCITY_LIMIT,        c.velocity_limit),
-            (Parameter.POSITION_CONTROLLER_POSITION_LIMIT_LOWER,  c.position_limits.lower_bound),
-            (Parameter.POSITION_CONTROLLER_POSITION_LIMIT_UPPER,  c.position_limits.upper_bound),
+            (Parameter.POSITION_CONTROLLER_POSITION_LIMIT_LOWER,  c.position_limits.lower_bound + c.position_offset),
+            (Parameter.POSITION_CONTROLLER_POSITION_LIMIT_UPPER,  c.position_limits.upper_bound + c.position_offset),
             (Parameter.POSITION_CONTROLLER_POSITION_OFFSET,       c.position_offset),
             (Parameter.POSITION_CONTROLLER_TORQUE_FILTER_ALPHA,   c.torque_filter_alpha),
             (Parameter.CURRENT_CONTROLLER_I_LIMIT,                c.current_limit),

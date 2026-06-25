@@ -249,7 +249,7 @@ async def apply_motor_config(
             status=409,
         )
     try:
-        updated = actuator.config.model_copy(update=body.config)
+        updated = actuator.config.model_copy(update=body.config, validate=True)
         actuator.update_config(updated)
         request.app.state.robot.config.joints[joint_name] = updated
         config_path: Path = getattr(request.app.state, "config_path", _DEFAULT_CONFIG_PATH)

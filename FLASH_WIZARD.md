@@ -651,3 +651,105 @@ phase_order, max_calibration_current, cpr
 
 This ensures correct parameters even when `skip_flash=True` (commission-only mode, no
 fresh config page) or if the config page on the ESC is from a previous broken run.
+
+---
+
+## BUG-012 — SDO reads fail after fresh flash; ESC boots in MODE_DISABLED and flash wizard never sends NMT IDLE
+
+**Symptom:** Flash completes successfully. ESC heartbeats are visible on the CAN bus at the
+target ID. Commissioning proceeds to "Writing params via SDO" but immediately fails:
+
+**Log output:**
+```
+Sniff result (1000 frames): ID 1:[HB×4], ID 3:[PDO2×195 HB×4], ...
+  ↳ ID 1 (target): heartbeat seen
+ESC at target CAN ID 1 — booted from config page (fresh flash) or previously commissioned.
+ESC at ID 1. Writing params via SDO: target_id=1, phase_order=inverted (-1), ...
+  Using gear_ratio=+15.0 from robot config
+  Slow-poll SDO suspended for left_hip_roll_joint
+FAILED: ESC at ID 1 is NOT responding to SDO reads — commissioning aborted to avoid
+calibration with wrong parameters.
+```
+
+**Root cause (two related issues):**
+
+*Issue A — ESC boots in MODE_DISABLED*: The firmware config page written by `_make_commissioning_config_page()` stores `0x00` at offset `0x010` (the mode field). When the firmware calls `loadConfig()` at boot, it reads this value and sets `controller->mode = MODE_DISABLED (0x00)`. In `MODE_DISABLED`, the firmware does not process incoming SDO frames — SDO reads and writes are silently ignored, causing all `generic_sdo_read()` and `generic_sdo_write()` calls to time out.
+
+*Issue B — daemon's NMT IDLE wakeup path never fires*: The daemon's `needs_idle_wakeup_` mechanism (added in session 6) sends `NMT IDLE` to a motor the first time it detects that motor on the bus. However, this detection is triggered by incoming `PDO4` (fast frame) from the motor. A freshly flashed ESC has `fast_frame_frequency=0` in its config page and therefore sends **no PDO4 frames** — only heartbeats. The daemon never detects the motor and never sends the NMT IDLE wakeup. The ESC remains in `MODE_DISABLED` indefinitely.
+
+The sniff confirms this: `ID 1:[HB×4]` — heartbeats only, no PDO2/PDO4, consistent with a motor in MODE_DISABLED that has never received NMT IDLE.
+
+---
+
+### FIX-012-a — Send NMT IDLE explicitly in flash.py after ESC detection [FAILED]
+
+**Files changed:** `backend/humanoid/flash.py`
+
+After `esc_found` is confirmed and the ESC is not already in the error-recovery path
+(`esc_needs_idle_recovery == False`), send `NMT IDLE` (`MODE_IDLE = 0x01`) to `active_id`
+and wait 300 ms for the firmware mode transition before any SDO I/O:
+
+```python
+else:
+    # Fresh-flash ESC boots with mode=DISABLED. In MODE_DISABLED the firmware does
+    # not process SDO frames. The daemon's needs_idle_wakeup_ path doesn't fire
+    # because fast_frame_frequency=0 means no PDO4 is sent.
+    self._log(
+        f"Sending NMT IDLE to ID {active_id} — "
+        f"waking ESC from MODE_DISABLED so SDO reads/writes are processed...")
+    await loop.run_in_executor(
+        None, dc.send_nmt, config.can_channel, active_id, 0x01)  # 0x01 = MODE_IDLE
+    await asyncio.sleep(0.3)
+```
+
+**Additional improvement:** The sniff loop now decodes heartbeat mode and error for the
+target CAN ID (previously only decoded for commissioning ID 127). The log now shows
+`mode=DISABLED, error=NO_ERROR` for a freshly booted ESC, making this failure class
+immediately visible in future logs without requiring SWD diagnosis.
+
+**Why FIX-012-a failed:** The ESC firmware always calls `MotorController_setMode(IDLE)` at
+the end of `MotorController_init()`, regardless of what `loadConfig()` loaded from the
+commissioning config page. The ESC boots in MODE_IDLE, not MODE_DISABLED. NMT IDLE was
+already a no-op. The root cause of the SDO timeout is elsewhere.
+
+---
+
+### FIX-012-b — Retry GENERIC_SDO_READ with diagnostic sniff [WORKING]
+
+**Files changed:** `daemon/src/control/robot.cpp`
+
+**Root cause (revised):** Unknown. The ESC IS in MODE_IDLE (heartbeats confirm this), CAN
+hardware filter does not block 0x601, and `generic_listener_.on_frame()` is always called
+after actuator dispatch. Static analysis cannot determine why the one-shot consistently
+times out.
+
+**Fix:** Replace the single-attempt GENERIC_SDO_READ with a retry loop (3 attempts) and a
+parallel diagnostic sniff that runs across all attempts:
+
+- **Diagnostic sniff** registers `begin_sniff(channel, device_id, FUNC_TRANSMIT_SDO)` before
+  the first attempt. After all retries, `end_sniff()` reveals whether ANY `FUNC_TRANSMIT_SDO`
+  frame from the target device was received during the window:
+  - Sniff empty → no SDO response ever reached the host (TX loss or ESC silently ignoring SDO)
+  - Sniff non-empty → frames arrived but the one-shot was not fulfilled (dispatcher bug)
+
+- **Per-attempt timeout** = `max(100, timeout_ms / 3)` so total daemon time ≤ `timeout_ms +
+  100 ms`, fitting inside Python's `timeout + 1.0 s` socket window.
+
+- **50 ms gap** between retries lets the control loop drain the kernel socket buffer before
+  the next attempt.
+
+**Stderr output on failure:**
+```
+[GENERIC_SDO_READ] attempt 1/3 TIMEOUT: device=1 channel=can_left_leg param=0x0000 arb_tx=0x601 arb_rx=0x581 per_attempt=333ms
+[GENERIC_SDO_READ] attempt 2/3 TIMEOUT: ...
+[GENERIC_SDO_READ] attempt 3/3 TIMEOUT: ...
+[GENERIC_SDO_READ] FAILED after 3 attempts: device=1 channel=can_left_leg param=0x0000
+  — no FUNC_TRANSMIT_SDO frames seen on bus — TX loss or ESC not responding (sniff captured 0 frames)
+```
+
+**If sniff captures 0 frames:** next investigation targets TX path (SocketCan TX drop on
+ENOBUFS, CAN bus error state at frame level, or ESC FDCAN RX FIFO full/overrun).
+
+**If sniff captures >0 frames:** next investigation targets `generic_listener_.on_frame()`
+dispatch — the sniff and one-shot share `on_frame()` equally, so this would be surprising
+and would point to a race between `cancel_stale()` and `on_frame()`.

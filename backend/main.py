@@ -172,7 +172,7 @@ async def ws_telemetry(ws: WebSocket) -> None:
                         actuator_dicts[name] = None
                         continue
                     d = s.model_dump()
-                    d["error_names"] = s.error_names()
+                    # error_names is now a computed_field included in model_dump(); no override needed
                     sm = _smooth.setdefault(name, {})
                     raw_v = d["velocity"] if d["velocity"] is not None and math.isfinite(d["velocity"]) else sm.get("velocity", 0.0)
                     sm["velocity"] = _VEL_ALPHA * raw_v + (1 - _VEL_ALPHA) * sm.get("velocity", raw_v)

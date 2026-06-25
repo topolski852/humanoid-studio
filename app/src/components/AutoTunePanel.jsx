@@ -52,6 +52,7 @@ function computeSuggestion(metrics, params) {
     steady_state_error_rad: sseRad,
     max_torque_nm,
     torque_saturated,
+    no_motion_detected,
   } = metrics
   const { position_kp: kp, position_ki: ki, torque_limit, offset_rad } = params
 
@@ -60,6 +61,11 @@ function computeSuggestion(metrics, params) {
   let newKi          = ki
   let newTorqueLimit = torque_limit
   let quality        = 'good'
+
+  if (no_motion_detected) {
+    rationale.push('Motor did not move — verify it is enabled and position limits allow the commanded range')
+    return { kp: newKp, ki: newKi, torqueLimit: newTorqueLimit, rationale, quality: 'poor' }
+  }
 
   // ── Kp / torque-limit decision (priority order) ───────────────────────────
   // All adjustments are intentionally small and incremental.  Multiple test
@@ -128,13 +134,13 @@ function computeSuggestion(metrics, params) {
 }
 
 export default function AutoTunePanel({ jointName, state, config, onLogError }) {
-  const [testKp,          setTestKp]          = useState(20.0)
-  const [testKi,          setTestKi]          = useState(0.0)
-  const [testTorqueLimit, setTestTorqueLimit] = useState(2.0)
-  const [centerDeg,       setCenterDeg]       = useState(0.0)
-  const [offsetDeg,       setOffsetDeg]       = useState(25.0)
-  const [stepHoldS,       setStepHoldS]       = useState(1.5)
-  const [numSteps,        setNumSteps]        = useState(4)
+  const [testKp,          setTestKp]          = useState('20')
+  const [testKi,          setTestKi]          = useState('0')
+  const [testTorqueLimit, setTestTorqueLimit] = useState('2')
+  const [centerDeg,       setCenterDeg]       = useState('0')
+  const [offsetDeg,       setOffsetDeg]       = useState('25')
+  const [stepHoldS,       setStepHoldS]       = useState('1.5')
+  const [numSteps,        setNumSteps]        = useState('4')
   const [signals, setSignals] = useState(
     Object.fromEntries(SIGNAL_CONFIG.map((s) => [s.key, DEFAULT_VISIBLE.has(s.key)]))
   )
@@ -169,16 +175,16 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
   useEffect(() => {
     if (cfgInit.current || !config) return
     cfgInit.current = true
-    if (config.position_kp != null) setTestKp(Number(config.position_kp))
-    if (config.position_ki != null) setTestKi(Number(config.position_ki))
-    if (config.torque_limit != null) setTestTorqueLimit(Number(config.torque_limit))
+    if (config.position_kp != null) setTestKp(String(config.position_kp))
+    if (config.position_ki != null) setTestKi(String(config.position_ki))
+    if (config.torque_limit != null) setTestTorqueLimit(String(config.torque_limit))
   }, [config])
 
   // Seed center from current motor position (in degrees) once telemetry arrives
   useEffect(() => {
     if (posInit.current || state?.position == null) return
     posInit.current = true
-    setCenterDeg(parseFloat((state.position * R2D).toFixed(1)))
+    setCenterDeg((state.position * R2D).toFixed(1))
   }, [state])
 
   // ── Motor control ───────────────────────────────────────────────────────────
@@ -220,22 +226,29 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
     // Snapshot the gains and offset at the moment this test starts.
     // The suggestion card uses this snapshot, not the live form values,
     // so "Try These Gains" cannot cascade the suggestion without a new test.
+    const kp  = parseFloat(testKp)          || 0
+    const ki  = parseFloat(testKi)          || 0
+    const tl  = parseFloat(testTorqueLimit) || 0
+    const ctr = parseFloat(centerDeg)       || 0
+    const off = parseFloat(offsetDeg)       || 0
+    const hold  = parseFloat(stepHoldS)     || 1.5
+    const steps = Math.max(1, Math.round(parseFloat(numSteps) || 4))
     const params = {
-      position_kp:  testKp,
-      position_ki:  testKi,
-      torque_limit: testTorqueLimit,
-      offset_rad:   offsetDeg * DEG,
+      position_kp:  kp,
+      position_ki:  ki,
+      torque_limit: tl,
+      offset_rad:   off * DEG,
     }
     setLastTestParams(params)
     try {
       const res = await api.runStepTest(jointName, {
-        position_kp:   testKp,
-        position_ki:   testKi,
-        torque_limit:  testTorqueLimit,
-        center_rad:    centerDeg * DEG,
-        offset_rad:    offsetDeg * DEG,
-        step_hold_s:   stepHoldS,
-        num_steps:     numSteps,
+        position_kp:   kp,
+        position_ki:   ki,
+        torque_limit:  tl,
+        center_rad:    ctr * DEG,
+        offset_rad:    off * DEG,
+        step_hold_s:   hold,
+        num_steps:     steps,
       }, abortRef.current.signal)
       setResult(res)
     } catch (e) {
@@ -249,7 +262,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
 
   async function applyGains() {
     try {
-      await api.writeMotorGains(jointName, testKp, testKi, testTorqueLimit)
+      await api.writeMotorGains(jointName, parseFloat(testKp)||0, parseFloat(testKi)||0, parseFloat(testTorqueLimit)||0)
     } catch (e) {
       const msg = `Apply gains failed: ${e.message}`
       setRunError(msg)
@@ -259,9 +272,9 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
 
   // ── Suggestion actions ──────────────────────────────────────────────────────
   function trySuggestion(s) {
-    setTestKp(s.kp)
-    setTestKi(s.ki)
-    setTestTorqueLimit(s.torqueLimit)
+    setTestKp(String(s.kp))
+    setTestKi(String(s.ki))
+    setTestTorqueLimit(String(s.torqueLimit))
     setTriedSuggestion(true)
   }
 
@@ -375,9 +388,9 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
       <section className="space-y-2">
         <SectionLabel>Gains for Test</SectionLabel>
         <div className="grid grid-cols-3 gap-2">
-          <Field label="Position Kp"      value={testKp}          onChange={(v) => setTestKp(Number(v))} />
-          <Field label="Position Ki"      value={testKi}          onChange={(v) => setTestKi(Number(v))} />
-          <Field label="Torque Limit (Nm)" value={testTorqueLimit} onChange={(v) => setTestTorqueLimit(Number(v))} />
+          <Field label="Position Kp"      value={testKp}          onChange={setTestKp} />
+          <Field label="Position Ki"      value={testKi}          onChange={setTestKi} />
+          <Field label="Torque Limit (Nm)" value={testTorqueLimit} onChange={setTestTorqueLimit} />
         </div>
       </section>
 
@@ -385,16 +398,16 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
       <section className="space-y-2">
         <SectionLabel>Step Parameters</SectionLabel>
         <div className="grid grid-cols-2 gap-2">
-          <Field label="Center (°)"    value={centerDeg} onChange={(v) => setCenterDeg(Number(v))} />
-          <Field label="Offset (°)"    value={offsetDeg} onChange={(v) => setOffsetDeg(Number(v))} />
-          <Field label="Hold time (s)" value={stepHoldS} onChange={(v) => setStepHoldS(Number(v))} />
-          <Field label="Steps"         value={numSteps}  onChange={(v) => setNumSteps(Math.max(1, Math.round(Number(v))))} />
+          <Field label="Center (°)"    value={centerDeg} onChange={setCenterDeg} />
+          <Field label="Offset (°)"    value={offsetDeg} onChange={setOffsetDeg} />
+          <Field label="Hold time (s)" value={stepHoldS} onChange={setStepHoldS} />
+          <Field label="Steps"         value={numSteps}  onChange={setNumSteps} />
         </div>
         <p className="text-[10px] text-gray-600">
           Moves between{' '}
-          <span className="font-mono text-gray-400">{(centerDeg - offsetDeg).toFixed(1)}°</span>
+          <span className="font-mono text-gray-400">{((parseFloat(centerDeg)||0) - (parseFloat(offsetDeg)||0)).toFixed(1)}°</span>
           {' '}and{' '}
-          <span className="font-mono text-gray-400">{(centerDeg + offsetDeg).toFixed(1)}°</span>
+          <span className="font-mono text-gray-400">{((parseFloat(centerDeg)||0) + (parseFloat(offsetDeg)||0)).toFixed(1)}°</span>
         </p>
       </section>
 
@@ -595,10 +608,14 @@ function Field({ label, value, onChange }) {
     <div className="space-y-0.5">
       <p className="text-[9px] text-gray-600">{label}</p>
       <input
-        type="number"
-        step="any"
+        type="text"
+        inputMode="decimal"
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        onBlur={(e) => {
+          const n = parseFloat(e.target.value)
+          if (!isNaN(n)) onChange(String(n))
+        }}
         className="w-full px-2 py-1 rounded border border-surface-3 bg-surface-2
           text-xs font-mono text-gray-200 outline-none focus:border-accent/50 transition-colors"
       />
