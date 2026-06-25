@@ -213,7 +213,10 @@ void Actuator::tick(CanBusManager& bus) {
                 Clock::now() - last_alive_received_).count();
             if (stale_ms > 1500) {
                 state_.joint_state    = JointState::OFFLINE;
-                state_.firmware_version = 0;           // re-read on next connect
+                // firmware_version intentionally preserved — shows last known version
+                // on the dashboard even during brief power cycles.  It is cleared to 0
+                // only inside apply_config() after a full successful re-read, which
+                // happens on the next Connect → apply_config cycle.
                 last_applied_config_ = std::nullopt;  // force full reconfigure on reconnect
             }
         }
@@ -451,10 +454,10 @@ bool Actuator::apply_config(CanBusManager& bus, int timeout_ms) {
     const JointConfig& c = cfg_;
     const JointConfig* prev = last_applied_config_.has_value() ? &(*last_applied_config_) : nullptr;
 
-    // Read firmware version once per connect — skip if already known.
-    // Cleared to 0 on OFFLINE transition so a power-cycle + reflash is reflected on next connect.
-    bool needs_fw_read;
-    { std::lock_guard<std::mutex> lk(state_mutex_); needs_fw_read = (state_.firmware_version == 0); }
+    // Read firmware version on every fresh connect (first apply_config after OFFLINE).
+    // prev==nullptr means last_applied_config_ was nullopt — this IS a fresh connect.
+    // This re-reads even if the cached value is non-zero, so a reflash is picked up.
+    bool needs_fw_read = (prev == nullptr);
     if (needs_fw_read) {
         float fw_f = read_config_param(bus, static_cast<uint16_t>(P::PARAM_FIRMWARE_VERSION), 300);
         if (!std::isnan(fw_f)) {

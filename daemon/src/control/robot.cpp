@@ -841,6 +841,16 @@ std::string Robot::handle_command(const std::string& request) {
         return ack();
     }
 
+    if (type == "DISABLE_ALL_SLOW_POLL") {
+        for (auto& a : actuators_) a->set_slow_poll_enabled(false);
+        return ack();
+    }
+
+    if (type == "ENABLE_ALL_SLOW_POLL") {
+        for (auto& a : actuators_) a->set_slow_poll_enabled(true);
+        return ack();
+    }
+
     if (type == "WRITE_GAINS") {
         std::string name = req.value("joint_name", "");
         auto it = actuator_by_name_.find(name);

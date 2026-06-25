@@ -673,6 +673,15 @@ class DaemonClient:
         """Resume slow-poll SDO telemetry reads for a joint."""
         self._send_command({"type": "ENABLE_SLOW_POLL", "joint_name": joint_name})
 
+    def disable_all_slow_poll(self) -> None:
+        """Stop slow-poll SDO reads for ALL joints — call before commissioning
+        to eliminate competing SDO traffic from other motors on the same bus."""
+        self._send_command({"type": "DISABLE_ALL_SLOW_POLL"})
+
+    def enable_all_slow_poll(self) -> None:
+        """Resume slow-poll SDO reads for all joints."""
+        self._send_command({"type": "ENABLE_ALL_SLOW_POLL"})
+
     # ------------------------------------------------------------------ #
     # Generic CAN passthrough — flash wizard and commissioning            #
     # ------------------------------------------------------------------ #

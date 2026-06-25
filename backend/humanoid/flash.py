@@ -715,13 +715,12 @@ class FlashManager:
             self.status.error = str(exc)
             self._log(f"FAILED (unexpected): {exc}")
         finally:
-            # Re-enable slow-poll telemetry if it was suspended for commissioning.
+            # Re-enable slow-poll telemetry for all joints (we suspended all).
             dc = self._daemon_client
-            jn = getattr(self, "_commissioning_joint_name", None)
-            if dc is not None and jn is not None:
+            if dc is not None:
                 try:
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, dc.enable_slow_poll, jn)
+                    await loop.run_in_executor(None, dc.enable_all_slow_poll)
                 except Exception:
                     pass
 
@@ -1055,17 +1054,18 @@ class FlashManager:
                     f"  No joint config for {config.can_channel} ID {config.can_id} "
                     f"— using gear_ratio=1.0 (direct drive)")
 
-        # Disable slow-poll SDO telemetry reads for this joint during commissioning.
-        # The daemon's slow-poll sends periodic SDO READ requests; the motor's SDO READ
-        # responses are FUNC_TRANSMIT_SDO frames that can consume generic_listener_ futures
-        # registered for the GENERIC_SDO_WRITE calls below, causing false NO_ACK results.
-        if self._commissioning_joint_name and dc:
-            await loop.run_in_executor(
-                None, dc.disable_slow_poll, self._commissioning_joint_name)
-            self._log(f"  Slow-poll SDO suspended for {self._commissioning_joint_name}")
-            # Allow 50 ms for any in-flight slow-poll SDO response already queued
-            # in the kernel receive buffer to be drained by the control loop before
-            # registering GENERIC_SDO_WRITE futures below.
+        # Suspend slow-poll SDO reads for ALL motors.
+        # The daemon sends periodic SDO READ requests (~3 Hz per motor) for telemetry.
+        # Responses from any motor on the same bus are FUNC_TRANSMIT_SDO frames that
+        # can interfere with GENERIC_SDO_WRITE futures and —critically— with the
+        # diagnostic SDO READ below.  Suspending all motors eliminates this race.
+        if dc:
+            await loop.run_in_executor(None, dc.disable_all_slow_poll)
+            self._log("  Slow-poll SDO suspended for all joints")
+            if self._commissioning_joint_name:
+                self._log(f"  (commissioning joint: {self._commissioning_joint_name})")
+            # Wait two control-loop ticks (10 ms) for any in-flight slow-poll SDO
+            # responses already in the kernel receive buffer to be drained.
             await asyncio.sleep(0.05)
 
         # Host-side CAN interface health check.  ERROR-PASSIVE / BUS-OFF causes
@@ -1084,19 +1084,23 @@ class FlashManager:
                 f"If this recurs, a damaged CAN transceiver on the bus is the likely cause.")
 
         # Pre-commission SDO diagnostic: try to read device_id from the ESC.
-        # If this times out the ESC is not responding to SDO at all — all
-        # subsequent SDO writes will also fail.  This is usually caused by:
+        # Timeout is 3 s (3 attempts × 1 s each) to tolerate brief CAN bus contention
+        # from other active motors on the same channel.
+        # If this times out the ESC is not responding to SDO at all — causes:
         #   • Old commissioning ELF with FDCAN filter fixed at device_id=127
         #   • Firmware in a wedged state (power-cycle + Flash+Commission required)
+        #   • Heavy CAN traffic from other motors overwhelming the ESC's SDO handler
         diag_result = await loop.run_in_executor(
             None, dc.generic_sdo_read,
-            config.can_channel, active_id, _PARAM_DEVICE_ID, 1.0)
+            config.can_channel, active_id, _PARAM_DEVICE_ID, 3.0)
         if diag_result is None:
             raise FlashError(
                 f"ESC at ID {active_id} is NOT responding to SDO reads — "
                 f"commissioning aborted to avoid calibration with wrong parameters. "
-                f"Power-cycle the ESC, then use 'Flash + Commission' to re-flash "
-                f"the firmware and reset the motor parameters from scratch.")
+                f"Tried 3 times over 3 s with all slow-poll suspended. "
+                f"Try: (1) power-cycle the ESC and retry, (2) disconnect the "
+                f"dashboard (click Disconnect) before commissioning to reduce CAN "
+                f"bus traffic, (3) use 'Flash + Commission' to re-flash from scratch.")
         stored_id = int(diag_result["value_u32"] or 0)
         self._log(f"  SDO diagnostic: ESC device_id={stored_id} — SDO responding ✓")
 
