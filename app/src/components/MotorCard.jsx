@@ -1,3 +1,4 @@
+import { useRef } from 'react'
 import { radToDeg } from '../utils/canDisplay'
 import StatusDot from './StatusDot'
 
@@ -19,6 +20,12 @@ function DataRow({ label, value, highlight = false, dim = false }) {
  * Comes from passive CAN traffic when the robot is not actively connected.
  */
 export default function MotorCard({ joint, state, passiveState, onClick }) {
+  // Latch last known firmware version — brief OFFLINE transitions reset firmware_version to null
+  // in the daemon but we don't want the card to flicker back to '—'
+  const lastFwRef = useRef(null)
+  if (state?.firmware_version) lastFwRef.current = state.firmware_version
+  const fwVersion = lastFwRef.current
+
   // A motor is online if actively polled OR seen in passive traffic within 2s
   const activeOnline  = state != null
   const passiveOnline = passiveState?.status === 'ONLINE'
@@ -71,7 +78,7 @@ export default function MotorCard({ joint, state, passiveState, onClick }) {
           dim={!activeOnline && passiveOnline}
         />
         <DataRow label="MODE" value={mode} highlight={activeOnline} />
-        <DataRow label="FW" value={state?.firmware_version ?? '—'} dim />
+        <DataRow label="FW" value={fwVersion ?? '—'} dim />
       </div>
 
       {/* Bottom accent bar */}
