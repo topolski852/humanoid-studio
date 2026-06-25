@@ -192,6 +192,16 @@ void Robot::telemetry_loop() {
     }
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+static json firmware_version_json(uint32_t fw) {
+    if (fw == 0) return json(nullptr);
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "v%u.%u.%u",
+                  (fw >> 24) & 0xFF, (fw >> 16) & 0xFF, fw & 0xFFFF);
+    return json(buf);
+}
+
 // ── Telemetry JSON builder ───────────────────────────────────────────────────
 
 std::string Robot::build_telemetry_json(uint64_t seq) {
@@ -212,8 +222,8 @@ std::string Robot::build_telemetry_json(uint64_t seq) {
         jj["current"]  = s.current;
         jj["mode"]     = static_cast<int>(s.mode);
         jj["error"]    = s.error;
-        jj["bus_voltage"] = (s.bus_voltage >= 0.0f)
-                            ? json(s.bus_voltage) : json(nullptr);
+        jj["bus_voltage"]      = (s.bus_voltage >= 0.0f) ? json(s.bus_voltage) : json(nullptr);
+        jj["firmware_version"] = firmware_version_json(s.firmware_version);
         joints_obj[a->name()] = std::move(jj);
     }
     j["joints"] = std::move(joints_obj);
@@ -270,9 +280,9 @@ std::string Robot::handle_command(const std::string& request) {
         r["state"]["current"]    = s.current;
         r["state"]["mode"]       = static_cast<int>(s.mode);
         r["state"]["error"]      = s.error;
-        r["state"]["joint_state"] = joint_state_name(s.joint_state);
-        r["state"]["bus_voltage"] = (s.bus_voltage >= 0.0f)
-                                    ? json(s.bus_voltage) : json(nullptr);
+        r["state"]["joint_state"]      = joint_state_name(s.joint_state);
+        r["state"]["bus_voltage"]      = (s.bus_voltage >= 0.0f) ? json(s.bus_voltage) : json(nullptr);
+        r["state"]["firmware_version"] = firmware_version_json(s.firmware_version);
         return r.dump();
     }
 
@@ -290,9 +300,9 @@ std::string Robot::handle_command(const std::string& request) {
             jj["current"]    = s.current;
             jj["mode"]       = static_cast<int>(s.mode);
             jj["error"]      = s.error;
-            jj["joint_state"] = joint_state_name(s.joint_state);
-            jj["bus_voltage"] = (s.bus_voltage >= 0.0f)
-                                ? json(s.bus_voltage) : json(nullptr);
+            jj["joint_state"]      = joint_state_name(s.joint_state);
+            jj["bus_voltage"]      = (s.bus_voltage >= 0.0f) ? json(s.bus_voltage) : json(nullptr);
+            jj["firmware_version"] = firmware_version_json(s.firmware_version);
             r["states"][a->name()] = std::move(jj);
         }
         return r.dump();

@@ -71,6 +71,7 @@ export default function MotorCard({ joint, state, passiveState, onClick }) {
           dim={!activeOnline && passiveOnline}
         />
         <DataRow label="MODE" value={mode} highlight={activeOnline} />
+        <DataRow label="FW" value={state?.firmware_version ?? '—'} dim />
       </div>
 
       {/* Bottom accent bar */}

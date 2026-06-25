@@ -106,6 +106,7 @@ def _daemon_state_to_actuator(d: dict) -> ActuatorState | None:
         return None
     mode_int = int(d.get("mode", 0))
     bv = d.get("bus_voltage")
+    fw = d.get("firmware_version")
     return ActuatorState(
         position=float(d.get("position", 0.0)),
         velocity=float(d.get("velocity", 0.0)),
@@ -115,6 +116,7 @@ def _daemon_state_to_actuator(d: dict) -> ActuatorState | None:
         mode_name=_mode_name(mode_int),
         error=int(d.get("error", 0)),
         bus_voltage=float(bv) if bv is not None else None,
+        firmware_version=fw if isinstance(fw, str) else None,
         timestamp=time.time(),
     )
 

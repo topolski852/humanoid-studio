@@ -31,14 +31,15 @@ enum class JointState {
 const char* joint_state_name(JointState s);
 
 struct ActuatorState {
-    JointState  joint_state   = JointState::OFFLINE;
-    float       position      = 0.0f;   // display-frame rad (wire - offset)
-    float       velocity      = 0.0f;   // rad/s
-    float       torque        = 0.0f;   // Nm estimated
-    float       current       = 0.0f;   // Iq A
-    uint8_t     mode          = 0;      // firmware MotorMode
-    uint32_t    error         = 0;      // firmware error bitmask
-    float       bus_voltage   = -1.0f;  // V; -1 = unknown
+    JointState  joint_state      = JointState::OFFLINE;
+    float       position         = 0.0f;   // display-frame rad (wire - offset)
+    float       velocity         = 0.0f;   // rad/s
+    float       torque           = 0.0f;   // Nm estimated
+    float       current          = 0.0f;   // Iq A
+    uint8_t     mode             = 0;      // firmware MotorMode
+    uint32_t    error            = 0;      // firmware error bitmask
+    float       bus_voltage      = -1.0f;  // V; -1 = unknown
+    uint32_t    firmware_version = 0;      // 0x00MMmmPP; 0 = not yet read
     std::chrono::steady_clock::time_point updated_at{};
 };
 

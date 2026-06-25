@@ -51,6 +51,7 @@ class ActuatorState(BaseModel):
     mode_name: str = "DISABLED"
     error: int = 0
     bus_voltage: float | None = None  # V; None = SDO read failed / no data yet
+    firmware_version: str | None = None  # "v3.0.8" format; None = not yet read
     timestamp: float = 0.0         # Unix time of last update
 
     @property

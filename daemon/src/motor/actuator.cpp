@@ -212,7 +212,8 @@ void Actuator::tick(CanBusManager& bus) {
             auto stale_ms = std::chrono::duration_cast<ms>(
                 Clock::now() - last_alive_received_).count();
             if (stale_ms > 1500) {
-                state_.joint_state = JointState::OFFLINE;
+                state_.joint_state    = JointState::OFFLINE;
+                state_.firmware_version = 0;           // re-read on next connect
                 last_applied_config_ = std::nullopt;  // force full reconfigure on reconnect
             }
         }
@@ -449,6 +450,20 @@ bool Actuator::apply_config(CanBusManager& bus, int timeout_ms) {
     using P = ParamId;
     const JointConfig& c = cfg_;
     const JointConfig* prev = last_applied_config_.has_value() ? &(*last_applied_config_) : nullptr;
+
+    // Read firmware version once per connect — skip if already known.
+    // Cleared to 0 on OFFLINE transition so a power-cycle + reflash is reflected on next connect.
+    bool needs_fw_read;
+    { std::lock_guard<std::mutex> lk(state_mutex_); needs_fw_read = (state_.firmware_version == 0); }
+    if (needs_fw_read) {
+        float fw_f = read_config_param(bus, static_cast<uint16_t>(P::PARAM_FIRMWARE_VERSION), 300);
+        if (!std::isnan(fw_f)) {
+            uint32_t fw_u32;
+            std::memcpy(&fw_u32, &fw_f, 4);
+            std::lock_guard<std::mutex> lk(state_mutex_);
+            state_.firmware_version = fw_u32;
+        }
+    }
 
     // Limits are stored in display frame (user-facing rad) but the firmware compares them
     // against position_target = (display_command + position_offset), i.e. the internal frame.
