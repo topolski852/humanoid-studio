@@ -722,10 +722,12 @@ class FlashManager:
         loop = asyncio.get_running_loop()
         # The commission suspended slow-poll; re-enable it for this joint so the
         # probe sees i_q current telemetry. Wake the joint to IDLE first.
+        self._log("  Waking joint to IDLE and resuming current telemetry...", progress=79)
         await loop.run_in_executor(None, dc.set_mode, jn, "IDLE")
         await loop.run_in_executor(None, dc.enable_slow_poll, jn)
         await asyncio.sleep(0.5)
         try:
+            self._log("  Enabling POSITION mode for the probe...", progress=80)
             await proxy.enable(mode=Mode.POSITION)
             # Wait for firmware POSITION mode to show up in telemetry before probing.
             for _ in range(20):
@@ -733,7 +735,12 @@ class FlashManager:
                 if st is not None and st.mode == int(Mode.POSITION):
                     break
                 await asyncio.sleep(0.1)
-            return await commutation_probe(proxy)
+            self._log("  Probing both directions under reduced torque...", progress=81)
+            result = await commutation_probe(proxy)
+            self._log(
+                f"  Probe result: moved {result.get('moved_rad')} rad, "
+                f"max {result.get('max_current_a')} A ({result.get('reason')}).")
+            return result
         finally:
             try:
                 await proxy.disable()
@@ -773,6 +780,12 @@ class FlashManager:
         profile = config.profile_data()
         firmware_dir = config.firmware_dir
         invert_phase = config.invert_phase
+
+        self._log(
+            f"Starting {'commission' if config.skip_flash else 'flash + commission'} "
+            f"— CAN ID {config.can_id} on {config.can_channel}, profile {config.motor_profile}.",
+            progress=2,
+        )
 
         if not config.skip_flash:
             # ── 1. Flash pre-compiled binary ──────────────────────────────────

@@ -17,7 +17,10 @@ export default function CalibrateStep({ jointName, onComplete, onLogError }) {
   const [applyResult, setApply] = useState(null)
   const [verifyRes, setVerify]  = useState(null)
   const [storeFlash, setStore]  = useState(false)
+  const [log, setLog]           = useState([])
   const pollRef = useRef(null)
+
+  const addLog = (msg) => setLog((l) => [...l, msg])
 
   // Poll live position while capturing hardstops.
   useEffect(() => {
@@ -37,25 +40,38 @@ export default function CalibrateStep({ jointName, onComplete, onLogError }) {
   async function run(fn, after) {
     setBusy(true); setError(null)
     try { const r = await fn(); after?.(r) }
-    catch (e) { setError(e.message); onLogError?.(e.message, 'Cal') }
+    catch (e) { setError(e.message); addLog(`Error: ${e.message}`); onLogError?.(e.message, 'Cal') }
     setBusy(false)
   }
 
   const handleStart = () => run(
     () => api.rangeCalStart(jointName),
-    () => { setLower(null); setUpper(null); setApply(null); setVerify(null); setPhase('capturing') },
+    () => {
+      setLower(null); setUpper(null); setApply(null); setVerify(null); setPhase('capturing')
+      addLog('Offset zeroed on ESC, motor idled. Move the joint to each hardstop and record it.')
+    },
   )
   const recordStop = (which) => {
     if (livePos == null) return
     which === 'lower' ? setLower(livePos) : setUpper(livePos)
+    addLog(`${which === 'lower' ? 'Lower' : 'Upper'} hardstop recorded at ${d(livePos)}.`)
   }
   const handleApply = () => run(
-    () => api.rangeCalApply(jointName, lower, upper, { storeToFlash: storeFlash }),
-    (r) => { setApply(r); setPhase('applied') },
+    () => { addLog('Computing gear sign, offset, and limits from the two hardstops...'); return api.rangeCalApply(jointName, lower, upper, { storeToFlash: storeFlash }) },
+    (r) => {
+      setApply(r); setPhase('applied')
+      addLog(`Applied: gear_ratio ${r.gear_ratio}${r.flipped ? ' (encoder backward — auto-flipped)' : ''}, ` +
+             `offset ${r.position_offset?.toFixed(4)} rad, limits ${d(r.limits?.min)}…${d(r.limits?.max)}, ` +
+             `measured span ${(r.measured_range_rad / DEG).toFixed(1)}° ${r.range_ok ? '(OK)' : '(range mismatch!)'}.`)
+    },
   )
   const handleVerify = () => run(
-    () => api.jogDirection(jointName, 0.25, 1.5),
-    (r) => { setVerify(r); setPhase('verified') },
+    () => { addLog('Verifying direction — jogging toward +...'); return api.jogDirection(jointName, 0.25, 1.5) },
+    (r) => {
+      setVerify(r); setPhase('verified')
+      addLog(`Jog moved ${(r.signed_motion_rad / DEG).toFixed(1)}° ` +
+             `(${r.signed_motion_rad >= 0 ? 'toward upper/+' : 'toward lower/−'}). Confirm direction visually.`)
+    },
   )
 
   const backwards = lower != null && upper != null && upper < lower
@@ -177,6 +193,23 @@ export default function CalibrateStep({ jointName, onComplete, onLogError }) {
           >
             {busy ? 'Saving…' : 'Done'}
           </button>
+        </div>
+      )}
+
+      {/* Activity log */}
+      {log.length > 0 && (
+        <div className="mt-1">
+          <p className="data-label mb-1">Calibration Log</p>
+          <div className="bg-surface rounded-lg border border-surface-3 p-2.5 font-mono text-[11px] leading-relaxed max-h-40 overflow-y-auto">
+            {log.map((m, i) => (
+              <div key={i} className={`whitespace-pre-wrap break-words ${
+                m.startsWith('Error') ? 'text-danger'
+                  : m.startsWith('Applied') || m.startsWith('Jog') ? 'text-online'
+                  : 'text-gray-400'}`}>
+                <span className="text-gray-600 mr-2 select-none">&gt;</span>{m}
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>
