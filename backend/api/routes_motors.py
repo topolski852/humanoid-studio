@@ -26,6 +26,7 @@ from humanoid.daemon_client import DaemonError, DaemonNotSupportedError, Mode
 from humanoid.motor_tune import run_step_test
 from humanoid.motor_diagnose import RunawayAbort, run_diagnosis, run_gravity_tune, jog
 from humanoid.joint_defaults import apply_default_limits, default_position_limits
+from humanoid.range_cal import compute_range_calibration
 from humanoid.robot_config import PositionLimits
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parents[3] / "configs" / "humanoid_lite.json"
@@ -624,6 +625,87 @@ async def remediate_phase(
             await actuator.apply_config()
         except Exception:
             pass
+        return _err(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Hardstop range calibration  (offset + gear_ratio sign + limits from 2 stops)
+# ---------------------------------------------------------------------------
+
+@router.post("/motors/{joint_name}/range_cal_start", response_model=None)
+async def range_cal_start(joint_name: str, request: Request) -> dict | JSONResponse:
+    """Begin hardstop range calibration: write position_offset = 0 to the ESC so
+    the hardstop captures are raw (no offset math / clean gear-flip), and put the
+    motor in IDLE so the user can hand-move it to each hardstop."""
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    if actuator.get_cached_state() is None:
+        return _err("Motor is OFFLINE — connect it first.", status=409)
+    try:
+        await actuator.disable()  # IDLE — free to move by hand
+        await asyncio.sleep(0.1)
+        actuator.update_config(actuator.config.model_copy(update={"position_offset": 0.0}))
+        request.app.state.robot.config.joints[joint_name] = actuator.config
+        await actuator.apply_config()   # zero the offset on the ESC
+        return _ok({"joint_name": joint_name, "position_offset": 0.0, "mode": "IDLE"})
+    except (DaemonError, DaemonNotSupportedError) as exc:
+        return _err(str(exc))
+
+
+class RangeCalApplyBody(BaseModel):
+    lower_pos_rad: float            # raw position at the lower hardstop (offset=0)
+    upper_pos_rad: float            # raw position at the upper hardstop
+    min_rad: float | None = None    # joint limit; defaults to the Berkeley spec
+    max_rad: float | None = None
+    store_to_flash: bool = False
+
+
+@router.post("/motors/{joint_name}/range_cal_apply", response_model=None)
+async def range_cal_apply(
+    joint_name: str, body: RangeCalApplyBody, request: Request
+) -> dict | JSONResponse:
+    """Finish hardstop range calibration: from the two raw hardstop positions and
+    the joint's known angular range, compute gear_ratio sign (backwards-encoder
+    detection), position_offset (lower stop -> min_rad), and limits; write them to
+    the ESC and persist. Optionally store to flash."""
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    if actuator.get_cached_state() is None:
+        return _err("Motor is OFFLINE — connect it first.", status=409)
+
+    min_rad, max_rad = body.min_rad, body.max_rad
+    if min_rad is None or max_rad is None:
+        d = default_position_limits(joint_name)
+        if d is None:
+            return _err("No default limits for this joint — provide min_rad and max_rad.")
+        min_rad, max_rad = d
+
+    try:
+        result = compute_range_calibration(
+            body.lower_pos_rad, body.upper_pos_rad, min_rad, max_rad,
+            actuator.config.gear_ratio)
+    except ValueError as exc:
+        return _err(str(exc))
+
+    config_path: Path = getattr(request.app.state, "config_path", _DEFAULT_CONFIG_PATH)
+    try:
+        await actuator.disable()  # IDLE for config writes
+        await asyncio.sleep(0.1)
+        updated = actuator.config.model_copy(update={
+            "gear_ratio": result["gear_ratio"],
+            "position_offset": result["position_offset"],
+            "position_limits": PositionLimits(min=min_rad, max=max_rad),
+        })
+        actuator.update_config(updated)
+        request.app.state.robot.config.joints[joint_name] = updated
+        request.app.state.robot.config.to_json(config_path)
+        await actuator.apply_config()
+        if body.store_to_flash:
+            await actuator.store_to_flash()
+        return _ok({"joint_name": joint_name, "stored_to_flash": body.store_to_flash, **result})
+    except (DaemonError, DaemonNotSupportedError) as exc:
         return _err(str(exc))
 
 
