@@ -227,39 +227,15 @@ export default function EscSetup() {
                 {selectedJoint && (
                   <div className="w-48 flex-shrink-0 flex flex-col gap-2">
                     <button
-                      onClick={() => setWizardMode('flash')}
-                      disabled={!hasStlink}
-                      title={!hasStlink ? 'Connect an ST-LINK programmer to enable flashing' : undefined}
-                      className={`flex flex-col gap-1 px-3 py-3 rounded-lg border text-left transition-colors ${
-                        hasStlink
-                          ? 'bg-surface-2 border-surface-3 hover:border-accent/40 hover:bg-accent/5'
-                          : 'bg-surface-2/50 border-surface-3/50 opacity-50 cursor-not-allowed'
-                      }`}
+                      onClick={() => setWizardMode('start')}
+                      className="btn-primary px-3 py-2.5 w-full"
                     >
-                      <div className="flex items-center justify-between gap-1 flex-wrap">
-                        <span className="text-sm font-medium text-gray-200">Flash + Commission</span>
-                        {!hasStlink
-                          ? <span className="text-[10px] text-warn font-mono">ST-LINK needed</span>
-                          : <span className="text-[10px] text-gray-600 font-mono">ST-LINK · SWD</span>
-                        }
-                      </div>
-                      <p className="text-[10px] text-gray-500 leading-relaxed">
-                        Flash firmware then commission over CAN. For new or replacement ESCs.
-                      </p>
+                      Start Setup
                     </button>
-
-                    <button
-                      onClick={() => setWizardMode('commission')}
-                      className="flex flex-col gap-1 px-3 py-3 rounded-lg border bg-surface-2 border-surface-3 hover:border-accent/40 hover:bg-accent/5 text-left transition-colors"
-                    >
-                      <div className="flex items-center justify-between gap-1">
-                        <span className="text-sm font-medium text-gray-200">Commission Only</span>
-                        <span className="text-[10px] text-gray-600 font-mono">CAN only</span>
-                      </div>
-                      <p className="text-[10px] text-gray-500 leading-relaxed">
-                        Re-commission existing firmware over CAN. ESC must already be flashed.
-                      </p>
-                    </button>
+                    <p className="text-[10px] text-gray-500 leading-relaxed">
+                      Pick which steps to run — Flash, Commission, and/or Calibrate —
+                      in the wizard. {hasStlink ? 'ST-LINK detected.' : 'Flash needs an ST-LINK; Commission/Calibrate run over CAN only.'}
+                    </p>
                   </div>
                 )}
               </div>
