@@ -47,7 +47,8 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from .daemon_client import DaemonClient
+from .daemon_client import DaemonClient, Mode
+from .motor_diagnose import commutation_probe
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +704,50 @@ class FlashManager:
             "message":     self.status.messages[-1] if self.status.messages else "",
         }
 
+    async def _commutation_check(self, config: FlashConfig) -> dict:
+        """Automatic commutation check run after calibration.
+
+        Drives the just-calibrated joint through the daemon control path (a small
+        guarded move under reduced torque) and reports whether it commutates. A
+        commutation fault means the current phase_order is wrong for this motor's
+        wiring; the caller toggles phase_order + recalibrates. Direction is NOT
+        judged here — that's the separate gear_ratio step.
+
+        Returns the commutation_probe() result, or {commutates: True, skipped:
+        True} when the joint isn't in the robot config (can't be driven by name).
+        """
+        dc = self._daemon_client
+        jn = self._commissioning_joint_name
+        if dc is None or not jn:
+            self._log("Commutation check skipped — joint not in robot config.")
+            return {"commutates": True, "skipped": True}
+        proxy = dc.get_actuator_by_name(jn)
+        if proxy is None:
+            self._log("Commutation check skipped — no proxy for joint.")
+            return {"commutates": True, "skipped": True}
+
+        loop = asyncio.get_running_loop()
+        # The commission suspended slow-poll; re-enable it for this joint so the
+        # probe sees i_q current telemetry. Wake the joint to IDLE first.
+        await loop.run_in_executor(None, dc.set_mode, jn, "IDLE")
+        await loop.run_in_executor(None, dc.enable_slow_poll, jn)
+        await asyncio.sleep(0.5)
+        try:
+            await proxy.enable(mode=Mode.POSITION)
+            # Wait for firmware POSITION mode to show up in telemetry before probing.
+            for _ in range(20):
+                st = proxy.get_cached_state()
+                if st is not None and st.mode == int(Mode.POSITION):
+                    break
+                await asyncio.sleep(0.1)
+            return await commutation_probe(proxy)
+        finally:
+            try:
+                await proxy.disable()
+            except Exception:
+                pass
+            await loop.run_in_executor(None, dc.disable_slow_poll, jn)
+
     # ── Internal session ──────────────────────────────────────────────────────
 
     async def _run_session(self, port: str, config: FlashConfig) -> None:
@@ -1329,6 +1374,8 @@ class FlashManager:
         self._log("Waiting for CAN bus to settle...", progress=56)
         await asyncio.sleep(2.0)
 
+        phase_attempts = 0   # only two phase_order values exist
+
         while True:
             self.status.state = FlashState.CALIBRATING
             ack_freq = await loop.run_in_executor(
@@ -1423,26 +1470,43 @@ class FlashManager:
                 f"({math.degrees(flux_offset):.2f}°). Saved to Flash.",
                 progress=75)
 
-            # ── 5. Confirm direction ──────────────────────────────────────────
-            self.status.state = FlashState.AWAITING_CONFIRMATION
-            self._confirm_event = asyncio.Event()
-            self._confirmed_correct = None
-            self._log(
-                "Did the motor rotate correctly during calibration? "
-                "Confirm direction. (120 s timeout)",
-                progress=78)
-            await asyncio.wait_for(self._confirm_event.wait(), timeout=120.0)
-            direction_correct = bool(self._confirmed_correct)
+            # ── 5. Auto commutation check ─────────────────────────────────────
+            # phase_order is chosen for COMMUTATION, not direction. A small guarded
+            # move detects a commutation fault (stuck while saturating torque); if
+            # found, toggle phase_order + recalibrate. Joint *direction* is set
+            # later via gear_ratio sign (the Direction & Limits step), so the user
+            # is no longer asked "did it move the right way?" here.
+            self._log("Checking commutation (small guarded move)...", progress=78)
+            try:
+                probe = await self._commutation_check(config)
+            except Exception as exc:  # don't let a probe glitch abort a good flash
+                self._log(f"Commutation check could not run ({exc}); assuming OK.")
+                probe = {"commutates": True, "skipped": True}
 
-            if direction_correct:
+            if probe.get("commutates"):
+                if probe.get("skipped"):
+                    self._log("Commutation check skipped — accepting calibration.",
+                              progress=85)
+                else:
+                    self._log(
+                        f"Commutation OK — moved {probe.get('moved_rad')} rad, "
+                        f"max {probe.get('max_current_a')} A "
+                        f"({probe.get('reason')}).", progress=85)
                 break
 
-            # Toggle phase, save, and re-calibrate.
+            phase_attempts += 1
+            if phase_attempts >= 2:
+                raise FlashError(
+                    "Commutation failed on both phase orders (stuck while drawing "
+                    f"{probe.get('max_current_a')} A). Check motor phase wires and "
+                    "the encoder connection.")
+
+            # Commutation fault → toggle phase_order, save, and re-calibrate.
             invert_phase = not invert_phase
             new_phase_val = -1 if invert_phase else +1
             self._log(
-                f"Direction wrong — toggling phase_order to {new_phase_val:+d}, "
-                f"saving, and re-calibrating...",
+                f"Commutation fault (stuck, {probe.get('max_current_a')} A) — "
+                f"toggling phase_order to {new_phase_val:+d}, saving, re-calibrating...",
                 progress=80)
             self.status.state = FlashState.CALIBRATING
             ack_tog = await loop.run_in_executor(

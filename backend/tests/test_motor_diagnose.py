@@ -19,7 +19,7 @@ from humanoid.motor_tune import (
     _hold_error, _descent_metrics, _motion_range,
 )
 from humanoid import motor_diagnose
-from humanoid.motor_diagnose import run_diagnosis, run_gravity_tune
+from humanoid.motor_diagnose import run_diagnosis, run_gravity_tune, commutation_probe
 
 _MODE_POSITION = 0x13
 
@@ -195,6 +195,57 @@ def test_gravity_tune_knee():
     assert r["recommended"]["ki"] == 0.0
     assert r["recommended"]["kp"] >= 20.0
     print("ok test_gravity_tune_knee  (selected_kd=%s, rec=%s)" % (r["selected_kd"], r["recommended"]))
+
+
+class _ProbeFake:
+    """Minimal proxy whose reported current models torque saturation, so the
+    commutation_probe()'s stuck-while-saturated logic can be exercised."""
+    def __init__(self, *, moves, current, kt=0.0896, gear=15.0, tl=6.0):
+        self._moves, self._current, self._pos, self._target = moves, current, 0.0, 0.0
+        self._config = JointConfig(
+            joint_name="f", can_id=1, can_channel="can0",
+            torque_constant=kt, gear_ratio=gear, torque_limit=tl,
+            position_kp=20.0, velocity_kp=2.0,
+            position_limits=PositionLimits(min=-2.0, max=2.0))
+
+    @property
+    def config(self): return self._config
+    def update_config(self, c): self._config = c
+    async def write_gains(self, kp, ki, kd, tl): pass
+    async def enable(self, mode=None): pass
+    async def disable(self): pass
+    async def set_position(self, t, *a, **k):
+        self._target = t
+        if self._moves:
+            self._pos += 0.5 * (t - self._pos)
+        return None
+    def get_cached_state(self):
+        return ActuatorState(position=self._pos, velocity=0.0, torque=0.0,
+                             current=self._current, mode=_MODE_POSITION,
+                             error=0, bus_voltage=19.7)
+
+
+def test_commutation_probe_healthy():
+    # moves freely with low current -> commutates
+    r = asyncio.run(commutation_probe(_ProbeFake(moves=True, current=0.6), move_s=0.08))
+    assert r["commutates"] is True, r
+    print("ok test_commutation_probe_healthy")
+
+
+def test_commutation_probe_fault():
+    # stuck while drawing the (reduced) saturation current -> commutation fault.
+    # probe_torque_limit = 0.6*6 = 3.6 ; sat_current = 3.6/0.0896/15 = 2.68 A
+    r = asyncio.run(commutation_probe(_ProbeFake(moves=False, current=2.68), move_s=0.08))
+    assert r["commutates"] is False, r
+    assert r["saturated"] is True, r
+    print("ok test_commutation_probe_fault")
+
+
+def test_commutation_probe_kp_starved_not_fault():
+    # stuck but LOW current (Kp too low) is NOT a commutation fault
+    r = asyncio.run(commutation_probe(_ProbeFake(moves=False, current=0.5), move_s=0.08))
+    assert r["commutates"] is True, r
+    print("ok test_commutation_probe_kp_starved_not_fault")
 
 
 if __name__ == "__main__":

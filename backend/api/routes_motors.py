@@ -24,7 +24,8 @@ from pydantic import BaseModel
 
 from humanoid.daemon_client import DaemonError, DaemonNotSupportedError, Mode
 from humanoid.motor_tune import run_step_test
-from humanoid.motor_diagnose import RunawayAbort, run_diagnosis, run_gravity_tune
+from humanoid.motor_diagnose import RunawayAbort, run_diagnosis, run_gravity_tune, jog
+from humanoid.joint_defaults import apply_default_limits, default_position_limits
 from humanoid.robot_config import PositionLimits
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parents[3] / "configs" / "humanoid_lite.json"
@@ -623,4 +624,101 @@ async def remediate_phase(
             await actuator.apply_config()
         except Exception:
             pass
+        return _err(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Direction & Limits step  (set joint direction via gear_ratio sign + limits)
+# ---------------------------------------------------------------------------
+
+class JogDirectionBody(BaseModel):
+    step_rad: float = 0.15
+    move_s: float = 1.0
+
+
+@router.post("/motors/{joint_name}/jog_direction", response_model=None)
+async def jog_direction_route(
+    joint_name: str, body: JogDirectionBody, request: Request
+) -> dict | JSONResponse:
+    """Direction & Limits step: jog the joint a small, visible amount so the user
+    can see which way it moves, then return to start and idle. The user then
+    confirms direction via /set_direction. Does NOT change any config."""
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    if actuator.get_cached_state() is None:
+        return _err("Motor is OFFLINE — connect it first.", status=409)
+
+    async def _do():
+        await actuator.enable(mode=Mode.POSITION)
+        await asyncio.sleep(0.3)
+        try:
+            res = await jog(actuator, step_rad=body.step_rad, move_s=body.move_s)
+        finally:
+            await actuator.disable()
+        return {"joint_name": joint_name, **res}   # _run_cancellable wraps in _ok
+
+    return await _run_cancellable(request, _do())
+
+
+class SetDirectionBody(BaseModel):
+    reversed: bool = False
+    store_to_flash: bool = False
+
+
+@router.post("/motors/{joint_name}/set_direction", response_model=None)
+async def set_direction(
+    joint_name: str, body: SetDirectionBody, request: Request
+) -> dict | JSONResponse:
+    """Direction & Limits step: set joint direction via the SIGN of gear_ratio
+    (never phase_order). If reversed=True, flip the sign of gear_ratio — this
+    reverses the joint and keeps the loop stable with NO recalibration. Also
+    fills the joint's default position limits if it has none. Pushes to device
+    RAM; optionally stores to flash."""
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    if actuator.get_cached_state() is None:
+        return _err("Motor is OFFLINE — connect it first.", status=409)
+
+    config_path: Path = getattr(request.app.state, "config_path", _DEFAULT_CONFIG_PATH)
+    cfg0 = actuator.config
+    gear_before = cfg0.gear_ratio
+
+    def _persist(updated):
+        actuator.update_config(updated)
+        request.app.state.robot.config.joints[joint_name] = updated
+        request.app.state.robot.config.to_json(config_path)
+
+    try:
+        await actuator.disable()  # IDLE — gear_ratio is written via apply_config
+        await asyncio.sleep(0.2)
+
+        update: dict = {}
+        if body.reversed:
+            update["gear_ratio"] = -cfg0.gear_ratio
+        if cfg0.position_limits.min is None and cfg0.position_limits.max is None:
+            d = default_position_limits(joint_name)
+            if d is not None:
+                update["position_limits"] = PositionLimits(min=d[0], max=d[1])
+
+        if update:
+            _persist(cfg0.model_copy(update=update))
+            await actuator.apply_config()
+        if body.store_to_flash:
+            await actuator.store_to_flash()
+
+        new = actuator.config
+        return _ok({
+            "joint_name": joint_name,
+            "gear_ratio_before": gear_before,
+            "gear_ratio": new.gear_ratio,
+            "reversed": body.reversed,
+            "position_limits": {"min": new.position_limits.min,
+                                "max": new.position_limits.max},
+            "stored_to_flash": body.store_to_flash,
+        })
+    except DaemonNotSupportedError as exc:
+        return _err(str(exc), 503)
+    except (DaemonError, ValueError) as exc:
         return _err(str(exc))
