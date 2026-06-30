@@ -12,7 +12,7 @@
       "can_channel": "can_left_leg",
       "can_id": 1,
       "phase_inverted": true,
-      "electrical_offset": 36.1773567199707,
+      "electrical_offset": 48.847755432128906,
       "gear_ratio": 15.0,
       "position_limits": {
         "min": -0.17453292519943295,
@@ -47,7 +47,7 @@
       "can_channel": "can_left_leg",
       "can_id": 3,
       "phase_inverted": true,
-      "electrical_offset": 54.14101791381836,
+      "electrical_offset": 41.57704544067383,
       "gear_ratio": -15.0,
       "position_limits": {
         "min": -0.9826203688728075,
@@ -63,7 +63,7 @@
       "torque_filter_alpha": 0.10000000149011612,
       "current_limit": 10.0,
       "current_kp": 0.190956,
-      "current_ki": 4538.416015625,
+      "current_ki": 4538.416,
       "undervoltage_threshold": 0.0,
       "overvoltage_threshold": 0.0,
       "bus_voltage_filter_alpha": 0.009999999776482582,
@@ -82,7 +82,7 @@
       "can_channel": "can_left_leg",
       "can_id": 5,
       "phase_inverted": true,
-      "electrical_offset": 42.93788528442383,
+      "electrical_offset": 74.3344955444336,
       "gear_ratio": -15.0,
       "position_limits": {
         "min": -1.8989182261698305,
@@ -117,7 +117,7 @@
       "can_channel": "can_left_leg",
       "can_id": 7,
       "phase_inverted": true,
-      "electrical_offset": 39.19907760620117,
+      "electrical_offset": 1.3042985200881958,
       "gear_ratio": 15.0,
       "position_limits": {
         "min": 0.0,
@@ -152,7 +152,7 @@
       "can_channel": "can_left_leg",
       "can_id": 11,
       "phase_inverted": true,
-      "electrical_offset": 49.03354263305664,
+      "electrical_offset": 5.072020053863525,
       "gear_ratio": 15.0,
       "position_limits": {
         "min": -0.7853981633974483,
@@ -187,7 +187,7 @@
       "can_channel": "can_left_leg",
       "can_id": 13,
       "phase_inverted": true,
-      "electrical_offset": 21.820680618286133,
+      "electrical_offset": 15.538732528686523,
       "gear_ratio": -15.0,
       "position_limits": {
         "min": -0.2617993877991494,
@@ -203,7 +203,7 @@
       "torque_filter_alpha": 0.1454,
       "current_limit": 6.0,
       "current_kp": 0.166452,
-      "current_ki": 5747.84716796875,
+      "current_ki": 5747.847,
       "undervoltage_threshold": 0.0,
       "overvoltage_threshold": 0.0,
       "bus_voltage_filter_alpha": 0.2696,
