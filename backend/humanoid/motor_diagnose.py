@@ -173,21 +173,21 @@ async def commutation_probe(
     probe_torque_limit: float | None = None,
     runaway_band_rad: float | None = None,
     motion_stuck_rad: float = 0.05,
-    sat_frac: float = 0.85,
-    min_fault_current_a: float = 0.8,
+    min_fault_current_a: float = 1.0,
 ) -> dict:
     """Lightweight commutation check: one small guarded move under reduced torque.
 
     A commutation fault (wrong phase_order: current flows but produces no real
-    torque) shows up as *stuck while saturating the torque limit* — the position
-    controller keeps demanding torque, i_q pins at the (reduced) limit, yet the
-    encoder doesn't move. A merely Kp-starved or gravity-loaded joint stays well
-    below saturation or actually moves. Keying on saturation-vs-motion (not an
-    absolute current) keeps the check valid even though the probe torque is low.
+    torque) shows up as the encoder staying *frozen while the motor draws real
+    current* in BOTH directions. We probe both ways because the joint is usually
+    gravity-loaded (mounted): a healthy joint may be stuck going uphill yet still
+    moves in the gravity-*assisted* direction — so "moves in either direction"
+    means it commutates, while "stuck both ways while energized" is the fault. A
+    merely Kp-starved joint is stuck both ways but draws little current.
 
-    Returns {commutates, reason, moved_rad, max_current_a, saturated, runaway}.
-    Restores entry gains/torque and returns to the start position on exit. The
-    motor must already be enabled in POSITION mode.
+    Returns {commutates, reason, moved_rad, max_current_a, runaway}. Restores
+    entry gains/torque and returns to start on exit. Motor must be enabled in
+    POSITION mode.
     """
     cfg = actuator.config
     start = _require_position_mode(actuator)
@@ -200,41 +200,50 @@ async def commutation_probe(
     if runaway_band_rad is None:
         runaway_band_rad = min(0.35, 0.5 * avail) if avail > 0 else 0.35
 
-    # Choose a probe direction that has room within the soft limits.
-    lo, hi = _limits(actuator)
-    step = step_rad if (start_pos + step_rad) <= hi else -step_rad
-
-    # Current i_q that corresponds to a saturated (reduced) torque limit.
-    kt = max(1e-6, abs(cfg.torque_constant))
-    gr = max(1e-6, abs(cfg.gear_ratio))
-    sat_current = probe_torque_limit / kt / gr
-
-    samples: list[dict] = []
+    moved = 0.0
+    max_current = 0.0
+    probed_any = False
     try:
         await actuator.write_gains(kp0, ki0, kd0, probe_torque_limit)
-        try:
-            samples = await _ramp(actuator, start_pos, step, duration_s=move_s,
-                                  runaway_band_rad=runaway_band_rad)
-        except RunawayAbort:
-            # It produced enough torque to leave the band — it commutates (the
-            # loop sign / direction is a separate, gear_ratio concern).
-            return {"commutates": True, "reason": "runaway", "moved_rad": runaway_band_rad,
-                    "max_current_a": None, "saturated": True, "runaway": True}
+        for direction in (+1.0, -1.0):
+            target = _clamp_target(actuator, start_pos + direction * step_rad)
+            if abs(target - start_pos) < 0.5 * step_rad:
+                continue  # no room this way — try the other direction
+            probed_any = True
+            try:
+                samples = await _ramp(actuator, start_pos, target - start_pos,
+                                      duration_s=move_s, runaway_band_rad=runaway_band_rad)
+            except RunawayAbort:
+                # Produced enough torque to leave the band — it commutates (the
+                # loop sign / direction is a separate, gear_ratio concern).
+                return {"commutates": True, "reason": "runaway",
+                        "moved_rad": runaway_band_rad, "max_current_a": None,
+                        "runaway": True}
+            d = max((abs(s["position"] - start_pos) for s in samples), default=0.0)
+            c = max((abs(s["current"]) for s in samples), default=0.0)
+            moved = max(moved, d)
+            max_current = max(max_current, c)
+            # return to start before testing the other direction
+            await _hold(actuator, _clamp_target(actuator, start_pos), duration_s=0.5,
+                        start_pos=start_pos, runaway_band_rad=runaway_band_rad)
+            if d >= motion_stuck_rad:
+                break  # moved in this direction → it commutates; no need to test the other
     finally:
         await _restore(actuator, kp0, ki0, kd0, tl0, start_pos)
 
-    moved = max((abs(s["position"] - start_pos) for s in samples), default=0.0)
-    max_current = max((abs(s["current"]) for s in samples), default=0.0)
-    stuck = moved < motion_stuck_rad
-    saturated = max_current >= sat_frac * sat_current and max_current >= min_fault_current_a
-    fault = stuck and saturated
+    if not probed_any:
+        return {"commutates": True, "reason": "no_room",
+                "moved_rad": 0.0, "max_current_a": round(max_current, 3), "runaway": False}
+
+    stuck = moved < motion_stuck_rad          # stuck in every direction tried
+    energized = max_current >= min_fault_current_a
+    fault = stuck and energized               # frozen both ways while drawing real current
     return {
         "commutates": not fault,
-        "reason": "stuck_and_saturated" if fault else ("moved" if not stuck else "stuck_low_current"),
+        "reason": ("stuck_and_energized" if fault
+                   else "moved" if not stuck else "stuck_no_current"),
         "moved_rad": round(moved, 4),
         "max_current_a": round(max_current, 3),
-        "sat_current_a": round(sat_current, 3),
-        "saturated": saturated,
         "runaway": False,
     }
 

@@ -198,8 +198,9 @@ def test_gravity_tune_knee():
 
 
 class _ProbeFake:
-    """Minimal proxy whose reported current models torque saturation, so the
-    commutation_probe()'s stuck-while-saturated logic can be exercised."""
+    """Minimal proxy for commutation_probe. `moves` controls motion per command:
+    'both' (tracks either way), 'none' (frozen), 'down' (tracks only the negative
+    direction — models a gravity-loaded healthy joint: stuck uphill, free downhill)."""
     def __init__(self, *, moves, current, kt=0.0896, gear=15.0, tl=6.0):
         self._moves, self._current, self._pos, self._target = moves, current, 0.0, 0.0
         self._config = JointConfig(
@@ -216,7 +217,9 @@ class _ProbeFake:
     async def disable(self): pass
     async def set_position(self, t, *a, **k):
         self._target = t
-        if self._moves:
+        go = (self._moves == "both"
+              or (self._moves == "down" and t < -1e-6))
+        if go:
             self._pos += 0.5 * (t - self._pos)
         return None
     def get_cached_state(self):
@@ -227,24 +230,33 @@ class _ProbeFake:
 
 def test_commutation_probe_healthy():
     # moves freely with low current -> commutates
-    r = asyncio.run(commutation_probe(_ProbeFake(moves=True, current=0.6), move_s=0.08))
+    r = asyncio.run(commutation_probe(_ProbeFake(moves="both", current=0.6), move_s=0.08))
     assert r["commutates"] is True, r
     print("ok test_commutation_probe_healthy")
 
 
 def test_commutation_probe_fault():
-    # stuck while drawing the (reduced) saturation current -> commutation fault.
-    # probe_torque_limit = 0.6*6 = 3.6 ; sat_current = 3.6/0.0896/15 = 2.68 A
-    r = asyncio.run(commutation_probe(_ProbeFake(moves=False, current=2.68), move_s=0.08))
+    # frozen BOTH ways while drawing real current (~1.7 A) -> commutation fault
+    r = asyncio.run(commutation_probe(_ProbeFake(moves="none", current=1.712), move_s=0.08))
     assert r["commutates"] is False, r
-    assert r["saturated"] is True, r
+    assert r["reason"] == "stuck_and_energized", r
     print("ok test_commutation_probe_fault")
 
 
-def test_commutation_probe_kp_starved_not_fault():
-    # stuck but LOW current (Kp too low) is NOT a commutation fault
-    r = asyncio.run(commutation_probe(_ProbeFake(moves=False, current=0.5), move_s=0.08))
+def test_commutation_probe_gravity_loaded_ok():
+    # stuck uphill but moves in the gravity-assisted direction -> commutates
+    # (this is the case that the one-direction probe got wrong on hardware)
+    r = asyncio.run(commutation_probe(_ProbeFake(moves="down", current=1.4), move_s=0.08))
     assert r["commutates"] is True, r
+    assert r["reason"] == "moved", r
+    print("ok test_commutation_probe_gravity_loaded_ok")
+
+
+def test_commutation_probe_kp_starved_not_fault():
+    # stuck both ways but LOW current (Kp too low) is NOT a commutation fault
+    r = asyncio.run(commutation_probe(_ProbeFake(moves="none", current=0.5), move_s=0.08))
+    assert r["commutates"] is True, r
+    assert r["reason"] == "stuck_no_current", r
     print("ok test_commutation_probe_kp_starved_not_fault")
 
 
