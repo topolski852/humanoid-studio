@@ -2,6 +2,7 @@
 Motor control endpoints.
 
 GET  /motors/{joint_name}
+POST /motors/{joint_name}/connect
 POST /motors/{joint_name}/enable
 POST /motors/{joint_name}/disable
 POST /motors/{joint_name}/calibrate
@@ -13,6 +14,7 @@ POST /motors/{joint_name}/store_to_flash
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -22,6 +24,7 @@ from pydantic import BaseModel
 
 from humanoid.daemon_client import DaemonError, DaemonNotSupportedError, Mode
 from humanoid.motor_tune import run_step_test
+from humanoid.motor_diagnose import RunawayAbort, run_diagnosis, run_gravity_tune
 from humanoid.robot_config import PositionLimits
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parents[3] / "configs" / "humanoid_lite.json"
@@ -44,6 +47,38 @@ def _err(msg: str, status: int = 400) -> JSONResponse:
         {"success": False, "data": None, "error": msg},
         status_code=status,
     )
+
+
+async def _run_cancellable(request: Request, coro) -> dict | JSONResponse:
+    """Run a long actuated routine, cancelling it if the client disconnects.
+
+    Mirrors the step_test route's cancel pattern so a closed tab can't leave a
+    diagnosis/sweep running as a ghost.  RunawayAbort surfaces as 409.
+    """
+    task = asyncio.create_task(coro)
+    try:
+        while not task.done():
+            await asyncio.sleep(0.1)
+            if await request.is_disconnected():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+                return JSONResponse(
+                    {"success": False, "data": None, "error": "cancelled"},
+                    status_code=499,
+                )
+        return _ok(await task)
+    except RunawayAbort as exc:
+        task.cancel()
+        return _err(str(exc), 409)
+    except ValueError as exc:
+        task.cancel()
+        return _err(str(exc), 400)
+    except DaemonError as exc:
+        task.cancel()
+        return _err(str(exc))
 
 
 def _resolve_actuator(request: Request, joint_name: str):
@@ -85,6 +120,22 @@ _MODE_MAP = {
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@router.post("/motors/{joint_name}/connect", response_model=None)
+async def connect_motor_single(joint_name: str, request: Request) -> dict | JSONResponse:
+    """Configure a single motor (OFFLINE → IDLE) without touching other motors."""
+    robot = request.app.state.robot
+    if robot is None:
+        return _err("No robot config loaded — PUT /robot/config first", 503)
+    if robot.get_actuator_by_name(joint_name) is None:
+        return _err(f"No joint named '{joint_name}'", 404)
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, robot.connect_single, joint_name)
+        return _ok({"joint_name": joint_name, "connected": True})
+    except DaemonError as exc:
+        return _err(str(exc))
+
 
 @router.get("/motors/{joint_name}", response_model=None)
 async def get_motor(joint_name: str, request: Request) -> dict | JSONResponse:
@@ -249,7 +300,9 @@ async def apply_motor_config(
             status=409,
         )
     try:
-        updated = actuator.config.model_copy(update=body.config, validate=True)
+        updated = actuator.config.__class__.model_validate(
+            {**actuator.config.model_dump(), **body.config}
+        )
         actuator.update_config(updated)
         request.app.state.robot.config.joints[joint_name] = updated
         config_path: Path = getattr(request.app.state, "config_path", _DEFAULT_CONFIG_PATH)
@@ -266,6 +319,7 @@ async def apply_motor_config(
 class WriteGainsBody(BaseModel):
     position_kp: float
     position_ki: float
+    velocity_kp: float
     torque_limit: float
 
 
@@ -274,7 +328,7 @@ async def write_motor_gains(
     joint_name: str, body: WriteGainsBody, request: Request
 ) -> dict | JSONResponse:
     """
-    Write only position_kp, position_ki, torque_limit to device RAM (~3 SDOs, ~15 ms).
+    Write position_kp, position_ki, velocity_kp (Kd), torque_limit to device RAM (~4 SDOs, ~20 ms).
     Does not persist to flash or update the JSON config file.
     Use apply_config for a full commit.
     """
@@ -285,7 +339,8 @@ async def write_motor_gains(
     if cached_state is None:
         return _err("Motor is OFFLINE — cannot write gains.", status=409)
     try:
-        await actuator.write_gains(body.position_kp, body.position_ki, body.torque_limit)
+        await actuator.write_gains(body.position_kp, body.position_ki,
+                                   body.velocity_kp, body.torque_limit)
         return _ok({"applied": True})
     except DaemonError as exc:
         return _err(str(exc))
@@ -362,6 +417,7 @@ async def store_motor_to_flash(joint_name: str, request: Request) -> dict | JSON
 class StepTestBody(BaseModel):
     position_kp: float
     position_ki: float
+    velocity_kp: float
     torque_limit: float
     center_rad: float
     offset_rad: float = 0.45
@@ -379,14 +435,192 @@ async def step_test_motor(
     The motor must be in POSITION mode (enabled).  The total duration is
     step_hold_s * (num_steps + 1) seconds (including pre-settle at pos_a).
     Returns samples and step-response metrics.
+
+    Cancels automatically if the client disconnects (tab close / navigation),
+    preventing the step sequence from continuing as a ghost after the UI leaves.
     """
     actuator, error = _resolve_actuator(request, joint_name)
     if error:
         return error
+    task = asyncio.create_task(run_step_test(actuator, **body.model_dump()))
     try:
-        result = await run_step_test(actuator, **body.model_dump())
-        return _ok(result)
+        while not task.done():
+            await asyncio.sleep(0.1)
+            if await request.is_disconnected():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                return JSONResponse(
+                    {"success": False, "data": None, "error": "cancelled"},
+                    status_code=499,
+                )
+        return _ok(await task)
     except ValueError as exc:
+        task.cancel()
         return _err(str(exc), 400)
     except DaemonError as exc:
+        task.cancel()
+        return _err(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic + gravity-aware auto-tuner (Workflow A / B)
+# ---------------------------------------------------------------------------
+
+class DiagnoseBody(BaseModel):
+    step_rad: float = 0.15
+    hold_s: float = 1.0
+    ramp_rad: float = 0.25
+    ramp_s: float = 3.0
+    diag_torque_limit: float | None = None
+    runaway_band_rad: float | None = None
+    current_fault_a: float = 3.0
+
+
+class GravityTuneBody(BaseModel):
+    kp: float
+    torque_limit: float
+    ki: float = 0.0
+    kd_values: list[float] = [0.5, 1.0, 2.0, 4.0, 8.0]
+    lift_rad: float = 0.25
+    lift_sign: float = 1.0
+    hold_s: float = 1.5
+    test_ki: bool = False
+
+
+class RaiseTorqueBody(BaseModel):
+    torque_limit: float
+    confirm: bool = False
+
+
+class PhaseRemediationBody(BaseModel):
+    confirm: bool = False
+
+
+@router.post("/motors/{joint_name}/diagnose", response_model=None)
+async def diagnose_motor(
+    joint_name: str, body: DiagnoseBody, request: Request
+) -> dict | JSONResponse:
+    """Workflow A — classify why a joint misbehaves (non-destructive).
+
+    Runs a guarded move + commutation ramp under a low diagnosis torque limit and
+    returns {classification, evidence, recommendation, rationale, thresholds}.
+    The recommendation is advisory — remediation is a separate confirmed call.
+    Motor must be enabled in POSITION mode.
+    """
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    return await _run_cancellable(request, run_diagnosis(actuator, **body.model_dump()))
+
+
+@router.post("/motors/{joint_name}/gravity_tune", response_model=None)
+async def gravity_tune_motor(
+    joint_name: str, body: GravityTuneBody, request: Request
+) -> dict | JSONResponse:
+    """Workflow B — lift/drop Kd sweep for a gravity-loaded joint (non-destructive).
+
+    Gains are written to RAM transiently and restored on exit.  Returns the sweep
+    table, selected Kd, recommended Kp/Kd, and a Ki-windup finding.
+    Motor must be enabled in POSITION mode.
+    """
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    return await _run_cancellable(request, run_gravity_tune(actuator, **body.model_dump()))
+
+
+@router.post("/motors/{joint_name}/raise_torque_limit", response_model=None)
+async def raise_torque_limit_route(
+    joint_name: str, body: RaiseTorqueBody, request: Request
+) -> dict | JSONResponse:
+    """Write a higher torque_limit to RAM (confirmed remediation for torque-starved)."""
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    if not body.confirm:
+        return _err("confirmation required", 400)
+    if actuator.get_cached_state() is None:
+        return _err("Motor is OFFLINE — cannot write gains.", status=409)
+    try:
+        cfg = actuator.config
+        await actuator.write_gains(cfg.position_kp, cfg.position_ki,
+                                   cfg.velocity_kp, body.torque_limit)
+        return _ok({"torque_limit": body.torque_limit, "applied": True})
+    except DaemonError as exc:
+        return _err(str(exc))
+
+
+@router.post("/motors/{joint_name}/remediate_phase", response_model=None)
+async def remediate_phase(
+    joint_name: str, body: PhaseRemediationBody, request: Request
+) -> dict | JSONResponse:
+    """Confirmed remediation for COMMUTATION_FAULT: flip phase_inverted, recalibrate
+    flux (required after a phase flip), persist, then re-diagnose to confirm.
+
+    This spins the motor (~90 s) and writes the new flux offset + phase to JSON and
+    device RAM.  It does NOT store to flash — the UI offers a separate confirmed
+    Persist-to-Flash step.  Wrapped so a failed recal restores the prior phase.
+    """
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    if not body.confirm:
+        return _err("confirmation required for phase flip + recalibration", 400)
+    if actuator.get_cached_state() is None:
+        return _err("Motor is OFFLINE — connect it first.", status=409)
+
+    config_path: Path = getattr(request.app.state, "config_path", _DEFAULT_CONFIG_PATH)
+    cfg0 = actuator.config
+    flux_before = cfg0.electrical_offset
+    phase_before = cfg0.phase_inverted
+
+    def _persist(updated):
+        actuator.update_config(updated)
+        request.app.state.robot.config.joints[joint_name] = updated
+        request.app.state.robot.config.to_json(config_path)
+
+    try:
+        # Calibration runs in IDLE; also avoids writing phase_order while enabled.
+        await actuator.disable()
+        await asyncio.sleep(0.2)
+
+        # 1. flip phase_inverted, persist + push to RAM
+        _persist(cfg0.model_copy(update={"phase_inverted": not cfg0.phase_inverted}))
+        await actuator.apply_config()
+
+        # 2. recalibrate flux for the new phase order (updates actuator.config)
+        flux_after = await actuator.calibrate_offset(timeout=90.0)
+
+        # 3. persist the freshly-calibrated offset (+ flipped phase) and push to RAM
+        _persist(actuator.config)
+        await actuator.apply_config()
+
+        # 4. re-diagnose to confirm it now commutates (current should drop, it tracks)
+        await actuator.enable(mode=Mode.POSITION)
+        await asyncio.sleep(0.3)
+        recheck = await run_diagnosis(actuator)
+        return _ok({
+            "phase_inverted": actuator.config.phase_inverted,
+            "flux_before": flux_before,
+            "flux_after": flux_after,
+            "recheck": {
+                "classification": recheck["classification"],
+                "evidence": recheck["evidence"],
+                "rationale": recheck["rationale"],
+            },
+        })
+    except DaemonNotSupportedError as exc:
+        return _err(str(exc), 503)
+    except (DaemonError, ValueError) as exc:
+        # Best-effort restore of the prior phase so a failed recal can't leave it
+        # mis-commutated with the flipped phase.
+        try:
+            _persist(cfg0.model_copy(update={"phase_inverted": phase_before,
+                                             "electrical_offset": flux_before}))
+            await actuator.apply_config()
+        except Exception:
+            pass
         return _err(str(exc))

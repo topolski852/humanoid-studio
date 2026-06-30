@@ -197,8 +197,11 @@ void Robot::telemetry_loop() {
 static json firmware_version_json(uint32_t fw) {
     if (fw == 0) return json(nullptr);
     char buf[16];
+    // Version is packed 0xMMmmPPrr (major, minor, patch, reserved).
+    // The patch byte is bits 8-15; the low byte is reserved/zero.  Reading
+    // (fw & 0xFFFF) here mis-printed the patch (e.g. 0x03010100 → "v3.1.256").
     std::snprintf(buf, sizeof(buf), "v%u.%u.%u",
-                  (fw >> 24) & 0xFF, (fw >> 16) & 0xFF, fw & 0xFFFF);
+                  (fw >> 24) & 0xFF, (fw >> 16) & 0xFF, (fw >> 8) & 0xFF);
     return json(buf);
 }
 
@@ -315,8 +318,10 @@ std::string Robot::handle_command(const std::string& request) {
         if (it == actuator_by_name_.end()) return error("unknown joint: " + name);
         if (mode == "POSITION" || mode == "ENABLED") {
             it->second->request_state(JointState::ENABLED);
-        } else if (mode == "IDLE" || mode == "DISABLED") {
+        } else if (mode == "IDLE") {
             it->second->request_state(JointState::IDLE);
+        } else if (mode == "DISABLED") {
+            it->second->request_state(JointState::DISABLED);
         } else {
             return error("unknown mode: " + mode);
         }
@@ -328,8 +333,10 @@ std::string Robot::handle_command(const std::string& request) {
         JointState target;
         if (mode == "POSITION" || mode == "ENABLED") {
             target = JointState::ENABLED;
-        } else if (mode == "IDLE" || mode == "DISABLED") {
+        } else if (mode == "IDLE") {
             target = JointState::IDLE;
+        } else if (mode == "DISABLED") {
+            target = JointState::DISABLED;
         } else {
             return error("unknown mode: " + mode);
         }
@@ -370,6 +377,20 @@ std::string Robot::handle_command(const std::string& request) {
     }
 
     if (type == "APPLY_ALL_CONFIGS") {
+        // Wake phase: transition all motors to IDLE via the state machine so that the
+        // daemon state is already IDLE when the heartbeat ACK arrives.  Using
+        // request_state() rather than a raw CAN send is essential: a raw NMT IDLE send
+        // leaves daemon state as DISABLED, so the heartbeat ACK triggers
+        // needs_idle_wakeup_ again and immediately sends another NMT IDLE — a loop.
+        // request_state(IDLE) sets the daemon state in the next control tick (< 5 ms),
+        // so by the time the ACK arrives the condition is already IDLE and no spurious
+        // wakeup fires.  NMT IDLE is idempotent for motors already in IDLE.
+        for (auto& a : actuators_) {
+            if (!bus_mgr_->is_open(a->can_channel())) continue;
+            a->request_state(JointState::IDLE);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
         // Skip joints whose CAN bus is not open — avoids 500 ms SDO timeout per
         // joint when only a subset of buses are physically connected.  A partial
         // robot (e.g. only left_leg attached) can now apply_config successfully
@@ -578,7 +599,8 @@ std::string Robot::handle_command(const std::string& request) {
                 "param=0x%04X — %s (sniff captured %zu frames)\n",
                 MAX_SDO_ATTEMPTS, device_id, channel.c_str(), param_id,
                 diag, sniff_frames.size());
-            return json{{"type","SDO_READ_RESULT"},{"id",id},{"status","TIMEOUT"}}.dump();
+            return json{{"type","SDO_READ_RESULT"},{"id",id},{"status","TIMEOUT"},
+                        {"sniff_count",(int)sniff_frames.size()}}.dump();
         }
 
         // Production firmware: 8-byte response, value at bytes 4-7.
@@ -857,8 +879,9 @@ std::string Robot::handle_command(const std::string& request) {
         if (it == actuator_by_name_.end()) return error("unknown joint: " + name);
         float kp           = req.value("position_kp",  0.0f);
         float ki           = req.value("position_ki",  0.0f);
+        float velocity_kp  = req.value("velocity_kp",  0.0f);
         float torque_limit = req.value("torque_limit", 0.0f);
-        bool ok = it->second->write_gains(*bus_mgr_, kp, ki, torque_limit);
+        bool ok = it->second->write_gains(*bus_mgr_, kp, ki, velocity_kp, torque_limit);
         return ok ? ack() : error("write_gains failed for " + name);
     }
 

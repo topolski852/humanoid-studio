@@ -13,6 +13,7 @@ using ms    = std::chrono::milliseconds;
 const char* joint_state_name(JointState s) {
     switch (s) {
         case JointState::OFFLINE:     return "OFFLINE";
+        case JointState::DISABLED:    return "DISABLED";
         case JointState::IDLE:        return "IDLE";
         case JointState::ENABLED:     return "ENABLED";
         case JointState::CALIBRATING: return "CALIBRATING";
@@ -52,7 +53,10 @@ void Actuator::on_rx_frame(const can_frame& frame) {
         state_.updated_at    = Clock::now();
         last_alive_received_ = Clock::now();
 
-        // Seeing PDO4 means the device is alive — advance from OFFLINE.
+        // PDO4 from an OFFLINE motor means it power-cycled back to life — wake it.
+        // Do NOT auto-advance from DISABLED: the heartbeat ACK to our own NMT DISABLED
+        // would set needs_idle_wakeup_ and immediately counter the disconnect with NMT IDLE.
+        // DISABLED→IDLE only happens via an explicit request_state(IDLE) (connect path).
         if (state_.joint_state == JointState::OFFLINE) {
             state_.joint_state = JointState::IDLE;
             needs_idle_wakeup_  = true;
@@ -73,7 +77,9 @@ void Actuator::on_rx_frame(const can_frame& frame) {
         state_.updated_at    = Clock::now();
         last_alive_received_ = Clock::now();
 
-        // Device is alive.
+        // Heartbeat from OFFLINE → motor came back after power-cycle; wake it.
+        // Same reasoning as the PDO4 handler: do NOT auto-advance from DISABLED, or
+        // the NMT DISABLED ACK heartbeat would undo the disconnect via needs_idle_wakeup_.
         if (state_.joint_state == JointState::OFFLINE) {
             state_.joint_state = JointState::IDLE;
             needs_idle_wakeup_   = true;
@@ -208,7 +214,10 @@ void Actuator::tick(CanBusManager& bus) {
     // oscillating OFFLINE→IDLE→OFFLINE every 500 ms.
     {
         std::lock_guard<std::mutex> lk(state_mutex_);
-        if (state_.joint_state != JointState::OFFLINE) {
+        // DISABLED motors are intentionally silent — suppress the OFFLINE timer so
+        // they don't oscillate DISABLED→OFFLINE when no frames arrive.
+        if (state_.joint_state != JointState::OFFLINE &&
+            state_.joint_state != JointState::DISABLED) {
             auto stale_ms = std::chrono::duration_cast<ms>(
                 Clock::now() - last_alive_received_).count();
             if (stale_ms > 1500) {
@@ -278,6 +287,10 @@ void Actuator::tick(CanBusManager& bus) {
                 return;
             } else if (target == JointState::IDLE) {
                 nmt.data[0] = static_cast<uint8_t>(MotorMode::MODE_IDLE);
+                nmt.data[1] = static_cast<uint8_t>(cfg_.device_id);
+                send_nmt = true;
+            } else if (target == JointState::DISABLED) {
+                nmt.data[0] = static_cast<uint8_t>(MotorMode::MODE_DISABLED);
                 nmt.data[1] = static_cast<uint8_t>(cfg_.device_id);
                 send_nmt = true;
             } else if (target == JointState::CALIBRATING && current_state == JointState::IDLE) {
@@ -550,8 +563,8 @@ bool Actuator::apply_config(CanBusManager& bus, int timeout_ms) {
 
 // ── write_gains ──────────────────────────────────────────────────────────────
 
-bool Actuator::write_gains(CanBusManager& bus, float kp, float ki, float torque_limit,
-                           int timeout_ms) {
+bool Actuator::write_gains(CanBusManager& bus, float kp, float ki, float velocity_kp,
+                           float torque_limit, int timeout_ms) {
     using P = ParamId;
     if (!sdo_write_f32(bus, static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_KP),
                        kp, timeout_ms)) {
@@ -561,6 +574,11 @@ bool Actuator::write_gains(CanBusManager& bus, float kp, float ki, float torque_
     if (!sdo_write_f32(bus, static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_POSITION_KI),
                        ki, timeout_ms)) {
         fprintf(stderr, "[Actuator] write_gains: Ki write failed for %s\n", cfg_.name.c_str());
+        return false;
+    }
+    if (!sdo_write_f32(bus, static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_VELOCITY_KP),
+                       velocity_kp, timeout_ms)) {
+        fprintf(stderr, "[Actuator] write_gains: velocity_kp write failed for %s\n", cfg_.name.c_str());
         return false;
     }
     if (!sdo_write_f32(bus, static_cast<uint16_t>(P::PARAM_POSITION_CONTROLLER_TORQUE_LIMIT),

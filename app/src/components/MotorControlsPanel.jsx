@@ -3,6 +3,7 @@ import { api } from '../api'
 import { useControlWebSocket } from '../hooks/useControlWebSocket'
 
 const DEG = Math.PI / 180
+const R2D = 180 / Math.PI
 const JOG_STEP_DEG = 1
 
 // Modes where the motor actively accepts position/torque/current commands
@@ -32,9 +33,21 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
   const [sineFreq,      setSineFreq]      = useState(0.5)
   const [sineAmpDeg,    setSineAmpDeg]    = useState('30')
   const [sineOffsetDeg, setSineOffsetDeg] = useState('0')
-  const sineRef = useRef(null)
+  const sineRef       = useRef(null)
   const sineOffsetNum = parseFloat(sineOffsetDeg) || 0
   const sineAmpNum    = Math.max(1, parseFloat(sineAmpDeg) || 30)
+
+  // Seed jog target and sine center from the motor's current position the first
+  // time telemetry arrives.  Prevents the default '0' from commanding a motor
+  // whose range starts at 0° (e.g. knee) straight to its hard stop.
+  const posInit = useRef(false)
+  useEffect(() => {
+    if (posInit.current || state?.position == null) return
+    posInit.current = true
+    const posDeg = parseFloat((state.position * R2D).toFixed(1))
+    setJogTargetDeg(posDeg)
+    setSineOffsetDeg(String(posDeg))
+  }, [state])
 
   const minRad = config?.position_limits?.min ?? null
   const maxRad = config?.position_limits?.max ?? null
@@ -108,17 +121,23 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
   }
 
   // ── Sine wave ──────────────────────────────────────────────────────────────
+  // Maximum safe amplitude = distance from center to the nearest limit.
+  // Negative when center is outside limits (prevents Start Sine from firing).
   const sineMaxAmpDeg = minRad != null && maxRad != null
     ? Math.min(maxDeg - sineOffsetNum, sineOffsetNum - minDeg)
     : 180
+  // Amplitude actually used — capped to limits and also capped to what the
+  // user requested.  Computed at render time so startSine captures it correctly.
+  const sineClampedAmpDeg = Math.min(sineAmpNum, Math.max(0, sineMaxAmpDeg - 0.1))
+  const sineDisabled = !isEnabled || sineClampedAmpDeg < 0.5
 
   function startSine() {
     if (sineRef.current) return
     setSineRunning(true)
-    const offsetRad = sineOffsetNum * DEG
+    const offsetRad    = sineOffsetNum * DEG
+    const clampedAmpRad = sineClampedAmpDeg * DEG
     sineRef.current = setInterval(() => {
-      const clampedAmp = Math.min(sineAmpNum, Math.max(0, sineMaxAmpDeg - 0.1))
-      const target = offsetRad + Math.sin(2 * Math.PI * sineFreq * (Date.now() / 1000)) * (clampedAmp * DEG)
+      const target = offsetRad + Math.sin(2 * Math.PI * sineFreq * (Date.now() / 1000)) * clampedAmpRad
       const sent = sendPositionCommand(jointName, target)
       if (!sent) api.setPosition(jointName, target).catch(() => {})
     }, 100)
@@ -344,17 +363,21 @@ export default function MotorControlsPanel({ jointName, state, config, onLogErro
             <span className="font-mono text-xs text-gray-300 w-12 text-right">° pk</span>
           </div>
         </div>
-        {sineAmpNum > sineMaxAmpDeg && (
-          <p className="text-[10px] text-amber-400 mb-2">
-            Exceeds joint limits at this center — max safe amplitude: {Math.max(0, sineMaxAmpDeg).toFixed(0)}°
+        {sineMaxAmpDeg <= 0 ? (
+          <p className="text-[10px] text-danger mb-2">
+            Center ({sineOffsetNum.toFixed(0)}°) is outside joint limits [{minDeg.toFixed(0)}°–{maxDeg.toFixed(0)}°] — adjust Center
           </p>
-        )}
+        ) : sineAmpNum > sineMaxAmpDeg ? (
+          <p className="text-[10px] text-amber-400 mb-2">
+            Exceeds joint limits at this center — using max safe amplitude: {Math.max(0, sineMaxAmpDeg).toFixed(0)}°
+          </p>
+        ) : null}
         {!isEnabled && (
           <p className="text-[10px] text-gray-500 mb-2">Enable motor first</p>
         )}
         <button
           onClick={sineRunning ? stopSine : startSine}
-          disabled={!isEnabled}
+          disabled={sineRunning ? false : sineDisabled}
           className={`w-full py-2 rounded-lg text-xs font-medium transition-colors border
             ${sineRunning
               ? 'bg-danger/20 text-danger border-danger/30 hover:bg-danger/30'

@@ -22,6 +22,7 @@
 
 enum class JointState {
     OFFLINE,
+    DISABLED,    // intentionally silenced via NMT MODE_DISABLED; OFFLINE timer suppressed
     IDLE,
     ENABLED,
     CALIBRATING,
@@ -90,10 +91,10 @@ public:
     // OFFLINE→IDLE so a motor power-cycle forces a full rewrite on next connect.
     bool apply_config(CanBusManager& bus, int timeout_ms = 500);
 
-    // Write only the three tuning gains to device RAM.  ~15 ms vs ~135 ms for full
+    // Write only the four tuning gains to device RAM.  ~20 ms vs ~135 ms for full
     // apply_config.  Does not update cfg_ — gains survive until motor power-cycles.
-    bool write_gains(CanBusManager& bus, float kp, float ki, float torque_limit,
-                     int timeout_ms = 500);
+    bool write_gains(CanBusManager& bus, float kp, float ki, float velocity_kp,
+                     float torque_limit, int timeout_ms = 500);
 
     // Send FUNC_FLASH store command; blocks ~150 ms for flash write to complete.
     void store_to_flash(CanBusManager& bus);

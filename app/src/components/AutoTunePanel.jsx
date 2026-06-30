@@ -8,42 +8,18 @@ import {
   ResponsiveContainer,
 } from 'recharts'
 import { api } from '../api'
-
-const DEG = Math.PI / 180
-const R2D = 180 / Math.PI
-
-const SIGNAL_CONFIG = [
-  { key: 'commanded',   label: 'Position Cmd (°)',  color: '#3b82f6', yAxisId: 'pos',   strokeDasharray: '4 2' },
-  { key: 'position',    label: 'Position Meas (°)', color: '#22c55e', yAxisId: 'pos' },
-  { key: 'velocity',    label: 'Velocity (°/s)',    color: '#eab308', yAxisId: 'other' },
-  { key: 'torque',      label: 'Torque (Nm)',       color: '#f97316', yAxisId: 'other' },
-  { key: 'current',     label: 'Current (A)',       color: '#ef4444', yAxisId: 'other' },
-  { key: 'bus_voltage', label: 'Bus Voltage (V)',   color: '#94a3b8', yAxisId: 'other' },
-]
-
-const DEFAULT_VISIBLE = new Set(['commanded', 'position', 'velocity', 'torque'])
-
-// Convert raw samples (rad) to display units (deg) for chart
-function toDisplaySamples(samples) {
-  return samples.map((s) => ({
-    ...s,
-    commanded:   s.commanded   != null ? s.commanded   * R2D : null,
-    position:    s.position    != null ? s.position    * R2D : null,
-    velocity:    s.velocity    != null ? s.velocity    * R2D : null,
-  }))
-}
-
-const ACTIVE_MODES = new Set(['POSITION', 'VELOCITY', 'TORQUE', 'CURRENT'])
+import {
+  DEG, R2D, round1, round2, ACTIVE_MODES,
+  SIGNAL_CONFIG, DEFAULT_VISIBLE, toDisplaySamples,
+  SectionLabel, Field, MetricRow,
+} from './tunePanelKit'
 
 // ── Suggestion algorithm ───────────────────────────────────────────────────────
 
-const round1 = (v) => Math.round(v * 10) / 10
-const round2 = (v) => Math.round(v * 100) / 100
-
 /**
  * Compute suggested gains from step-test metrics.
- * params: { position_kp, position_ki, torque_limit, offset_rad }
- * Returns: { kp, ki, torqueLimit, rationale: string[], quality: 'good'|'marginal'|'poor' }
+ * params: { position_kp, position_ki, velocity_kp, torque_limit, offset_rad }
+ * Returns: { kp, ki, kd, torqueLimit, rationale: string[], quality: 'good'|'marginal'|'poor' }
  */
 function computeSuggestion(metrics, params) {
   const {
@@ -54,17 +30,18 @@ function computeSuggestion(metrics, params) {
     torque_saturated,
     no_motion_detected,
   } = metrics
-  const { position_kp: kp, position_ki: ki, torque_limit, offset_rad } = params
+  const { position_kp: kp, position_ki: ki, velocity_kp: kd, torque_limit, offset_rad } = params
 
   const rationale = []
   let newKp          = kp
   let newKi          = ki
+  let newKd          = kd
   let newTorqueLimit = torque_limit
   let quality        = 'good'
 
   if (no_motion_detected) {
     rationale.push('Motor did not move — verify it is enabled and position limits allow the commanded range')
-    return { kp: newKp, ki: newKi, torqueLimit: newTorqueLimit, rationale, quality: 'poor' }
+    return { kp: newKp, ki: newKi, kd: newKd, torqueLimit: newTorqueLimit, rationale, quality: 'poor' }
   }
 
   // ── Kp / torque-limit decision (priority order) ───────────────────────────
@@ -121,21 +98,45 @@ function computeSuggestion(metrics, params) {
   // Hard safety cap — clamp to ±12%/+8% regardless of heuristic above
   newKp = Math.max(kpFloor, Math.min(kpCeil, newKp))
 
+  // ── Velocity Kp (Kd / damping) decision ──────────────────────────────────
+  // Only adjust Kd when torque response is meaningful (not saturated, not stalled).
+  // High overshoot → underdamped → increase Kd.
+  // Very low overshoot + slow settling → overdamped → reduce Kd slightly.
+  // Cap at ±15% per step.
+  if (!torque_saturated && !no_motion_detected) {
+    const kdFloor = round2(kd * 0.85)
+    const kdCeil  = round2(kd * 1.15)
+    if (overshoot > 15) {
+      rationale.push(`Underdamped — increase velocity Kp (Kd) to reduce ringing`)
+      newKd = round2(kd * 1.12)          // +12%
+    } else if (overshoot > 8) {
+      rationale.push(`Overshoot ${overshoot.toFixed(1)}% — small Kd increase for more damping`)
+      newKd = round2(kd * 1.06)          // +6%
+    } else if (overshoot < 2 && settling != null && settling > 800) {
+      rationale.push(`Overdamped (${settling} ms settling) — reduce Kd slightly`)
+      newKd = round2(kd * 0.92)          // −8%
+    } else if (overshoot >= 2 && overshoot <= 8 && settling != null && settling < 500) {
+      rationale.push(`Velocity Kp (Kd) looks good`)
+    }
+    newKd = Math.max(kdFloor, Math.min(kdCeil, newKd))
+  }
+
   // Ki is held constant — integral wind-up risk is high without knowing firmware integrator limits.
-  // Tune Ki manually in the Tune tab after Kp is satisfactory.
+  // Tune Ki manually in the Tune tab after Kp and Kd are satisfactory.
   if (sseRad != null) {
     const sseDeg = sseRad * R2D
     if (sseDeg > 2.0 && ki === 0) {
-      rationale.push(`Steady-state error ${sseDeg.toFixed(1)}° — consider adding a small Ki in the Tune tab once Kp is set`)
+      rationale.push(`Steady-state error ${sseDeg.toFixed(1)}° — consider adding a small Ki in the Tune tab once Kp/Kd are set`)
     }
   }
 
-  return { kp: newKp, ki: newKi, torqueLimit: newTorqueLimit, rationale, quality }
+  return { kp: newKp, ki: newKi, kd: newKd, torqueLimit: newTorqueLimit, rationale, quality }
 }
 
 export default function AutoTunePanel({ jointName, state, config, onLogError }) {
   const [testKp,          setTestKp]          = useState('20')
   const [testKi,          setTestKi]          = useState('0')
+  const [testVelocityKp,  setTestVelocityKp]  = useState('1')
   const [testTorqueLimit, setTestTorqueLimit] = useState('2')
   const [centerDeg,       setCenterDeg]       = useState('0')
   const [offsetDeg,       setOffsetDeg]       = useState('25')
@@ -177,6 +178,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
     cfgInit.current = true
     if (config.position_kp != null) setTestKp(String(config.position_kp))
     if (config.position_ki != null) setTestKi(String(config.position_ki))
+    if (config.velocity_kp != null) setTestVelocityKp(String(config.velocity_kp))
     if (config.torque_limit != null) setTestTorqueLimit(String(config.torque_limit))
   }, [config])
 
@@ -228,6 +230,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
     // so "Try These Gains" cannot cascade the suggestion without a new test.
     const kp  = parseFloat(testKp)          || 0
     const ki  = parseFloat(testKi)          || 0
+    const kd  = parseFloat(testVelocityKp)  || 0
     const tl  = parseFloat(testTorqueLimit) || 0
     const ctr = parseFloat(centerDeg)       || 0
     const off = parseFloat(offsetDeg)       || 0
@@ -236,6 +239,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
     const params = {
       position_kp:  kp,
       position_ki:  ki,
+      velocity_kp:  kd,
       torque_limit: tl,
       offset_rad:   off * DEG,
     }
@@ -244,6 +248,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
       const res = await api.runStepTest(jointName, {
         position_kp:   kp,
         position_ki:   ki,
+        velocity_kp:   kd,
         torque_limit:  tl,
         center_rad:    ctr * DEG,
         offset_rad:    off * DEG,
@@ -262,7 +267,9 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
 
   async function applyGains() {
     try {
-      await api.writeMotorGains(jointName, parseFloat(testKp)||0, parseFloat(testKi)||0, parseFloat(testTorqueLimit)||0)
+      await api.writeMotorGains(jointName,
+        parseFloat(testKp)||0, parseFloat(testKi)||0,
+        parseFloat(testVelocityKp)||0, parseFloat(testTorqueLimit)||0)
     } catch (e) {
       const msg = `Apply gains failed: ${e.message}`
       setRunError(msg)
@@ -274,6 +281,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
   function trySuggestion(s) {
     setTestKp(String(s.kp))
     setTestKi(String(s.ki))
+    setTestVelocityKp(String(s.kd))
     setTestTorqueLimit(String(s.torqueLimit))
     setTriedSuggestion(true)
   }
@@ -281,7 +289,7 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
   async function applySuggestion(s) {
     setApplyingSuggestion(true)
     try {
-      await api.writeMotorGains(jointName, s.kp, s.ki, s.torqueLimit)
+      await api.writeMotorGains(jointName, s.kp, s.ki, s.kd, s.torqueLimit)
     } catch (e) {
       const msg = `Apply suggestion failed: ${e.message}`
       setRunError(msg)
@@ -387,11 +395,15 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
       {/* ── Gains ────────────────────────────────────────────────────────── */}
       <section className="space-y-2">
         <SectionLabel>Gains for Test</SectionLabel>
-        <div className="grid grid-cols-3 gap-2">
-          <Field label="Position Kp"      value={testKp}          onChange={setTestKp} />
-          <Field label="Position Ki"      value={testKi}          onChange={setTestKi} />
-          <Field label="Torque Limit (Nm)" value={testTorqueLimit} onChange={setTestTorqueLimit} />
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Position Kp"        value={testKp}          onChange={setTestKp} />
+          <Field label="Velocity Kp (Kd)"   value={testVelocityKp}  onChange={setTestVelocityKp} />
+          <Field label="Position Ki"        value={testKi}          onChange={setTestKi} />
+          <Field label="Torque Limit (Nm)"  value={testTorqueLimit} onChange={setTestTorqueLimit} />
         </div>
+        <p className="text-[10px] text-gray-600">
+          Velocity Kp acts as damping (Kd) in position mode — higher value reduces overshoot and ringing
+        </p>
       </section>
 
       {/* ── Step parameters ──────────────────────────────────────────────── */}
@@ -436,6 +448,19 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
       {/* ── Results ──────────────────────────────────────────────────────── */}
       {result && (
         <>
+          {/* Clipping warning: shown when position limits reduced the step range */}
+          {result.params_used && (() => {
+            const usedOff = result.params_used.offset_rad * R2D
+            const reqOff  = parseFloat(offsetDeg) || 0
+            if (reqOff === 0 || Math.abs(usedOff - reqOff) < reqOff * 0.02) return null
+            return (
+              <div className="px-2.5 py-1.5 rounded border border-warn/30 bg-warn/10
+                text-[10px] text-warn">
+                Position limits clipped range to ±{usedOff.toFixed(1)}° (requested ±{reqOff.toFixed(1)}°)
+              </div>
+            )
+          })()}
+
           {/* Signal toggles */}
           <section className="space-y-2">
             <SectionLabel>Signals</SectionLabel>
@@ -595,47 +620,8 @@ export default function AutoTunePanel({ jointName, state, config, onLogError }) 
   )
 }
 
-function SectionLabel({ children }) {
-  return (
-    <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">
-      {children}
-    </p>
-  )
-}
-
-function Field({ label, value, onChange }) {
-  return (
-    <div className="space-y-0.5">
-      <p className="text-[9px] text-gray-600">{label}</p>
-      <input
-        type="text"
-        inputMode="decimal"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        onBlur={(e) => {
-          const n = parseFloat(e.target.value)
-          if (!isNaN(n)) onChange(String(n))
-        }}
-        className="w-full px-2 py-1 rounded border border-surface-3 bg-surface-2
-          text-xs font-mono text-gray-200 outline-none focus:border-accent/50 transition-colors"
-      />
-    </div>
-  )
-}
-
-function MetricRow({ label, value, warn = false }) {
-  return (
-    <>
-      <span className="text-gray-500">{label}</span>
-      <span className={`font-mono text-right ${warn ? 'text-amber-400' : 'text-gray-200'}`}>
-        {value}
-      </span>
-    </>
-  )
-}
-
 function SuggestionCard({ suggestion, testedKp, tried, applying, canApply, onTry, onApply }) {
-  const { kp, ki, torqueLimit, rationale, quality } = suggestion
+  const { kp, ki, kd, torqueLimit, rationale, quality } = suggestion
 
   const borderCls = quality === 'good'     ? 'border-online/40'
                   : quality === 'marginal' ? 'border-warn/40'
@@ -676,9 +662,10 @@ function SuggestionCard({ suggestion, testedKp, tried, applying, canApply, onTry
       </ul>
 
       {/* Suggested values */}
-      <div className="grid grid-cols-3 gap-2 text-center">
+      <div className="grid grid-cols-4 gap-2 text-center">
         {[
           { label: 'Kp',    value: kp },
+          { label: 'Kd',    value: kd },
           { label: 'Ki',    value: ki },
           { label: 'Limit', value: `${torqueLimit} Nm` },
         ].map(({ label, value }) => (

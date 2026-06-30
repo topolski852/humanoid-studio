@@ -8,6 +8,8 @@ import MotorControlsPanel    from './MotorControlsPanel'
 import MotorConfigPanel      from './MotorConfigPanel'
 import MotorCalibrationPanel from './MotorCalibrationPanel'
 import AutoTunePanel         from './AutoTunePanel'
+import DiagnosePanel         from './DiagnosePanel'
+import GravityTunePanel      from './GravityTunePanel'
 import FlashWizard from './FlashWizard'
 import ErrorLogPanel from './ErrorLogPanel'
 
@@ -15,9 +17,44 @@ const TABS = [
   { id: 'drive', label: 'Move' },
   { id: 'tune',  label: 'Tune' },
   { id: 'auto',  label: 'Auto' },
+  { id: 'diag',  label: 'Diagnose' },
+  { id: 'gtune', label: 'Gravity' },
   { id: 'cal',   label: 'Cal'  },
   { id: 'log',   label: 'Log'  },
 ]
+
+function ConnectMotorButton({ jointName }) {
+  const [connecting, setConnecting] = useState(false)
+  const [error, setError] = useState(null)
+
+  async function handleConnect() {
+    setConnecting(true)
+    setError(null)
+    try {
+      await api.connectMotor(jointName)
+    } catch (e) {
+      setError(e.message)
+    }
+    setConnecting(false)
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      <button
+        onClick={handleConnect}
+        disabled={connecting}
+        className="px-3 py-1 rounded text-xs font-medium transition-colors
+          bg-accent/20 text-accent border border-accent/30
+          hover:bg-accent/30 disabled:opacity-40"
+      >
+        {connecting ? 'Connecting…' : 'Connect Motor'}
+      </button>
+      {error && (
+        <span className="text-[10px] text-danger font-mono">{error}</span>
+      )}
+    </div>
+  )
+}
 
 export default function MotorTab() {
   const { jointName } = useParams()
@@ -111,6 +148,7 @@ export default function MotorTab() {
               {config.phase_inverted ? 'PHASE INV' : 'PHASE NOM'}
             </span>
           )}
+          {state == null && <ConnectMotorButton jointName={decodedName} />}
           {/* Tab strip */}
           <div className="flex rounded-lg border border-surface-3 overflow-hidden ml-2">
             {TABS.map(({ id, label }) => (
@@ -150,6 +188,22 @@ export default function MotorTab() {
         )}
         {view === 'auto' && (
           <AutoTunePanel
+            jointName={decodedName}
+            state={state}
+            config={config}
+            onLogError={addLogEntry}
+          />
+        )}
+        {view === 'diag' && (
+          <DiagnosePanel
+            jointName={decodedName}
+            state={state}
+            config={config}
+            onLogError={addLogEntry}
+          />
+        )}
+        {view === 'gtune' && (
+          <GravityTunePanel
             jointName={decodedName}
             state={state}
             config={config}

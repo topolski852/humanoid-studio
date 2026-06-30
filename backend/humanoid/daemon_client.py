@@ -190,11 +190,12 @@ class DaemonActuatorProxy:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._client.estop_all)
 
-    async def write_gains(self, kp: float, ki: float, torque_limit: float) -> None:
-        """Write only Kp, Ki, torque_limit (~3 SDOs, ~15 ms) instead of full apply_config."""
+    async def write_gains(self, kp: float, ki: float, velocity_kp: float,
+                          torque_limit: float) -> None:
+        """Write Kp, Ki, velocity_kp (Kd), torque_limit (~4 SDOs, ~20 ms) instead of full apply_config."""
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None, self._client.write_gains, self._name, kp, ki, torque_limit
+            None, self._client.write_gains, self._name, kp, ki, velocity_kp, torque_limit
         )
 
     async def clear_error(self) -> None:
@@ -387,6 +388,14 @@ class DaemonClient:
         self._drop_lock   = threading.Lock()
         self._drop_events: list[dict] = []
 
+        # Explicit connect/disconnect state (separate from telemetry liveness).
+        # True only after apply_all_configs completes; False after disconnect().
+        self._connected: bool = False
+        # Joints connected one-at-a-time via connect_single().  Non-empty when the
+        # user is in single-motor mode (one motor IDLE, all others DISABLED).
+        # Cleared by apply_all_configs() and disconnect().
+        self._directly_connected: set[str] = set()
+
         # Per-joint proxies built from the loaded config
         self._proxies: dict[str, DaemonActuatorProxy] = {}
         self._rebuild_proxies()
@@ -457,8 +466,8 @@ class DaemonClient:
         return (time.monotonic() - self._last_tel_time) < _RUNNING_MAX_AGE
 
     def is_connected(self) -> bool:
-        """Alias for is_running() — satisfies the Robot interface used by routes."""
-        return self.is_running()
+        """True after apply_all_configs OR connect_single(); False after disconnect()."""
+        return (self._connected or bool(self._directly_connected)) and self.is_running()
 
     # ------------------------------------------------------------------ #
     # Telemetry receive thread                                             #
@@ -608,6 +617,27 @@ class DaemonClient:
         else:
             _log.info("apply_all_configs: %d configured, %d skipped, %d failed",
                       configured, skipped, failed)
+        self._connected = True
+        self._directly_connected.clear()  # global connect supersedes per-motor mode
+
+    def connect_single(self, joint_name: str) -> None:
+        """Configure one joint (DISABLED → IDLE) without touching other motors.
+        Uses _directly_connected so only this joint appears in telemetry.
+
+        Must follow the same two-phase sequence as APPLY_ALL_CONFIGS:
+        (1) wake: send NMT IDLE so firmware stops ignoring SDO writes,
+        (2) config: write all parameters via SDO.
+        Skipping the wake phase leaves the motor in DISABLED — firmware
+        silently drops SDO writes while disabled."""
+        # Phase 1: wake — transition the daemon state machine to IDLE so the
+        # control loop sends NMT IDLE to the motor on its next tick.
+        self.set_mode(joint_name, "IDLE")
+        # Phase 2: wait for the motor to become SDO-responsive.  APPLY_ALL_CONFIGS
+        # uses 300 ms; add 100 ms margin for a single slower motor wake-up.
+        time.sleep(0.4)
+        # Phase 3: write all config parameters (gains, limits, offsets) via SDO.
+        self.apply_config(joint_name)
+        self._directly_connected.add(joint_name)
 
     def store_joint_to_flash(self, joint_name: str) -> None:
         self._send_command({"type": "STORE_TO_FLASH", "joint_name": joint_name})
@@ -651,14 +681,15 @@ class DaemonClient:
             except OSError as exc:
                 _log.warning("estop_all: send error: %s", exc)
 
-    def write_gains(self, joint_name: str, kp: float, ki: float, torque_limit: float,
-                    timeout: float = 3.0) -> None:
-        """Write only position_kp, position_ki, torque_limit (~3 SDOs, ~15 ms)."""
+    def write_gains(self, joint_name: str, kp: float, ki: float, velocity_kp: float,
+                    torque_limit: float, timeout: float = 3.0) -> None:
+        """Write position_kp, position_ki, velocity_kp, torque_limit (~4 SDOs, ~20 ms)."""
         self._send_command({
             "type":         "WRITE_GAINS",
             "joint_name":   joint_name,
             "position_kp":  float(kp),
             "position_ki":  float(ki),
+            "velocity_kp":  float(velocity_kp),
             "torque_limit": float(torque_limit),
         }, timeout=timeout)
 
@@ -737,6 +768,35 @@ class DaemonClient:
                 "value_i32": resp.get("value_i32"),
             }
         return None
+
+    def generic_sdo_read_diag(
+        self,
+        channel: str,
+        device_id: int,
+        param_id: int,
+        timeout: float = 1.0,
+    ) -> tuple[dict | None, int]:
+        """
+        Like generic_sdo_read but also returns the sniff frame count on timeout.
+        Returns (result_dict, sniff_count) where sniff_count is -1 if unknown,
+        0 if no SDO response frames arrived at all (ESC not responding),
+        or >0 if frames arrived but were not matched (dispatcher issue).
+        """
+        resp = self._send_command({
+            "type": "GENERIC_SDO_READ",
+            "channel": channel,
+            "device_id": device_id,
+            "param_id": param_id,
+            "timeout_ms": int(timeout * 1000),
+        }, timeout=timeout + 1.0)
+        if resp.get("status") == "OK":
+            return ({
+                "value_u32": resp.get("value_u32"),
+                "value_f32": resp.get("value_f32"),
+                "value_i32": resp.get("value_i32"),
+            }, -1)
+        sniff_count = int(resp.get("sniff_count", -1))
+        return (None, sniff_count)
 
     def wait_heartbeat(
         self,
@@ -863,6 +923,15 @@ class DaemonClient:
             for name in self.config.joints:
                 result.setdefault(name, None)
 
+        # In single-motor mode (connect_single was used, not apply_all_configs),
+        # hide all joints except the ones explicitly connected so the frontend
+        # only shows the motor the user asked to connect.
+        if not self._connected and self._directly_connected:
+            result = {
+                name: (state if name in self._directly_connected else None)
+                for name, state in result.items()
+            }
+
         return result
 
     async def feed_all_watchdogs(self) -> None:
@@ -881,9 +950,31 @@ class DaemonClient:
 
     async def disconnect(self) -> None:
         """
-        No-op for normal disconnect.  routes_flash.py calls daemon_shutdown() explicitly
-        when it needs the CAN bus back for the flash wizard.
+        Put all motors into firmware MODE_DISABLED (truly silent) and mark disconnected.
+
+        MODE_DISABLED suppresses both the periodic heartbeat and PDO4 broadcasts, so
+        commissioning can run on any motor without FIFO saturation from neighbours.
+
+        Strategy: (1) daemon state machine → DISABLED (stops PDO2 commands and queues
+        NMT DISABLED for the next control tick); (2) send NMT DISABLED (0x00) directly
+        to every motor 3× over 300 ms to overcome any FDCAN FIFO drops under load.
         """
+        self._connected = False
+        self._directly_connected.clear()
+        loop = asyncio.get_running_loop()
+        # Step 1: daemon state machine → DISABLED (stops outbound PDO2 command frames).
+        await loop.run_in_executor(None, self.set_all_mode, "DISABLED")
+        # Step 2: direct NMT DISABLED to every configured motor (3× per motor, 100 ms apart).
+        if self.config is None:
+            return
+        motors = [(jc.can_channel, jc.can_id) for jc in self.config.joints.values()]
+        for _ in range(3):
+            for channel, can_id in motors:
+                try:
+                    await loop.run_in_executor(None, self.send_nmt, channel, can_id, 0x00)
+                except Exception:
+                    pass
+            await asyncio.sleep(0.1)
 
     def _rebuild_proxies(self) -> None:
         """Recreate per-joint proxies from the current config (call after config update)."""

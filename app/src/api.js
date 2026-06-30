@@ -27,6 +27,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ mode }),
     }),
+  connectMotor: (jointName) =>
+    request(`/motors/${encodeURIComponent(jointName)}/connect`, { method: 'POST' }),
   disableMotor: (jointName) =>
     request(`/motors/${encodeURIComponent(jointName)}/disable`, { method: 'POST' }),
   clearMotorError: (jointName) =>
@@ -113,10 +115,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ config }),
     }),
-  writeMotorGains: (jointName, position_kp, position_ki, torque_limit) =>
+  writeMotorGains: (jointName, position_kp, position_ki, velocity_kp, torque_limit) =>
     request(`/motors/${encodeURIComponent(jointName)}/write_gains`, {
       method: 'POST',
-      body: JSON.stringify({ position_kp, position_ki, torque_limit }),
+      body: JSON.stringify({ position_kp, position_ki, velocity_kp, torque_limit }),
     }),
   storeMotorToFlash: (jointName) =>
     request(`/motors/${encodeURIComponent(jointName)}/store_to_flash`, { method: 'POST' }),
@@ -125,6 +127,29 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(params),
     }, signal),
+
+  // ── Diagnostic + gravity-aware auto-tuner ────────────────────────────────────
+  runDiagnosis: (jointName, params, signal = undefined) =>
+    request(`/motors/${encodeURIComponent(jointName)}/diagnose`, {
+      method: 'POST',
+      body: JSON.stringify(params),
+    }, signal),
+  runGravityTune: (jointName, params, signal = undefined) =>
+    request(`/motors/${encodeURIComponent(jointName)}/gravity_tune`, {
+      method: 'POST',
+      body: JSON.stringify(params),
+    }, signal),
+  // Long-running (~90s): flips phase order + recalibrates flux, then re-diagnoses.
+  remediatePhase: (jointName) =>
+    request(`/motors/${encodeURIComponent(jointName)}/remediate_phase`, {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true }),
+    }),
+  raiseTorqueLimit: (jointName, torque_limit) =>
+    request(`/motors/${encodeURIComponent(jointName)}/raise_torque_limit`, {
+      method: 'POST',
+      body: JSON.stringify({ torque_limit, confirm: true }),
+    }),
 
   // ── App settings ───────────────────────────────────────────────────────────
   getSettings: () => request('/settings'),

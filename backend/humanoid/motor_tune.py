@@ -9,6 +9,7 @@ from humanoid.daemon_client import DaemonActuatorProxy
 # SDO parameter addresses (from recoil_protocol.hpp ParamId enum)
 _PARAM_POSITION_KP  = 0x020
 _PARAM_POSITION_KI  = 0x024
+_PARAM_VELOCITY_KP  = 0x028
 _PARAM_TORQUE_LIMIT = 0x030
 
 # Firmware POSITION mode value (Mode.POSITION = 0x13)
@@ -19,6 +20,7 @@ async def run_step_test(
     actuator: DaemonActuatorProxy,
     position_kp: float,
     position_ki: float,
+    velocity_kp: float,
     torque_limit: float,
     center_rad: float,
     offset_rad: float = 0.45,
@@ -71,6 +73,7 @@ async def run_step_test(
     for param, value in [
         (_PARAM_POSITION_KP,  position_kp),
         (_PARAM_POSITION_KI,  position_ki),
+        (_PARAM_VELOCITY_KP,  velocity_kp),
         (_PARAM_TORQUE_LIMIT, torque_limit),
     ]:
         await actuator.sdo_write_f32(param, value)
@@ -109,6 +112,12 @@ async def run_step_test(
     return {
         "samples": samples,
         "metrics": _compute_metrics(samples, torque_limit, offset_rad),
+        "params_used": {
+            "center_rad": center_rad,
+            "offset_rad": offset_rad,
+            "pos_a": pos_a,
+            "pos_b": pos_b,
+        },
     }
 
 
@@ -218,4 +227,95 @@ def _compute_metrics(
         "torque_saturated": torque_saturated,
         "max_current_a":    round(max_current_a, 3),
         "no_motion_detected": no_motion_detected,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared sample-analysis helpers (used by motor_tune AND motor_diagnose)
+#
+# Each operates on a list of sample dicts shaped like run_step_test() samples:
+#   {"position": float, "velocity": float, "torque": float, "current": float, ...}
+# Missing/None fields are skipped so partial telemetry never raises.
+# ---------------------------------------------------------------------------
+
+def _values(samples: list[dict], key: str) -> list[float]:
+    return [s[key] for s in samples if s.get(key) is not None]
+
+
+def _motion_range(samples: list[dict]) -> float:
+    """Peak-to-peak position travel over the window (rad)."""
+    ps = _values(samples, "position")
+    return (max(ps) - min(ps)) if len(ps) >= 2 else 0.0
+
+
+def _velocity_reversals(samples: list[dict], vel_eps: float = 0.05) -> int:
+    """Count velocity sign changes where at least one side is real motion (> vel_eps).
+
+    A high count with little net travel is the signature of stick-slip / limit-cycle
+    chatter rather than smooth tracking.
+    """
+    vs = _values(samples, "velocity")
+    return sum(
+        1 for a, b in zip(vs, vs[1:])
+        if a * b < 0 and (abs(a) > vel_eps or abs(b) > vel_eps)
+    )
+
+
+def _torque_chatter_pp(samples: list[dict]) -> float:
+    """Peak-to-peak of measured torque over the window (Nm)."""
+    ts = _values(samples, "torque")
+    return round(max(ts) - min(ts), 3) if ts else 0.0
+
+
+def _current_motion_ratio(samples: list[dict], motion_eps: float = 1e-4) -> dict:
+    """Current drawn per radian of travel.
+
+    High max_current with near-zero motion_range = "fictitious torque": the current
+    loop is driving phase current but the rotor isn't turning — a closed-loop
+    commutation/phase fault (the hip_roll case).  current_per_rad is inf when stuck.
+    """
+    cs = [abs(c) for c in _values(samples, "current")]
+    max_cur = max(cs) if cs else 0.0
+    motion = _motion_range(samples)
+    ratio = (max_cur / motion) if motion > motion_eps else float("inf")
+    return {
+        "max_current_a":    round(max_cur, 3),
+        "motion_range_rad": round(motion, 4),
+        "current_per_rad":  ratio,
+    }
+
+
+def _hold_error(samples: list[dict], target: float, tail_frac: float = 0.2) -> float:
+    """Signed steady-state hold error (droop): target - mean(position over last tail).
+
+    On a gravity-loaded joint commanded to hold against gravity, this is the sag a
+    pure-P loop can't remove (droop ~= gravity_torque / Kp).
+    """
+    ps = _values(samples, "position")
+    if not ps:
+        return 0.0
+    n = max(1, int(len(ps) * tail_frac))
+    mean_tail = sum(ps[-n:]) / n
+    return round(target - mean_tail, 4)
+
+
+def _descent_metrics(samples: list[dict], target: float) -> dict:
+    """Peak speed and overshoot past target for a move toward `target`.
+
+    Direction is inferred from the first sample, so it works for both the
+    gravity-assisted "drop" and a normal step.  overshoot_rad is the worst
+    excursion BEYOND the target in the direction of travel (the "slam").
+    """
+    ps = _values(samples, "position")
+    vs = _values(samples, "velocity")
+    if not ps:
+        return {"peak_velocity": 0.0, "overshoot_rad": 0.0, "final_pos": None, "final_error": None}
+    going_down = target < ps[0]
+    peak_v = max((abs(v) for v in vs), default=0.0)
+    overshoot = max(0.0, target - min(ps)) if going_down else max(0.0, max(ps) - target)
+    return {
+        "peak_velocity": round(peak_v, 3),
+        "overshoot_rad": round(overshoot, 4),
+        "final_pos":     round(ps[-1], 4),
+        "final_error":   round(ps[-1] - target, 4),
     }

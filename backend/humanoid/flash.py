@@ -254,9 +254,14 @@ async def _run_subprocess(cmd: list[str], cwd: Path) -> tuple[int, str]:
 async def _check_can_interface_state(channel: str) -> str | None:
     """
     Read the host-side CAN interface state via `ip -details link show`.
-    Returns 'BUS-OFF', 'ERROR-PASSIVE', or None (healthy / unknown).
-    A degraded interface silently drops TX frames, causing all SDO writes
-    to return NO_ACK even when the ESC firmware is perfectly healthy.
+    Returns 'BUS-OFF', 'ERROR-PASSIVE', 'ERROR-WARNING', or None (healthy).
+    Any of these states can cause silent TX frame loss, causing SDO reads/writes
+    to time out even when the ESC firmware is perfectly healthy.
+
+    ERROR-WARNING is the most common culprit: the Linux CAN adapter's TX queue
+    fills with frames that can't be sent (e.g., after repeated BUS-OFF recovery
+    cycles), so all subsequent writes get ENOBUFS at the socket layer and never
+    reach the bus.  Bouncing the interface (down + up) clears the queue.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -270,6 +275,8 @@ async def _check_can_interface_state(channel: str) -> str | None:
             return "BUS-OFF"
         if "ERROR-PASSIVE" in text or "error-passive" in text:
             return "ERROR-PASSIVE"
+        if "ERROR-WARNING" in text or "error-warning" in text:
+            return "ERROR-WARNING"
     except Exception:
         pass
     return None
@@ -968,6 +975,64 @@ class FlashManager:
                     f"ESC did not appear on {config.can_channel} within 30 s — "
                     f"check CAN cable, ESC power, and that it was power-cycled after flashing.")
 
+        # Detect active motors on this CAN channel (PDO4 fast-frame, func_id=0x9).
+        # Recoil ESCs in IDLE mode use a permissive FDCAN hardware filter; fast-frame
+        # traffic from neighbour motors can saturate the ESC's receive FIFO and silently
+        # drop incoming SDO request frames, causing all SDO reads to return 0 responses.
+        # Abort now — before wasting 6+ seconds on doomed SDO attempts — so the user can
+        # disconnect the dashboard first.  Threshold 30 frames / 3 s (10 Hz) is well
+        # above 2 Hz heartbeats and well below the 65–200 Hz fast-frame rate.
+        _FAST_FRAME_FUNC = 0x9   # FUNC_TRANSMIT_PDO_4
+        _active_ids = sorted({
+            dev for (dev, func), cnt in _frame_counts.items()
+            if func == _FAST_FRAME_FUNC and dev != active_id and cnt >= 30
+        })
+        if _active_ids:
+            # Attempt to silence them directly via NMT IDLE before giving up.
+            # 'Disconnect' in the dashboard sends SET_ALL_MODE IDLE through the daemon's
+            # state machine, but motors that miss the single NMT frame end up in DAMPING
+            # (watchdog timeout) rather than IDLE — and DAMPING still broadcasts PDO4.
+            # Sending NMT IDLE directly here is more reliable: NMT has the highest CAN
+            # priority and is a 2-byte frame that the ESC's FDCAN filter will accept even
+            # under heavy load.  Send 3× over 1.5 s so at least one gets through.
+            self._log(
+                f"Detected active motors {_active_ids} on {config.can_channel} — "
+                f"sending NMT DISABLED to silence fast-frame broadcasts...",
+                progress=46)
+            for _nmt_pass in range(3):
+                for _mid in _active_ids:
+                    try:
+                        await loop.run_in_executor(
+                            None, dc.send_nmt, config.can_channel, _mid, 0x00)  # MODE_DISABLED
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.5)
+
+            # Re-sniff for 1 s to check whether the motors went quiet.
+            _recheck_raw = await loop.run_in_executor(
+                None, dc.sniff_bus, config.can_channel, 1000)
+            _recheck_counts: dict[tuple[int, int], int] = {}
+            for _rf in _recheck_raw:
+                _rdev  = _rf.get("device_id", -1)
+                _rfunc = _rf.get("func_id", -1)
+                _recheck_counts[(_rdev, _rfunc)] = _recheck_counts.get((_rdev, _rfunc), 0) + 1
+            _still_active = sorted({
+                dev for (dev, func), cnt in _recheck_counts.items()
+                if func == _FAST_FRAME_FUNC and dev != active_id and cnt >= 10
+            })
+            if _still_active:
+                raise FlashError(
+                    f"Motor(s) {_still_active} on {config.can_channel} are still "
+                    f"broadcasting fast frames after 3 NMT DISABLED attempts. "
+                    f"Their CAN traffic saturates the target ESC's receive FIFO and "
+                    f"prevents SDO communication. "
+                    f"Click 'Disconnect' in the dashboard to put all motors in DISABLED "
+                    f"(silent) mode, wait 2 s, then retry. "
+                    f"If this persists, power cycle motors {_still_active}.")
+            self._log(
+                f"Motors {_active_ids} silenced — continuing commissioning.",
+                progress=47)
+
         # If the ESC is in an error/DAMPING state, attempt recovery before writing params.
         # Strategy: disable watchdog + clear error register via SDO (firmware accepts writes
         # to any param even in DAMPING), then send NMT IDLE.  The watchdog re-fires every
@@ -1006,22 +1071,25 @@ class FlashManager:
                 self._log(
                     "No heartbeat after recovery (ESC may not broadcast in IDLE — continuing)")
         else:
-            # Fresh-flash ESC boots with mode=DISABLED (config page stores 0x00 at mode
-            # offset 0x010).  In MODE_DISABLED the firmware does not process SDO frames, so
-            # all SDO reads and writes silently time out.
-            #
-            # The daemon's needs_idle_wakeup_ flag normally handles this, but it only fires
-            # when the daemon sees a PDO4 (fast frame) from the motor.  A freshly flashed
-            # ESC has fast_frame_frequency=0 in its config page and never sends PDO4 until
-            # that param is written via SDO — so the daemon never detects it and never sends
-            # NMT IDLE.  The flash wizard must send NMT IDLE explicitly before any SDO I/O.
-            self._log(
-                f"Sending NMT IDLE to ID {active_id} — "
-                f"waking ESC from MODE_DISABLED so SDO reads/writes are processed...",
-                progress=44)
-            await loop.run_in_executor(
-                None, dc.send_nmt, config.can_channel, active_id, 0x01)  # 0x01 = MODE_IDLE
-            await asyncio.sleep(0.3)
+            # Production firmware (v3.0.6+) auto-transitions to IDLE after init, so the
+            # sniff may already show mode=IDLE.  Sending NMT IDLE to an already-IDLE ESC
+            # triggers MotorController_reset() in the firmware, which can temporarily
+            # disable SDO processing for > 300 ms and cause the diagnostic SDO read to
+            # time out.  Only send NMT IDLE if the sniff confirmed DISABLED mode.
+            _MODE_IDLE = 0x01
+            if _hb_target_mode != _MODE_IDLE:
+                self._log(
+                    f"Sending NMT IDLE to ID {active_id} — "
+                    f"waking ESC from MODE_DISABLED so SDO reads/writes are processed...",
+                    progress=44)
+                await loop.run_in_executor(
+                    None, dc.send_nmt, config.can_channel, active_id, 0x01)  # 0x01 = MODE_IDLE
+                await asyncio.sleep(0.3)
+            else:
+                self._log(
+                    f"ESC at ID {active_id} already in IDLE (confirmed by sniff) — "
+                    f"skipping NMT IDLE to avoid firmware state reset.",
+                    progress=44)
 
         self._log(
             f"ESC at ID {active_id}. "
@@ -1068,41 +1136,94 @@ class FlashManager:
             # responses already in the kernel receive buffer to be drained.
             await asyncio.sleep(0.05)
 
-        # Host-side CAN interface health check.  ERROR-PASSIVE / BUS-OFF causes
-        # the kernel to silently drop TX frames (ENOBUFS), making all SDO writes
-        # return NO_ACK even when the ESC firmware is perfectly healthy.  This is
-        # usually caused by a damaged ESC CAN transceiver on the same bus.
+        # Host-side CAN interface health check.  ERROR-WARNING / ERROR-PASSIVE / BUS-OFF
+        # all cause the kernel TX queue to fill (ENOBUFS), silently dropping every outgoing
+        # CAN frame so SDO reads return no response even though the ESC firmware is healthy.
+        # Root cause: repeated BUS-OFF cycles (from prior SDO failures or bus errors) leave
+        # old frames stuck in the kernel queue; a down/up cycle flushes the queue.
         can_iface_state = await _check_can_interface_state(config.can_channel)
         if can_iface_state:
-            self._log(
-                f"  WARNING: CAN interface {config.can_channel} is in {can_iface_state} state. "
-                f"TX frames will be silently dropped — SDO writes will return NO_ACK. "
-                f"Close the app, run: sudo ip link set {config.can_channel} down && "
-                f"sudo ip link set {config.can_channel} type can bitrate 1000000 restart-ms 100 && "
-                f"sudo ip link set {config.can_channel} txqueuelen 1000 && "
-                f"sudo ip link set {config.can_channel} up, then reopen the app. "
-                f"If this recurs, a damaged CAN transceiver on the bus is the likely cause.")
+            # Attempt automatic recovery: bounce the interface to flush the TX queue.
+            _reset_ok = False
+            try:
+                import subprocess as _sp
+                _sp.run(["ip", "link", "set", config.can_channel, "down"],
+                        check=True, timeout=3, capture_output=True)
+                _sp.run(["ip", "link", "set", config.can_channel, "type", "can",
+                         "bitrate", "1000000"],
+                        check=False, timeout=3, capture_output=True)
+                _sp.run(["ip", "link", "set", config.can_channel,
+                         "txqueuelen", "1000"],
+                        check=True, timeout=3, capture_output=True)
+                _sp.run(["ip", "link", "set", config.can_channel, "up"],
+                        check=True, timeout=3, capture_output=True)
+                _reset_ok = True
+            except Exception:
+                pass
+            if _reset_ok:
+                self._log(
+                    f"  CAN interface {config.can_channel} was in {can_iface_state} "
+                    f"(TX queue clogged from prior errors) — automatically reset to "
+                    f"ERROR-ACTIVE. Waiting 300 ms for motors to reconnect...")
+                await asyncio.sleep(0.3)
+            else:
+                self._log(
+                    f"  WARNING: CAN interface {config.can_channel} is in {can_iface_state} "
+                    f"state and could not be auto-reset (run as root?). "
+                    f"TX frames will be silently dropped — SDO reads will return no response. "
+                    f"Run manually: sudo ip link set {config.can_channel} down && "
+                    f"sudo ip link set {config.can_channel} type can bitrate 1000000 && "
+                    f"sudo ip link set {config.can_channel} txqueuelen 1000 && "
+                    f"sudo ip link set {config.can_channel} up")
 
-        # Pre-commission SDO diagnostic: try to read device_id from the ESC.
-        # Timeout is 3 s (3 attempts × 1 s each) to tolerate brief CAN bus contention
-        # from other active motors on the same channel.
-        # If this times out the ESC is not responding to SDO at all — causes:
+        # Pre-commission SDO diagnostic: confirm the ESC responds to SDO reads before
+        # starting the 27-param write sequence.  Try device_id (0x000) first; fall back to
+        # watchdog_timeout (0x008) in case the firmware marks 0x000 as non-readable.
+        # Timeout is 3 s (3 attempts × 1 s each).  If this times out the ESC is wedged:
         #   • Old commissioning ELF with FDCAN filter fixed at device_id=127
         #   • Firmware in a wedged state (power-cycle + Flash+Commission required)
-        #   • Heavy CAN traffic from other motors overwhelming the ESC's SDO handler
-        diag_result = await loop.run_in_executor(
-            None, dc.generic_sdo_read,
-            config.can_channel, active_id, _PARAM_DEVICE_ID, 3.0)
+        diag_result = None
+        _diag_sniff_count = -1
+        _diag_param_used = _PARAM_DEVICE_ID
+        for _diag_param_try in (_PARAM_DEVICE_ID, _PARAM_WATCHDOG_TIMEOUT):
+            _r, _sniff = await loop.run_in_executor(
+                None, dc.generic_sdo_read_diag,
+                config.can_channel, active_id, _diag_param_try, 3.0)
+            if _r is not None:
+                diag_result = _r
+                _diag_param_used = _diag_param_try
+                break
+            _diag_sniff_count = _sniff  # capture sniff count from last attempt
         if diag_result is None:
+            if _diag_sniff_count == 0:
+                _diag_hint = (
+                    "The daemon received no SDO response frames from the ESC at all — "
+                    "the ESC firmware is not responding to SDO requests. "
+                    "This usually means the FDCAN receive filter is misconfigured "
+                    "or the firmware is in a wedged state. ")
+            elif _diag_sniff_count > 0:
+                _diag_hint = (
+                    f"The daemon received {_diag_sniff_count} SDO frame(s) from the ESC "
+                    f"but the response matcher did not fire — please file a bug report. ")
+            else:
+                _diag_hint = "The firmware is likely in a wedged state. "
             raise FlashError(
                 f"ESC at ID {active_id} is NOT responding to SDO reads — "
                 f"commissioning aborted to avoid calibration with wrong parameters. "
-                f"Tried 3 times over 3 s with all slow-poll suspended. "
-                f"Try: (1) power-cycle the ESC and retry, (2) disconnect the "
-                f"dashboard (click Disconnect) before commissioning to reduce CAN "
-                f"bus traffic, (3) use 'Flash + Commission' to re-flash from scratch.")
-        stored_id = int(diag_result["value_u32"] or 0)
-        self._log(f"  SDO diagnostic: ESC device_id={stored_id} — SDO responding ✓")
+                f"Tried params 0x{_PARAM_DEVICE_ID:03X} and 0x{_PARAM_WATCHDOG_TIMEOUT:03X}, "
+                f"3 s each, with all slow-poll suspended. "
+                f"{_diag_hint}"
+                f"Try: (1) power-cycle the ESC and retry, "
+                f"(2) disconnect the dashboard (click Disconnect) before commissioning, "
+                f"(3) use 'Flash + Commission' to re-flash from scratch.")
+        if _diag_param_used == _PARAM_DEVICE_ID:
+            stored_id = int(diag_result["value_u32"] or 0)
+            self._log(f"  SDO diagnostic: ESC device_id={stored_id} — SDO responding ✓")
+        else:
+            wdt_ms = int(diag_result["value_u32"] or 0)
+            self._log(
+                f"  SDO diagnostic: watchdog_timeout={wdt_ms} ms — SDO responding ✓ "
+                f"(device_id param 0x000 timed out, used fallback 0x{_PARAM_WATCHDOG_TIMEOUT:03X})")
 
         sdo_writes = [
             (_PARAM_POSITION_GEAR_RATIO,   "f32", gear_ratio,                   f"gear_ratio={gear_ratio:+.1f}"),
@@ -1346,5 +1467,13 @@ class FlashManager:
             "gear_ratio":              gear_ratio,
         }
 
+        # Put the commissioned ESC into DISABLED (silent resting state).
+        # The motor is fully configured and stored to flash; it should not broadcast
+        # until the robot is next connected via the dashboard.
+        await loop.run_in_executor(None, dc.send_nmt, config.can_channel, active_id, 0x00)
+
         self.status.state = FlashState.COMPLETE
-        self._log("Flash wizard complete. Motor is commissioned and operational.", progress=100)
+        self._log(
+            "Flash wizard complete. Motor is commissioned, stored to flash, "
+            "and placed in DISABLED mode.",
+            progress=100)
