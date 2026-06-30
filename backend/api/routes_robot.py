@@ -13,6 +13,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from humanoid.robot_config import RobotConfig
+from humanoid.joint_defaults import apply_default_limits
 from humanoid.daemon_client import DaemonClient, DaemonNotRunningError
 
 router = APIRouter(tags=["robot"])
@@ -86,6 +87,11 @@ async def put_robot_config(request: Request) -> dict | JSONResponse:
         new_config = RobotConfig.model_validate(body)
     except Exception as exc:
         return _err(f"Config validation failed: {exc}", 422)
+
+    # Fill in the Berkeley Humanoid Lite default position limits for any joint
+    # that has none yet (e.g. just commissioned via the Flash Wizard). Joints
+    # with explicit limits are left untouched.
+    apply_default_limits(new_config)
 
     config_path: Path = getattr(request.app.state, "config_path", _DEFAULT_CONFIG_PATH)
     try:
