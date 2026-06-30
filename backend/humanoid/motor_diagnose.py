@@ -252,31 +252,52 @@ async def jog(
     actuator: DaemonActuatorProxy,
     *,
     step_rad: float = 0.15,
-    move_s: float = 1.0,
+    move_s: float = 1.5,
     hold_s: float = 0.6,
     runaway_band_rad: float | None = None,
     return_to_start: bool = True,
+    gentle: bool = True,
 ) -> dict:
     """Move the joint a small, visible amount so a human can see which way it
     goes, then return to start. Used by the Direction & Limits step: the user
-    watches and confirms whether it moved in the +direction. Returns the signed
-    motion (end - start) for logging. Motor must be enabled in POSITION mode."""
+    watches and confirms whether it moved in the +direction.
+
+    gentle (default) caps Kp and the torque limit for the move so an UNtuned
+    joint — e.g. one just commissioned, before PID tuning — can't slam; gains are
+    restored on exit. The cap bounds the force, so the joint moves softly (it may
+    not overcome gravity going uphill, but the hardstops already fixed direction;
+    this jog is only a visual confirmation). Returns the signed motion (end-start).
+    Motor must be enabled in POSITION mode."""
+    cfg = actuator.config
     start = _require_position_mode(actuator)
     start_pos = start.position
+    kp0, ki0, kd0, tl0 = cfg.position_kp, cfg.position_ki, cfg.velocity_kp, cfg.torque_limit
     avail = _available_range(actuator)
     if runaway_band_rad is None:
         runaway_band_rad = min(0.4, 0.6 * avail) if avail > 0 else 0.4
 
     lo, hi = _limits(actuator)
     step = step_rad if (start_pos + step_rad) <= hi else -step_rad
-    samples = await _ramp(actuator, start_pos, step, duration_s=move_s,
-                          runaway_band_rad=runaway_band_rad)
-    end_pos = samples[-1]["position"] if samples else start_pos
-    signed = end_pos - start_pos
-    if return_to_start:
-        await _hold(actuator, _clamp_target(actuator, start_pos),
-                    duration_s=hold_s, start_pos=start_pos,
-                    runaway_band_rad=runaway_band_rad)
+    try:
+        if gentle:
+            # Cap Kp + torque (with a little Kd for damping) so the move is soft
+            # regardless of how aggressive the joint's tuned gains are.
+            await actuator.write_gains(min(kp0, 10.0), 0.0, max(kd0, 2.0),
+                                       min(tl0, max(1.0, 0.3 * tl0)))
+        samples = await _ramp(actuator, start_pos, step, duration_s=move_s,
+                              runaway_band_rad=runaway_band_rad)
+        end_pos = samples[-1]["position"] if samples else start_pos
+        signed = end_pos - start_pos
+        if return_to_start:
+            await _hold(actuator, _clamp_target(actuator, start_pos),
+                        duration_s=hold_s, start_pos=start_pos,
+                        runaway_band_rad=runaway_band_rad)
+    finally:
+        if gentle:
+            try:
+                await actuator.write_gains(kp0, ki0, kd0, tl0)
+            except Exception:
+                pass
     return {
         "commanded_step_rad": round(step, 4),
         "signed_motion_rad": round(signed, 4),
