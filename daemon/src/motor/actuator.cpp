@@ -301,9 +301,20 @@ void Actuator::tick(CanBusManager& bus) {
 
             if (send_nmt) {
                 bus.send(cfg_.can_channel, nmt);
-                std::lock_guard<std::mutex> slk(state_mutex_);
-                state_.joint_state = target;
-                current_state = target;
+                // Don't optimistically mark a never-seen (OFFLINE) motor as DISABLED.
+                // The OFFLINE timer is suppressed for DISABLED, so an absent motor
+                // commanded DISABLED (e.g. by disconnect()/SET_ALL_MODE DISABLED) would
+                // stick in DISABLED forever and show up as "detected" on the dashboard.
+                // Leaving it OFFLINE lets the UI distinguish a present-but-disabled motor
+                // from one that isn't on the bus at all. A present motor is online
+                // (IDLE/ENABLED) when disconnected, so it still transitions correctly;
+                // the IDLE wake path is unaffected (keeps apply_config timing).
+                if (!(target == JointState::DISABLED &&
+                      current_state == JointState::OFFLINE)) {
+                    std::lock_guard<std::mutex> slk(state_mutex_);
+                    state_.joint_state = target;
+                    current_state = target;
+                }
             }
         }
     }

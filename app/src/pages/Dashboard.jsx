@@ -122,10 +122,13 @@ export default function Dashboard({ onOpenMotor }) {
       .finally(() => setLoading(false))
   }, [])
 
-  // A motor is online if it has active state OR is seen in passive traffic within 2s
-  const onlineCount = joints.filter((j) =>
+  // A motor is online if it has active state OR is seen in passive traffic within 2s.
+  // Motors that aren't on the bus (never detected) report no state and are hidden
+  // from the card grid entirely — only show what's actually connected.
+  const isOnline = (j) =>
     states[j.joint_name] != null || passiveTelemetry[j.joint_name]?.status === 'ONLINE'
-  ).length
+  const detectedJoints = joints.filter(isOnline)
+  const onlineCount = detectedJoints.length
 
   // Handler for diagram node clicks: find the matching joint and open its tab
   function handleDiagramClick(jointName) {
@@ -141,7 +144,7 @@ export default function Dashboard({ onOpenMotor }) {
           <h1 className="font-semibold text-base">Dashboard</h1>
           {joints.length > 0 && (
             <p className="text-xs text-gray-500 mt-0.5">
-              {onlineCount} / {joints.length} motors online
+              {onlineCount} of {joints.length} motors connected
             </p>
           )}
         </div>
@@ -163,11 +166,11 @@ export default function Dashboard({ onOpenMotor }) {
             <div className="flex gap-3 text-xs text-gray-500">
               <span className="flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-online" style={{ boxShadow: '0 0 6px #22c55e' }} />
-                {onlineCount} online
+                {onlineCount} connected
               </span>
               <span className="flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-offline" />
-                {joints.length - onlineCount} offline
+                {joints.length - onlineCount} not present
               </span>
             </div>
           )}
@@ -205,9 +208,17 @@ export default function Dashboard({ onOpenMotor }) {
             </div>
           ) : joints.length === 0 ? (
             <EmptyState />
+          ) : detectedJoints.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-32 text-center">
+              <p className="text-sm text-gray-400">No motors connected</p>
+              <p className="text-xs text-gray-600 mt-1">
+                Click <span className="text-gray-400">Connect</span> to wake the robot — only
+                detected motors appear here.
+              </p>
+            </div>
           ) : (
             <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
-              {joints.map((joint) => (
+              {detectedJoints.map((joint) => (
                 <MotorCard
                   key={joint.joint_name}
                   joint={joint}
