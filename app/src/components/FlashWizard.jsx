@@ -1,19 +1,20 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
+import CalibrateStep from './CalibrateStep'
 
-// Steps matching FlashState.step_index (0-5)
-const STEP_LABELS = [
-  'Configure',    // 0 — pre-start
-  'Flash',        // 1 — FLASHING
-  'Connect',      // 2 — WAITING_CAN_CONNECT
-  'Commission',   // 3 — COMMISSIONING
-  'Calibrate',    // 4 — CALIBRATING / AWAITING_CONFIRMATION
-  'Done',         // 5 — COMPLETE
-]
+// Three high-level steps. Flash + Commission run through the backend flash state
+// machine (Commission bundles the CAN commission, flux calibration, and the
+// automatic commutation check). Calibrate is the frontend hardstop range cal.
+const HL_STEPS = ['Flash', 'Commission', 'Calibrate']
+
+// Map a backend flash state to its high-level step index (0 Flash, 1 Commission).
+function backendHLStep(state) {
+  if (state === 'FLASHING') return 0
+  return 1   // WAITING_CAN_CONNECT / COMMISSIONING / CALIBRATING / COMPLETE
+}
 
 const ACTIVE_STATES = new Set([
-  'FLASHING', 'COMMISSIONING',
-  'WAITING_CAN_CONNECT', 'CALIBRATING', 'AWAITING_CONFIRMATION',
+  'FLASHING', 'COMMISSIONING', 'WAITING_CAN_CONNECT', 'CALIBRATING',
 ])
 
 // States where closing would leave the ESC in a broken intermediate state
@@ -41,33 +42,29 @@ function ProfileTable({ profile }) {
 }
 
 
-// ── Step progress strip ────────────────────────────────────────────────────────
-function StepStrip({ stepIndex, isFailed, isComplete }) {
-  // Show steps 1-8 (skip step 0 = Configure which is pre-start)
-  const visibleSteps = STEP_LABELS.slice(1)
+// ── Step progress strip (Flash → Commission → Calibrate) ───────────────────────
+function StepStrip({ hlIndex, allDone, isFailed }) {
   return (
     <div className="flex items-center gap-0 overflow-x-auto pb-1">
-      {visibleSteps.map((label, i) => {
-        const idx = i + 1   // actual step_index
-        const done = isComplete || idx < stepIndex
-        const active = idx === stepIndex && !isComplete && !isFailed
-        const failed = isFailed && idx === stepIndex
-
+      {HL_STEPS.map((label, i) => {
+        const done   = allDone || i < hlIndex
+        const active = i === hlIndex && !allDone && !isFailed
+        const failed = isFailed && i === hlIndex
         return (
           <div key={label} className="flex items-center flex-shrink-0">
-            <div className={`flex items-center gap-1 px-2 py-1 rounded-full text-[10px] whitespace-nowrap
+            <div className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] whitespace-nowrap
               ${done ? 'bg-online/20 text-online' :
                 active ? 'bg-accent/20 text-accent ring-1 ring-accent/40' :
                 failed ? 'bg-danger/20 text-danger' :
                 'text-gray-600'}`}
             >
               <span className="font-mono w-3 text-center">
-                {done ? '✓' : failed ? '✗' : `${idx}`}
+                {done ? '✓' : failed ? '✗' : `${i + 1}`}
               </span>
-              <span className="hidden sm:inline">{label}</span>
+              <span>{label}</span>
             </div>
-            {i < visibleSteps.length - 1 && (
-              <div className={`w-4 h-px mx-0.5 flex-shrink-0 ${done ? 'bg-online/40' : 'bg-surface-3'}`} />
+            {i < HL_STEPS.length - 1 && (
+              <div className={`w-5 h-px mx-0.5 flex-shrink-0 ${done ? 'bg-online/40' : 'bg-surface-3'}`} />
             )}
           </div>
         )
@@ -158,7 +155,12 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
   const [stepInfo, setStepInfo]       = useState({ step_index: 0, total_steps: 6 })
   const [profiles, setProfiles]       = useState([])
   const [motorProfile, setMotorProfile] = useState('MAD_5010_200KV')
-  const [invertPhase, setInvertPhase] = useState(false)
+  // Which steps to run. 'full' = Flash+Commission+Calibrate, 'commission' =
+  // Commission+Calibrate (firmware already on ESC), 'calibrate' = Calibrate only.
+  const [stepPlan, setStepPlan]       = useState(commissionOnly ? 'commission' : 'full')
+  // 'setup' = the backend flash/commission flow; 'calibrate' = hardstop range cal.
+  const [wizardPhase, setWizardPhase] = useState('setup')
+  const [calConnecting, setCalConnecting] = useState(false)
   const [started, setStarted]         = useState(false)
   const [startError, setStartError]   = useState(null)
   const [calStartedAt, setCalStartedAt] = useState(null)
@@ -241,17 +243,36 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
     setStarted(true)
     setAwaitingFlashChoice(false)
     try {
-      await api.flashStart(canId, invertPhase, motorProfile, 'SWD', canChannel ?? 'can0', skipFlash)
+      // invert_phase is just the starting guess — the commission's automatic
+      // commutation check toggles it if it's wrong, so we always start at +1.
+      await api.flashStart(canId, false, motorProfile, 'SWD', canChannel ?? 'can0', skipFlash)
     } catch (e) {
       setStartError(e.message)
       setStarted(false)
     }
   }
 
+  // Enter the Calibrate phase: wake the joint (commission leaves it DISABLED) so
+  // range_cal can reach it, then show the hardstop calibration UI.
+  async function enterCalibrate() {
+    setStarted(true)
+    setCalConnecting(true)
+    try {
+      await api.connectRobot()
+      await new Promise((r) => setTimeout(r, 1500))
+    } catch { /* user can retry from the step */ }
+    setCalConnecting(false)
+    setWizardPhase('calibrate')
+  }
+
   async function handleStart() {
     setStartError(null)
-    if (!commissionOnly) {
-      // Check if ESC already has the latest firmware before flashing.
+    if (stepPlan === 'calibrate') {
+      await enterCalibrate()
+      return
+    }
+    if (stepPlan === 'full') {
+      // Check if the ESC already has the latest firmware before flashing.
       setVersionChecking(true)
       try {
         const result = await api.flashCheckFirmwareVersion()
@@ -265,8 +286,11 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
         setVersionChecking(false)
         // Check failed (ST-LINK not connected etc.) — proceed with flash
       }
+      await _doStart(false)
+    } else {
+      // commission: firmware already on the ESC → skip flash
+      await _doStart(true)
     }
-    await _doStart(commissionOnly)
   }
 
   async function handleReset() {
@@ -304,19 +328,20 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
     api.connectRobot().catch(() => {})
   }
 
-  async function handleConfirm(correct) {
-    try { await api.flashConfirm(correct) } catch (e) { console.error(e) }
-  }
-
   const currentState     = status?.state ?? 'IDLE'
-  const stepIndex        = stepInfo.step_index ?? 0
-  const isActive         = started && ACTIVE_STATES.has(currentState)
-  const isComplete       = currentState === 'COMPLETE'
-  const isFailed         = currentState === 'FAILED'
-  const isLocked         = started && LOCKED_STATES.has(currentState)
-  const awaitingCanConnect  = currentState === 'WAITING_CAN_CONNECT'
-  const awaitingConfirm     = currentState === 'AWAITING_CONFIRMATION'
-  const isCalibrating       = currentState === 'CALIBRATING'
+  const inCalibrate      = wizardPhase === 'calibrate'
+  const isActive         = started && !inCalibrate && ACTIVE_STATES.has(currentState)
+  const isComplete       = !inCalibrate && currentState === 'COMPLETE'
+  const isFailed         = !inCalibrate && currentState === 'FAILED'
+  const isLocked         = started && !inCalibrate && LOCKED_STATES.has(currentState)
+  const awaitingCanConnect  = !inCalibrate && currentState === 'WAITING_CAN_CONNECT'
+  const isCalibrating       = !inCalibrate && currentState === 'CALIBRATING'
+
+  // High-level step (0 Flash, 1 Commission, 2 Calibrate) for the progress strip.
+  const hlIndex = inCalibrate ? 2
+    : !started ? (stepPlan === 'calibrate' ? 2 : stepPlan === 'commission' ? 1 : 0)
+    : isComplete ? 2
+    : backendHLStep(currentState)
 
   const selectedProfile  = profiles.find((p) => p.key === motorProfile) ?? null
 
@@ -328,7 +353,7 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
         <div className="flex items-center justify-between px-6 py-4 border-b border-surface-3 flex-shrink-0">
           <div>
             <h2 className="font-semibold text-base">
-              {commissionOnly ? 'ESC Commission Wizard' : 'ESC Flash Wizard'}
+              ESC Setup Wizard
             </h2>
             <p className="text-xs text-gray-500 font-mono">
               {jointName} · {canChannel} · CAN ID {canId}
@@ -350,8 +375,8 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
 
         {/* ── Step strip + progress bar ── */}
         <div className="px-6 py-3 border-b border-surface-3 space-y-2 flex-shrink-0">
-          <StepStrip stepIndex={started ? stepIndex : 0} isFailed={isFailed} isComplete={isComplete} />
-          {status && (
+          <StepStrip hlIndex={hlIndex} allDone={false} isFailed={isFailed} />
+          {status && !inCalibrate && (
             <div>
               <div className="flex justify-between text-[10px] text-gray-600 mb-1 font-mono">
                 <span>{currentState.toLowerCase().replace(/_/g, ' ')}</span>
@@ -369,22 +394,35 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
           )}
         </div>
 
-        {/* ── Log pane ── */}
-        <div className="flex-1 p-4 flex flex-col min-h-0 overflow-hidden">
-          <div className="flex items-center justify-between mb-2 flex-shrink-0">
-            <p className="data-label">Log Output</p>
-            <button
-              onClick={() => {
-                const text = (status?.messages ?? []).join('\n')
-                navigator.clipboard.writeText(text).catch(() => {})
-              }}
-              className="text-[10px] text-gray-600 hover:text-gray-300 px-2 py-0.5 rounded border border-surface-3 hover:border-gray-600 transition-colors"
-            >
-              Copy log
-            </button>
+        {/* ── Body: Calibrate step, or the backend log pane ── */}
+        {inCalibrate ? (
+          <div className="flex-1 p-5 overflow-y-auto min-h-0">
+            {calConnecting ? (
+              <div className="flex items-center gap-3">
+                <span className="w-3.5 h-3.5 rounded-full border-2 border-accent border-t-transparent animate-spin" />
+                <span className="text-sm text-gray-400">Waking the joint…</span>
+              </div>
+            ) : (
+              <CalibrateStep jointName={jointName} onComplete={handleDone} />
+            )}
           </div>
-          <LogPane messages={status?.messages ?? []} />
-        </div>
+        ) : (
+          <div className="flex-1 p-4 flex flex-col min-h-0 overflow-hidden">
+            <div className="flex items-center justify-between mb-2 flex-shrink-0">
+              <p className="data-label">Log Output</p>
+              <button
+                onClick={() => {
+                  const text = (status?.messages ?? []).join('\n')
+                  navigator.clipboard.writeText(text).catch(() => {})
+                }}
+                className="text-[10px] text-gray-600 hover:text-gray-300 px-2 py-0.5 rounded border border-surface-3 hover:border-gray-600 transition-colors"
+              >
+                Copy log
+              </button>
+            </div>
+            <LogPane messages={status?.messages ?? []} />
+          </div>
+        )}
 
         {/* ── Footer ── */}
         <div className="px-6 py-4 border-t border-surface-3 flex-shrink-0">
@@ -392,38 +430,51 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
           {/* Not started: configuration */}
           {!started && (
             <div className="space-y-3">
-              {/* Motor profile selector */}
+              {/* Step plan selector */}
               <div className="space-y-1.5">
-                <label className="data-label">Motor Profile</label>
-                <select
-                  value={motorProfile}
-                  onChange={(e) => setMotorProfile(e.target.value)}
-                  className="w-full bg-surface-2 border border-surface-3 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:border-accent"
-                >
-                  {profiles.map((p) => (
-                    <option key={p.key} value={p.key}>
-                      {p.key}
-                    </option>
-                  ))}
-                  {profiles.length === 0 && (
-                    <option value="MAD_5010_200KV">MAD_5010_200KV</option>
-                  )}
-                </select>
-                <ProfileTable profile={selectedProfile} />
+                <label className="data-label">Steps to run</label>
+                {[
+                  ['full', 'Flash → Commission → Calibrate', 'New ESC — ST-LINK connected'],
+                  ['commission', 'Commission → Calibrate', 'Firmware already on the ESC'],
+                  ['calibrate', 'Calibrate only', 'Already commissioned — set range & direction'],
+                ].map(([val, label, hint]) => (
+                  <label key={val}
+                    className={`flex items-start gap-2 px-3 py-2 rounded-lg border cursor-pointer transition-colors
+                      ${stepPlan === val ? 'border-accent/50 bg-accent/10' : 'border-surface-3 bg-surface-2 hover:border-gray-600'}`}
+                  >
+                    <input type="radio" name="plan" checked={stepPlan === val}
+                      onChange={() => setStepPlan(val)} className="accent-accent mt-0.5" />
+                    <div>
+                      <p className="text-sm text-gray-200">{label}</p>
+                      <p className="text-[10px] text-gray-500">{hint}</p>
+                    </div>
+                  </label>
+                ))}
               </div>
 
-              {/* Phase + programmer info + start */}
+              {/* Motor profile (not needed for Calibrate-only) */}
+              {stepPlan !== 'calibrate' && (
+                <div className="space-y-1.5">
+                  <label className="data-label">Motor Profile</label>
+                  <select
+                    value={motorProfile}
+                    onChange={(e) => setMotorProfile(e.target.value)}
+                    className="w-full bg-surface-2 border border-surface-3 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:border-accent"
+                  >
+                    {profiles.map((p) => (
+                      <option key={p.key} value={p.key}>{p.key}</option>
+                    ))}
+                    {profiles.length === 0 && (
+                      <option value="MAD_5010_200KV">MAD_5010_200KV</option>
+                    )}
+                  </select>
+                  <ProfileTable profile={selectedProfile} />
+                </div>
+              )}
+
+              {/* Start */}
               <div className="flex gap-4 items-center flex-wrap">
-                <label className="flex items-center gap-2 text-sm text-gray-400 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={invertPhase}
-                    onChange={(e) => setInvertPhase(e.target.checked)}
-                    className="accent-accent"
-                  />
-                  Invert Phase
-                </label>
-                {!commissionOnly && (
+                {stepPlan === 'full' && (
                   <span className="text-xs text-gray-600 font-mono px-2 py-1 rounded bg-surface-2 border border-surface-3">
                     ST-LINK · SWD
                   </span>
@@ -435,7 +486,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
                 >
                   {versionChecking
                     ? 'Checking firmware…'
-                    : commissionOnly ? 'Commission Motor' : 'Flash + Commission Motor'}
+                    : stepPlan === 'calibrate' ? 'Start Calibration'
+                    : stepPlan === 'commission' ? 'Commission Motor'
+                    : 'Flash + Commission Motor'}
                 </button>
               </div>
 
@@ -494,9 +547,11 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
               )}
 
               <p className="text-[10px] text-gray-600">
-                {commissionOnly
-                  ? 'Commissions the ESC over CAN (sets motor profile + gains + ID), then runs encoder calibration. Firmware must already be on the ESC. Estimated time: ~1 min.'
-                  : 'Flashes pre-compiled firmware via ST-LINK, commissions the ESC over CAN (sets motor profile + gains + ID), then runs encoder calibration. No compile step — estimated time: ~2 min.'}
+                {stepPlan === 'calibrate'
+                  ? 'Hardstop range calibration only: move the joint to both hardstops to set zero, limits, and direction. Motor must already be commissioned.'
+                  : stepPlan === 'commission'
+                  ? 'Commissions the ESC over CAN (motor profile + gains + ID), runs flux calibration and an automatic commutation check, then hardstop calibration. Firmware must already be on the ESC. ~1 min + calibration.'
+                  : 'Flashes firmware via ST-LINK, commissions over CAN, runs flux calibration + automatic commutation check, then hardstop calibration. ~2 min + calibration.'}
               </p>
             </div>
           )}
@@ -575,27 +630,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
             <CalibrationProgress startedAt={calStartedAt} />
           )}
 
-          {/* Awaiting direction confirmation */}
-          {awaitingConfirm && (
-            <div className="flex items-center gap-3">
-              <div className="flex-1">
-                <p className="text-sm font-medium">Did the motor shaft move in the correct direction?</p>
-                <p className="text-xs text-gray-500 mt-0.5">
-                  Positive command = shaft moved as expected for joint convention.
-                </p>
-              </div>
-              <button onClick={() => handleConfirm(false)} className="btn-danger px-4 py-2 whitespace-nowrap">
-                No, invert ↻
-              </button>
-              <button onClick={() => handleConfirm(true)} className="btn-success px-4 py-2 whitespace-nowrap">
-                Yes, correct ✓
-              </button>
-            </div>
-          )}
-
-          {/* Complete */}
+          {/* Commission complete → continue to Calibration or finish */}
           {isComplete && (
-            <div className="flex items-center justify-between gap-4">
+            <div className="space-y-3">
               <div>
                 <p className="text-sm text-online font-medium">✓ ESC commissioned successfully</p>
                 {status?.flux_offset != null && (
@@ -609,9 +646,18 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
                   </p>
                 )}
               </div>
-              <button onClick={handleDone} className="btn-primary px-5 flex-shrink-0">
-                Done
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={enterCalibrate}
+                  disabled={calConnecting}
+                  className="btn-primary px-5 disabled:opacity-50"
+                >
+                  {calConnecting ? 'Preparing…' : 'Continue to Calibration →'}
+                </button>
+                <button onClick={handleDone} className="btn-ghost px-4 py-2">
+                  Skip — Done
+                </button>
+              </div>
             </div>
           )}
 
@@ -634,7 +680,7 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
           )}
 
           {/* Generic in-progress spinner */}
-          {isActive && !awaitingCanConnect && !awaitingConfirm && !isCalibrating && (
+          {isActive && !awaitingCanConnect && !isCalibrating && (
             <div className="flex items-center gap-2">
               <span className="w-3.5 h-3.5 rounded-full border-2 border-accent border-t-transparent animate-spin" />
               <span className="text-sm text-gray-400">

@@ -688,13 +688,6 @@ class FlashManager:
             "error": None,
         }
 
-    async def confirm_direction(self, correct: bool) -> None:
-        if self.status.state != FlashState.AWAITING_CONFIRMATION:
-            raise FlashError("No direction confirmation pending")
-        self._confirmed_correct = correct
-        if self._confirm_event is not None:
-            self._confirm_event.set()
-
     def get_step_info(self) -> dict:
         return {
             "state":       self.status.state,

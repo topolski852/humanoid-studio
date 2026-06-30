@@ -6,7 +6,6 @@ GET  /flash/status             returns state, progress, messages, flux_offset, e
 GET  /flash/step               returns step_index, total_steps, progress for UI progress strip
 POST /flash/power_cycled       — called when user confirms ESC has been power-cycled
 POST /flash/can_connected      — called when user confirms motor + CAN + encoder are connected
-POST /flash/confirm_direction  body: {correct: bool}
 GET  /flash/profiles           — list available motor profiles with specs
 POST /flash/reset              — force state back to IDLE, cancels any in-progress session
 """
@@ -73,10 +72,6 @@ class FlashStartBody(BaseModel):
     port: str = "SWD"
     firmware_dir: str | None = None
     skip_flash: bool = False
-
-
-class ConfirmDirectionBody(BaseModel):
-    correct: bool
 
 
 # ---------------------------------------------------------------------------
@@ -163,17 +158,6 @@ async def flash_can_connected(request: Request) -> dict | JSONResponse:
     except FlashError as exc:
         return _err(str(exc), 409)
 
-
-@router.post("/flash/confirm_direction", response_model=None)
-async def flash_confirm_direction(
-    body: ConfirmDirectionBody, request: Request
-) -> dict | JSONResponse:
-    flash_manager = request.app.state.flash_manager
-    try:
-        await flash_manager.confirm_direction(correct=body.correct)
-        return _ok({"confirmed": body.correct})
-    except FlashError as exc:
-        return _err(str(exc), 409)
 
 
 @router.post("/flash/can_ping", response_model=None)

@@ -89,11 +89,6 @@ export const api = {
   flashCanConnected: () => request('/flash/can_connected', { method: 'POST' }),
   flashCanPing: () => request('/flash/can_ping', { method: 'POST' }),
   flashCheckFirmwareVersion: () => request('/flash/firmware_version'),
-  flashConfirm: (correct) =>
-    request('/flash/confirm_direction', {
-      method: 'POST',
-      body: JSON.stringify({ correct }),
-    }),
 
   // ── Motor calibration ──────────────────────────────────────────────────────
   setMotorPositionOffset: (jointName, positionOffset) =>
@@ -105,6 +100,25 @@ export const api = {
     request(`/motors/${encodeURIComponent(jointName)}/position_calibrate`, {
       method: 'POST',
       body: JSON.stringify({ hardstop_lower_rad: hardstopLowerRad, limits_min: limitsMin, limits_max: limitsMax }),
+    }),
+  // Hardstop range calibration: zero offset, then derive gear sign + offset + limits.
+  rangeCalStart: (jointName) =>
+    request(`/motors/${encodeURIComponent(jointName)}/range_cal_start`, { method: 'POST' }),
+  rangeCalApply: (jointName, lowerPosRad, upperPosRad, opts = {}) =>
+    request(`/motors/${encodeURIComponent(jointName)}/range_cal_apply`, {
+      method: 'POST',
+      body: JSON.stringify({
+        lower_pos_rad: lowerPosRad,
+        upper_pos_rad: upperPosRad,
+        min_rad: opts.minRad ?? null,
+        max_rad: opts.maxRad ?? null,
+        store_to_flash: opts.storeToFlash ?? false,
+      }),
+    }),
+  jogDirection: (jointName, stepRad = 0.2, moveS = 1.5) =>
+    request(`/motors/${encodeURIComponent(jointName)}/jog_direction`, {
+      method: 'POST',
+      body: JSON.stringify({ step_rad: stepRad, move_s: moveS }),
     }),
 
   // ── ESC config sync ────────────────────────────────────────────────────────
