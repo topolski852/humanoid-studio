@@ -280,10 +280,12 @@ async def jog(
     step = step_rad if (start_pos + step_rad) <= hi else -step_rad
     try:
         if gentle:
-            # Cap Kp + torque (with a little Kd for damping) so the move is soft
-            # regardless of how aggressive the joint's tuned gains are.
-            await actuator.write_gains(min(kp0, 10.0), 0.0, max(kd0, 2.0),
-                                       min(tl0, max(1.0, 0.3 * tl0)))
+            # Cap Kp so the approach force is bounded (no slam) and raise Kd for
+            # damping, but keep a generous torque ceiling: a too-low torque cap
+            # lets a gravity-loaded joint fall (and starves the Kd term that
+            # would resist the fall). Peak force is then ~Kp*error, not the cap.
+            await actuator.write_gains(min(kp0, 10.0), 0.0, max(kd0, 3.0),
+                                       min(tl0, 8.0))
         samples = await _ramp(actuator, start_pos, step, duration_s=move_s,
                               runaway_band_rad=runaway_band_rad)
         end_pos = samples[-1]["position"] if samples else start_pos
