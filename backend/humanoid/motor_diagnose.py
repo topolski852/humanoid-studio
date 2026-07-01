@@ -736,6 +736,135 @@ async def run_gravity_tune(
         await _restore(actuator, kp0, ki0, kd0, tl0, start_pos)
 
 
+# ---------------------------------------------------------------------------
+# Breakaway torque discovery
+# ---------------------------------------------------------------------------
+
+async def find_breakaway_torque(
+    actuator: DaemonActuatorProxy,
+    *,
+    step_rad: float = 0.15,
+    torque_start: float = 0.5,
+    torque_step: float = 0.5,
+    torque_max: float | None = None,
+    move_threshold_rad: float = 0.03,
+    settle_s: float = 0.6,
+    probe_s: float = 0.6,
+    runaway_band_rad: float | None = None,
+) -> dict:
+    """Ramp the torque limit up until the joint breaks away and moves — the
+    minimum torque that produces motion = gravity load + static friction.
+
+    A high Kp is used so the torque LIMIT (not Kp·error) is the binding constraint,
+    so the applied torque tracks the limit as we ramp it. Both directions are
+    tested when there's room: the harder direction is uphill (gravity + friction),
+    the easier is downhill (friction − gravity), which separates gravity (the
+    up/down asymmetry) from friction (the common part). Motor must be in POSITION
+    mode; entry gains and position are restored on exit.
+    """
+    cfg = actuator.config
+    start = _require_position_mode(actuator)
+    start_pos = start.position
+    kp0, ki0, kd0, tl0 = cfg.position_kp, cfg.position_ki, cfg.velocity_kp, cfg.torque_limit
+    if torque_max is None:
+        torque_max = tl0
+    avail = _available_range(actuator)
+    if runaway_band_rad is None:
+        runaway_band_rad = min(0.4, 0.6 * avail) if avail > 0 else 0.4
+    runaway_band_rad = max(runaway_band_rad, abs(step_rad) + 0.1)
+
+    # Kp high enough that the torque limit binds (applied torque = limit).
+    kp_test = max(kp0, 2.0 * torque_max / max(abs(step_rad), 0.05))
+    kd_test = max(kd0, 3.0)
+
+    levels: list[float] = []
+    t = torque_start
+    while t < torque_max - 1e-6:
+        levels.append(round(t, 3)); t += torque_step
+    levels.append(round(torque_max, 3))
+
+    lo, hi = _limits(actuator)
+    dirs = []
+    if (start_pos + abs(step_rad)) <= hi:
+        dirs.append(("+", +1.0))
+    if (start_pos - abs(step_rad)) >= lo:
+        dirs.append(("-", -1.0))
+    if not dirs:
+        raise ValueError("No room to move in either direction — center the joint first.")
+
+    async def return_to_start():
+        # Bring the joint back to start with full torque + damping before the next probe.
+        try:
+            await actuator.write_gains(kp_test, 0.0, max(kd_test, 6.0), torque_max)
+            await _hold(actuator, _clamp_target(actuator, start_pos), duration_s=settle_s,
+                        start_pos=start_pos, runaway_band_rad=runaway_band_rad * 2.0)
+        except RunawayAbort:
+            try:
+                await actuator.enable()
+            except Exception:
+                pass
+
+    out: dict = {}
+    try:
+        for dname, sign in dirs:
+            target = _clamp_target(actuator, start_pos + sign * abs(step_rad))
+            breakaway = None
+            per_level: list[dict] = []
+            for tq in levels:
+                await return_to_start()
+                await actuator.write_gains(kp_test, 0.0, kd_test, tq)
+                try:
+                    s = await _hold(actuator, target, duration_s=probe_s,
+                                    start_pos=start_pos, runaway_band_rad=runaway_band_rad)
+                    moved = max((abs(x["position"] - start_pos) for x in s), default=0.0)
+                    cur = max((abs(x["current"]) for x in s), default=0.0)
+                except RunawayAbort:
+                    moved, cur = runaway_band_rad, None
+                    try:
+                        await actuator.enable()
+                    except Exception:
+                        pass
+                per_level.append({"torque": tq, "moved_rad": round(moved, 4),
+                                  "max_current_a": round(cur, 3) if cur is not None else None})
+                if moved >= move_threshold_rad:
+                    breakaway = tq
+                    break
+            out[dname] = {"breakaway_torque": breakaway, "levels": per_level}
+        await return_to_start()
+    finally:
+        await _restore(actuator, kp0, ki0, kd0, tl0, start_pos)
+
+    # Analysis
+    b = {d: out[d]["breakaway_torque"] for d in out}
+    found = [v for v in b.values() if v is not None]
+    analysis: dict = {"config_torque_limit": tl0}
+    if len(found) == 2:
+        up, down = max(found), min(found)
+        analysis.update({
+            "breakaway_uphill": up,
+            "breakaway_downhill": down,
+            "gravity_torque_est": round((up - down) / 2.0, 3),
+            "friction_torque_est": round((up + down) / 2.0, 3),
+        })
+    working = max(found) if found else None      # worst-case torque needed to move
+    analysis["working_torque"] = working
+    if working is not None:
+        rec = round(working * 1.4, 1)             # +40% headroom for control
+        analysis["recommended_torque_limit"] = rec
+        analysis["torque_limit_marginal"] = working > 0.85 * tl0
+    else:
+        analysis["recommended_torque_limit"] = None
+        analysis["never_moved"] = True            # needs more torque than tested / binding
+
+    return {
+        "directions": out,
+        "analysis": analysis,
+        "torque_levels": levels,
+        "kp_test": round(kp_test, 1),
+        "kd_test": round(kd_test, 2),
+    }
+
+
 async def _lift_drop_ki(actuator, kp, ki, kd, hold_point, drop_point, hold_s,
                         start_pos, runaway_band_rad, torque_limit):
     await actuator.write_gains(kp, ki, kd, torque_limit)
