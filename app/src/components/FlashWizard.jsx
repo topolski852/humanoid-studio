@@ -161,9 +161,11 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
   // 'setup' = the backend flash/commission flow; 'calibrate' = hardstop range cal.
   const [wizardPhase, setWizardPhase] = useState('setup')
   const [calConnecting, setCalConnecting] = useState(false)
-  // Skip the auto commutation check — for a joint that can't spin freely
-  // (assembled / short travel), where the check would false-fault.
-  const [skipCommutation, setSkipCommutation] = useState(false)
+  // Commutation check + phase order. phase_order is a hardware constant, so the
+  // check (which can flip it) defaults OFF and the starting phase defaults to the
+  // configured default — both come from app settings, overridable per-run here.
+  const [skipCommutation, setSkipCommutation] = useState(true)   // default: check OFF
+  const [phaseInverted, setPhaseInverted]     = useState(true)   // default: inverted
   const [started, setStarted]         = useState(false)
   const [startError, setStartError]   = useState(null)
   const [calStartedAt, setCalStartedAt] = useState(null)
@@ -191,6 +193,16 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
   useEffect(() => {
     api.flashProfiles()
       .then((d) => setProfiles(d.profiles ?? []))
+      .catch(() => {})
+  }, [])
+
+  // Load Flash Wizard defaults (commutation check + phase order) from settings
+  useEffect(() => {
+    api.getSettings()
+      .then((s) => {
+        setSkipCommutation(!(s.commutation_check ?? false))
+        setPhaseInverted(s.default_phase_inverted ?? true)
+      })
       .catch(() => {})
   }, [])
 
@@ -246,9 +258,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
     setStarted(true)
     setAwaitingFlashChoice(false)
     try {
-      // invert_phase is just the starting guess — the commission's automatic
-      // commutation check toggles it if it's wrong, so we always start at +1.
-      await api.flashStart(canId, false, motorProfile, 'SWD', canChannel ?? 'can0',
+      // Start at the configured phase order. If the commutation check is enabled
+      // (opt-in) it may still toggle it; with the check off, this value stands.
+      await api.flashStart(canId, phaseInverted, motorProfile, 'SWD', canChannel ?? 'can0',
                            skipFlash, skipCommutation)
     } catch (e) {
       setStartError(e.message)
@@ -476,20 +488,42 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
                 </div>
               )}
 
-              {/* Skip commutation check — for joints that can't spin freely */}
+              {/* Phase order + commutation check — phase_order is a hardware constant */}
               {stepPlan !== 'calibrate' && (
-                <label className="flex items-start gap-2 text-xs text-gray-400 cursor-pointer select-none px-1">
-                  <input type="checkbox" checked={skipCommutation}
-                    onChange={(e) => setSkipCommutation(e.target.checked)}
-                    className="accent-accent mt-0.5" />
-                  <span>
-                    Skip commutation check
-                    <span className="block text-[10px] text-gray-600">
-                      For a joint that can't spin freely (assembled / short travel).
-                      The check needs free motion — best to commission free-to-spin instead.
+                <div className="space-y-2 px-1">
+                  <label className="flex items-start gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                    <input type="checkbox" checked={phaseInverted}
+                      onChange={(e) => setPhaseInverted(e.target.checked)}
+                      className="accent-accent mt-0.5" />
+                    <span>
+                      Phase order: inverted
+                      <span className="block text-[10px] text-gray-600">
+                        Hardware wiring constant. Leave checked for standard wiring; uncheck only
+                        if this motor's phases are wired opposite.
+                      </span>
                     </span>
-                  </span>
-                </label>
+                  </label>
+                  <label className="flex items-start gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                    <input type="checkbox" checked={!skipCommutation}
+                      onChange={(e) => setSkipCommutation(!e.target.checked)}
+                      className="accent-accent mt-0.5" />
+                    <span>
+                      Run commutation check
+                      <span className="block text-[10px] text-gray-600">
+                        Verifies commutation and can flip phase order if it's wrong.
+                      </span>
+                    </span>
+                  </label>
+                  {!skipCommutation && (
+                    <div className="rounded-md bg-warn/10 border border-warn/25 px-3 py-2">
+                      <p className="text-[10px] text-warn leading-relaxed">
+                        ⚠ The commutation check can fail if the motor is under load — run it with
+                        the joint <span className="font-semibold">free to spin</span>. On an
+                        assembled or constrained joint it may misfire and flip phase order.
+                      </p>
+                    </div>
+                  )}
+                </div>
               )}
 
               {/* Start */}
@@ -570,8 +604,8 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
                 {stepPlan === 'calibrate'
                   ? 'Hardstop range calibration only: move the joint to both hardstops to set zero, limits, and direction. Motor must already be commissioned.'
                   : stepPlan === 'commission'
-                  ? 'Commissions the ESC over CAN (motor profile + gains + ID), runs flux calibration and an automatic commutation check, then hardstop calibration. Firmware must already be on the ESC. ~1 min + calibration.'
-                  : 'Flashes firmware via ST-LINK, commissions over CAN, runs flux calibration + automatic commutation check, then hardstop calibration. ~2 min + calibration.'}
+                  ? 'Commissions the ESC over CAN (motor profile + gains + ID), runs flux calibration and an optional commutation check, then hardstop calibration. Firmware must already be on the ESC. ~1 min + calibration.'
+                  : 'Flashes firmware via ST-LINK, commissions over CAN, runs flux calibration + optional commutation check, then hardstop calibration. ~2 min + calibration.'}
               </p>
             </div>
           )}

@@ -14,6 +14,22 @@ function SettingRow({ label, description, children }) {
   )
 }
 
+function Toggle({ checked, onChange, disabled }) {
+  return (
+    <button
+      role="switch"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={`relative inline-flex h-5 w-9 flex-shrink-0 items-center rounded-full transition-colors
+        disabled:opacity-40 ${checked ? 'bg-accent/70' : 'bg-surface-3'}`}
+    >
+      <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform
+        ${checked ? 'translate-x-4' : 'translate-x-0.5'}`} />
+    </button>
+  )
+}
+
 export default function Settings() {
   const { wsConnected, robotConnected, states } = useTelemetry()
   const [apiUrl] = useState('http://localhost:8765')
@@ -24,14 +40,28 @@ export default function Settings() {
   const [savingPath,      setSavingPath]      = useState(false)
   const [pathMsg,         setPathMsg]         = useState(null)
 
+  // Flash Wizard defaults
+  const [commutationCheck, setCommutationCheck]       = useState(false)
+  const [defaultPhaseInverted, setDefaultPhaseInverted] = useState(true)
+
   useEffect(() => {
     api.getSettings()
       .then((s) => {
         setConfigPath(s.config_path ?? '')
         setConfigPathDraft(s.config_path ?? '')
+        setCommutationCheck(s.commutation_check ?? false)
+        setDefaultPhaseInverted(s.default_phase_inverted ?? true)
       })
       .catch(() => {})
   }, [])
+
+  async function saveFlashDefault(patch, revert) {
+    try {
+      await api.putSettings(patch)
+    } catch {
+      revert()   // roll the toggle back if the write failed
+    }
+  }
 
   async function saveConfigPath() {
     setSavingPath(true)
@@ -100,6 +130,31 @@ export default function Settings() {
           </div>
         </section>
 
+        {/* Flash Wizard */}
+        <section>
+          <h2 className="text-xs font-medium text-gray-500 uppercase tracking-widest mb-4">Flash Wizard</h2>
+          <div className="card p-4">
+            <SettingRow
+              label="Run commutation check by default"
+              description="The auto commutation check can flip phase order. It only works when the motor is free to spin — on an assembled/loaded joint it can misfire and corrupt phase order. Off by default; still toggleable per-run in the wizard."
+            >
+              <Toggle
+                checked={commutationCheck}
+                onChange={(v) => { setCommutationCheck(v); saveFlashDefault({ commutation_check: v }, () => setCommutationCheck(!v)) }}
+              />
+            </SettingRow>
+            <SettingRow
+              label="Default phase order: Inverted"
+              description="Phase order is a hardware wiring constant (True/inverted for the standard wiring). Used as the starting value when commissioning; override per-run in the wizard."
+            >
+              <Toggle
+                checked={defaultPhaseInverted}
+                onChange={(v) => { setDefaultPhaseInverted(v); saveFlashDefault({ default_phase_inverted: v }, () => setDefaultPhaseInverted(!v)) }}
+              />
+            </SettingRow>
+          </div>
+        </section>
+
         {/* Connection status */}
         <section>
           <h2 className="text-xs font-medium text-gray-500 uppercase tracking-widest mb-4">Connection</h2>
@@ -132,7 +187,7 @@ export default function Settings() {
         <section>
           <h2 className="text-xs font-medium text-gray-500 uppercase tracking-widest mb-4">About</h2>
           <div className="card p-4">
-            <SettingRow label="Humanoid Studio" description="Version 0.1.0">
+            <SettingRow label="Humanoid Studio" description="Version 1.1.0">
               <span className="text-xs text-gray-500">Berkeley Humanoid Lite</span>
             </SettingRow>
             <SettingRow label="Robot" description="Motor controller firmware">

@@ -865,6 +865,167 @@ async def find_breakaway_torque(
     }
 
 
+async def sweep_breakaway_torque(
+    actuator: DaemonActuatorProxy,
+    *,
+    n_poses: int = 5,
+    step_rad: float = 0.12,
+    torque_start: float = 0.3,
+    torque_step: float = 0.4,
+    torque_max: float | None = None,
+    move_threshold_rad: float = 0.03,
+    overshoot_limit_rad: float = 0.06,
+    probe_s: float = 0.5,
+    settle_s: float = 0.6,
+) -> dict:
+    """Step the joint across its range and, at each pose, ramp the torque limit to
+    find the minimum torque for CONTROLLED motion (reaches the target without
+    falling past it) — the joint's load at that pose. Maps load vs position: a flat
+    profile = friction-dominated; a profile that rises at some angles = gravity.
+    Reports the worst (highest-load) pose, the friction floor (the minimum across
+    poses), and whether the torque limit is marginal. Restores gains + position."""
+    cfg = actuator.config
+    start = _require_position_mode(actuator)
+    entry_pos = start.position
+    kp0, ki0, kd0, tl0 = cfg.position_kp, cfg.position_ki, cfg.velocity_kp, cfg.torque_limit
+    if torque_max is None:
+        torque_max = tl0
+    kp_test = max(kp0, 2.0 * torque_max / max(abs(step_rad), 0.05))
+    band = abs(step_rad) + 0.12
+
+    lo, hi = _limits(actuator)
+    margin = abs(step_rad) + 0.03
+    p_lo, p_hi = lo + margin, hi - margin
+    if p_hi - p_lo < 0.1:
+        raise ValueError("Joint range too small to sweep — use single-pose breakaway.")
+    n_poses = max(2, min(n_poses, 9))
+    poses = [round(p_lo + (p_hi - p_lo) * i / (n_poses - 1), 4) for i in range(n_poses)]
+
+    levels: list[float] = []
+    t = torque_start
+    while t < torque_max - 1e-6:
+        levels.append(round(t, 3)); t += torque_step
+    levels.append(round(torque_max, 3))
+
+    async def wg(kp, ki, kd, tl):
+        # Retry the gain write: it's SDO and can transiently time out under the
+        # sweep's rapid write/PDO/slow-poll contention. One failure shouldn't abort.
+        for _ in range(3):
+            try:
+                await actuator.write_gains(kp, ki, kd, tl); return
+            except Exception:
+                await asyncio.sleep(0.15)
+        await actuator.write_gains(kp, ki, kd, tl)   # final try — propagate if still bad
+
+    async def goto(p):
+        """Drive to pose p at full test torque and return the ACTUAL settled
+        position (not the commanded one — the joint may be stuck / hardstopped)."""
+        try:
+            await wg(kp_test, 0.0, max(kd0, 6.0), torque_max)
+            await _hold(actuator, _clamp_target(actuator, p), duration_s=settle_s,
+                        start_pos=p, runaway_band_rad=band * 2.5)
+        except RunawayAbort:
+            try:
+                await actuator.enable()
+            except Exception:
+                pass
+        st = actuator.get_cached_state()
+        return st.position if st and st.position is not None else p
+
+    # Tolerance for "goto actually reached the pose". If the joint can't be placed
+    # near the pose (stuck / commutation fault / hardstop), the pose is unmeasurable
+    # and we must NOT count the residual pose-offset as motion.
+    reach_tol = max(0.08, abs(step_rad) * 0.6)
+
+    async def breakaway_at(pose):
+        """Min torque to MOVE the joint, per direction; return the HARDER direction
+        (max) = the uphill/loaded number. Measures displacement from the joint's
+        ACTUAL settled position each probe, so a joint that goto can't place is
+        reported unreachable rather than faking a breakaway. Returns
+        {breakaway, reached_deg, unreachable}."""
+        p_settle = await goto(pose)
+        if abs(p_settle - pose) > reach_tol:            # goto couldn't get there
+            return {"breakaway": None, "reached_deg": round(p_settle * _R2D, 1),
+                    "unreachable": True}
+        best = None
+        for sign in (+1.0, -1.0):
+            dir_break = None
+            for tq in levels:
+                p0 = await goto(pose)                   # re-settle, capture actual start
+                if abs(p0 - pose) > reach_tol:          # slipped away between probes
+                    return {"breakaway": None, "reached_deg": round(p0 * _R2D, 1),
+                            "unreachable": True}
+                target = _clamp_target(actuator, p0 + sign * abs(step_rad))
+                if abs(target - p0) < abs(step_rad) * 0.5:
+                    break                               # at a limit in this direction
+                await wg(kp_test, 0.0, max(kd0, 4.0), tq)
+                try:
+                    s = await _hold(actuator, target, duration_s=probe_s,
+                                    start_pos=p0, runaway_band_rad=band)
+                    moved = max((abs(x["position"] - p0) for x in s
+                                 if x.get("position") is not None), default=0.0)
+                except RunawayAbort:
+                    moved = band                       # fell/ran away = it moved
+                if moved >= move_threshold_rad:
+                    dir_break = tq
+                    break
+            if dir_break is not None:
+                best = dir_break if best is None else max(best, dir_break)
+        return {"breakaway": best, "reached_deg": round(p_settle * _R2D, 1),
+                "unreachable": False}
+
+    sweep: list[dict] = []
+    try:
+        for pose in poses:
+            reached_deg, unreachable, err = None, False, None
+            try:
+                res = await breakaway_at(pose)
+                bk = res["breakaway"]
+                reached_deg = res["reached_deg"]
+                unreachable = res["unreachable"]
+            except Exception as exc:            # a pose that can't be probed shouldn't kill the sweep
+                bk, err = None, str(exc)
+            row = {"pose_rad": pose, "pose_deg": round(pose * _R2D, 1),
+                   "breakaway_torque": bk, "reached_deg": reached_deg,
+                   "unreachable": unreachable}
+            if err:
+                row["error"] = err
+            sweep.append(row)
+    finally:
+        await _restore(actuator, kp0, ki0, kd0, tl0, entry_pos)
+
+    valid = [s for s in sweep if s["breakaway_torque"] is not None]
+    unreachable = [s["pose_deg"] for s in sweep if s.get("unreachable")]
+    analysis: dict = {"config_torque_limit": tl0}
+    if unreachable:
+        # goto couldn't place the joint here even at full test torque: not a load
+        # problem — the joint is stuck / mis-commutated / hardstopped at these poses.
+        analysis["unreachable_poses_deg"] = unreachable
+        analysis["stuck_warning"] = (
+            f"{len(unreachable)}/{len(poses)} poses unreachable at {round(torque_max,1)} Nm "
+            "— likely a commutation/mechanical fault, not a gains/torque issue. "
+            "Run Diagnose before tuning."
+        )
+    if valid:
+        friction = min(s["breakaway_torque"] for s in valid)   # min load ≈ friction floor
+        worst = max(valid, key=lambda s: s["breakaway_torque"])
+        analysis.update({
+            "friction_floor_est": friction,
+            "worst_pose_deg": worst["pose_deg"],
+            "worst_breakaway_torque": worst["breakaway_torque"],
+            "gravity_span_est": round(worst["breakaway_torque"] - friction, 3),
+            "recommended_torque_limit": round(worst["breakaway_torque"] * 1.4, 1),
+            "torque_limit_marginal": worst["breakaway_torque"] > 0.85 * tl0,
+            "poses_that_never_moved": [s["pose_deg"] for s in sweep
+                                       if s["breakaway_torque"] is None],
+        })
+    else:
+        analysis["never_moved"] = True
+
+    return {"sweep": sweep, "analysis": analysis, "torque_levels": levels,
+            "kp_test": round(kp_test, 1)}
+
+
 async def _lift_drop_ki(actuator, kp, ki, kd, hold_point, drop_point, hold_s,
                         start_pos, runaway_band_rad, torque_limit):
     await actuator.write_gains(kp, ki, kd, torque_limit)

@@ -24,7 +24,10 @@ from pydantic import BaseModel
 
 from humanoid.daemon_client import DaemonError, DaemonNotSupportedError, Mode
 from humanoid.motor_tune import run_step_test
-from humanoid.motor_diagnose import RunawayAbort, run_diagnosis, run_gravity_tune, jog, find_breakaway_torque
+from humanoid.motor_diagnose import (
+    RunawayAbort, run_diagnosis, run_gravity_tune, jog,
+    find_breakaway_torque, sweep_breakaway_torque,
+)
 from humanoid.joint_defaults import apply_default_limits, default_position_limits
 from humanoid.range_cal import compute_range_calibration
 from humanoid.robot_config import PositionLimits
@@ -570,6 +573,27 @@ async def find_breakaway_torque_route(
     if error:
         return error
     return await _run_cancellable(request, find_breakaway_torque(actuator, **body.model_dump()))
+
+
+class SweepBreakawayBody(BaseModel):
+    n_poses: int = 5
+    step_rad: float = 0.12
+    torque_start: float = 0.3
+    torque_step: float = 0.4
+    torque_max: float | None = None
+
+
+@router.post("/motors/{joint_name}/sweep_breakaway_torque", response_model=None)
+async def sweep_breakaway_torque_route(
+    joint_name: str, body: SweepBreakawayBody, request: Request
+) -> dict | JSONResponse:
+    """Step the joint across its range and measure the breakaway (load) at each
+    pose — maps load vs position (friction floor vs gravity), finds the worst pose.
+    Non-destructive; restores gains + position. Motor must be in POSITION mode."""
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    return await _run_cancellable(request, sweep_breakaway_torque(actuator, **body.model_dump()))
 
 
 @router.post("/motors/{joint_name}/gravity_tune", response_model=None)
