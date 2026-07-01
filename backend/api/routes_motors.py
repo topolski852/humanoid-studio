@@ -156,6 +156,39 @@ async def get_motor(joint_name: str, request: Request) -> dict | JSONResponse:
         return _err(str(exc))
 
 
+# Encoder diagnostic — read the raw encoder registers straight off the ESC (SDO),
+# independent of gear_ratio / position_offset, to sanity-check a suspect encoder.
+_ENCODER_DIAG_PARAMS = {
+    "position_raw": 0x12C,   # PARAM_ENCODER_POSITION_RAW  (single-turn count, 0..cpr-1)
+    "n_rotations":  0x130,   # PARAM_ENCODER_N_ROTATIONS   (multi-turn count)
+    "enc_position": 0x134,   # PARAM_ENCODER_POSITION      (processed angle, rad)
+}
+
+
+@router.get("/motors/{joint_name}/encoder_diag", response_model=None)
+async def encoder_diag(joint_name: str, request: Request) -> dict | JSONResponse:
+    """Read the raw encoder registers off the ESC (position_raw, n_rotations,
+    encoder position/velocity, cpr) plus the processed telemetry position — for
+    diagnosing a suspect encoder while the joint is hand-moved through its range."""
+    actuator, error = _resolve_actuator(request, joint_name)
+    if error:
+        return error
+    dc = request.app.state.robot
+    ch, dev = actuator.config.can_channel, actuator.config.can_id
+    loop = asyncio.get_running_loop()
+    out: dict = {}
+    for name, pid in _ENCODER_DIAG_PARAMS.items():
+        try:
+            r = await loop.run_in_executor(None, dc.generic_sdo_read, ch, dev, pid, 0.3)
+            out[name] = r  # {value_u32, value_f32, value_i32} or None on timeout
+        except Exception as exc:
+            out[name] = {"error": str(exc)}
+    st = actuator.get_cached_state()
+    out["telemetry_position"] = st.position if st is not None else None
+    out["telemetry_velocity"] = st.velocity if st is not None else None
+    return _ok(out)
+
+
 @router.post("/motors/{joint_name}/enable", response_model=None)
 async def enable_motor(
     joint_name: str, body: EnableBody, request: Request
