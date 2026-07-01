@@ -72,6 +72,7 @@ class FlashStartBody(BaseModel):
     port: str = "SWD"
     firmware_dir: str | None = None
     skip_flash: bool = False
+    skip_commutation_check: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +111,7 @@ async def flash_start(body: FlashStartBody, request: Request) -> dict | JSONResp
         invert_phase=body.invert_phase,
         motor_profile=body.motor_profile,
         skip_flash=body.skip_flash,
+        skip_commutation_check=body.skip_commutation_check,
     )
     try:
         await flash_manager.start(port=body.port, config=config)

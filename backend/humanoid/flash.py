@@ -209,6 +209,11 @@ class FlashConfig(BaseModel):
     invert_phase: bool = False
     motor_profile: str = "MAD_5010_200KV"
     skip_flash: bool = False
+    # Skip the automatic commutation check. The check needs the joint FREE TO SPIN;
+    # on a constrained/loaded joint (e.g. assembled, or short-travel like an ankle
+    # roll) it can't move and reads a false fault. Set this to commission such a
+    # joint without the check (verify commutation separately, free-to-spin).
+    skip_commutation_check: bool = False
 
     def profile_data(self) -> dict:
         key = self.motor_profile
@@ -1380,7 +1385,10 @@ class FlashManager:
         self._log("Waiting for CAN bus to settle...", progress=56)
         await asyncio.sleep(2.0)
 
-        phase_attempts = 0   # only two phase_order values exist
+        phase_attempts = 0            # only two phase_order values exist
+        original_invert = invert_phase  # restore this if both phases look stuck
+        finish_after_recal = False    # set when recalibrating the restored phase
+        commutation_verified = None   # None = unverified, True = verified
 
         while True:
             self.status.state = FlashState.CALIBRATING
@@ -1476,12 +1484,26 @@ class FlashManager:
                 f"({math.degrees(flux_offset):.2f}°). Saved to Flash.",
                 progress=75)
 
+            # If we just recalibrated the restored (original) phase after both
+            # phases looked stuck, stop here — commutation stays unverified.
+            if finish_after_recal:
+                self._log("Recalibrated at the original phase order — commutation "
+                          "left UNVERIFIED (see warning above).", progress=85)
+                break
+
             # ── 5. Auto commutation check ─────────────────────────────────────
             # phase_order is chosen for COMMUTATION, not direction. A small guarded
-            # move detects a commutation fault (stuck while saturating torque); if
+            # move detects a commutation fault (stuck while drawing current); if
             # found, toggle phase_order + recalibrate. Joint *direction* is set
-            # later via gear_ratio sign (the Direction & Limits step), so the user
-            # is no longer asked "did it move the right way?" here.
+            # later via gear_ratio sign (the Calibrate step), so the user is no
+            # longer asked "did it move the right way?" here.
+            if config.skip_commutation_check:
+                self._log("Commutation check skipped by request — accepting the "
+                          "calibration at phase_order "
+                          f"{'-1' if invert_phase else '+1'}. Verify commutation with "
+                          "the joint free to spin.", progress=85)
+                break
+
             self._log("Checking commutation (small guarded move)...", progress=78)
             try:
                 probe = await self._commutation_check(config)
@@ -1494,6 +1516,7 @@ class FlashManager:
                     self._log("Commutation check skipped — accepting calibration.",
                               progress=85)
                 else:
+                    commutation_verified = True
                     self._log(
                         f"Commutation OK — moved {probe.get('moved_rad')} rad, "
                         f"max {probe.get('max_current_a')} A "
@@ -1502,10 +1525,34 @@ class FlashManager:
 
             phase_attempts += 1
             if phase_attempts >= 2:
-                raise FlashError(
-                    "Commutation failed on both phase orders (stuck while drawing "
-                    f"{probe.get('max_current_a')} A). Check motor phase wires and "
-                    "the encoder connection.")
+                # Both phase orders looked stuck. Ambiguous: a real commutation
+                # fault OR a joint that simply can't move (mechanically constrained
+                # / heavily loaded — e.g. an assembled short-travel ankle roll).
+                # Don't hard-fail and don't leave the phase toggled to a guess:
+                # restore the ORIGINAL phase order, recalibrate, and finish with a
+                # warning so the user can verify commutation free-to-spin.
+                commutation_verified = False
+                self._log(
+                    f"WARNING: could not verify commutation — the joint barely moved "
+                    f"on either phase order (moved {probe.get('moved_rad')} rad, drew "
+                    f"{probe.get('max_current_a')} A). This usually means the joint is "
+                    f"mechanically CONSTRAINED or LOADED (assembled on the robot, or "
+                    f"short travel). Best practice: Flash + Commission with the joint "
+                    f"FREE to spin, then Calibrate once assembled. Restoring the "
+                    f"original phase order and finishing.")
+                if invert_phase != original_invert:
+                    invert_phase = original_invert
+                    restore_val = -1 if invert_phase else +1
+                    await loop.run_in_executor(
+                        None, dc.generic_sdo_write, config.can_channel, config.can_id,
+                        _PARAM_MOTOR_PHASE_ORDER, "i32", restore_val)
+                    await loop.run_in_executor(
+                        None, dc.send_flash_store, config.can_channel, config.can_id)
+                    self._log(f"Restored phase_order to {restore_val:+d}; recalibrating "
+                              "flux for it...", progress=82)
+                    finish_after_recal = True
+                    continue   # recalibrate at the original phase, then break above
+                break
 
             # Commutation fault → toggle phase_order, save, and re-calibrate.
             invert_phase = not invert_phase
@@ -1543,7 +1590,20 @@ class FlashManager:
         await loop.run_in_executor(None, dc.send_nmt, config.can_channel, active_id, 0x00)
 
         self.status.state = FlashState.COMPLETE
-        self._log(
-            "Flash wizard complete. Motor is commissioned, stored to flash, "
-            "and placed in DISABLED mode.",
-            progress=100)
+        if commutation_verified is False:
+            self._log(
+                "Flash wizard complete — BUT COMMUTATION IS UNVERIFIED. The joint "
+                "couldn't move enough to confirm phase_order (likely constrained / "
+                "assembled). Re-commission it free-to-spin to verify, or verify "
+                "during calibration.",
+                progress=100)
+        elif commutation_verified is None:
+            self._log(
+                "Flash wizard complete. Motor is commissioned and stored to flash "
+                "(commutation check skipped — verify free-to-spin).",
+                progress=100)
+        else:
+            self._log(
+                "Flash wizard complete. Motor is commissioned, commutation verified, "
+                "stored to flash, and placed in DISABLED mode.",
+                progress=100)

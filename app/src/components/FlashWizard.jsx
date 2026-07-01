@@ -161,6 +161,9 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
   // 'setup' = the backend flash/commission flow; 'calibrate' = hardstop range cal.
   const [wizardPhase, setWizardPhase] = useState('setup')
   const [calConnecting, setCalConnecting] = useState(false)
+  // Skip the auto commutation check — for a joint that can't spin freely
+  // (assembled / short travel), where the check would false-fault.
+  const [skipCommutation, setSkipCommutation] = useState(false)
   const [started, setStarted]         = useState(false)
   const [startError, setStartError]   = useState(null)
   const [calStartedAt, setCalStartedAt] = useState(null)
@@ -245,7 +248,8 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
     try {
       // invert_phase is just the starting guess — the commission's automatic
       // commutation check toggles it if it's wrong, so we always start at +1.
-      await api.flashStart(canId, false, motorProfile, 'SWD', canChannel ?? 'can0', skipFlash)
+      await api.flashStart(canId, false, motorProfile, 'SWD', canChannel ?? 'can0',
+                           skipFlash, skipCommutation)
     } catch (e) {
       setStartError(e.message)
       setStarted(false)
@@ -470,6 +474,22 @@ export default function FlashWizard({ canId, canChannel, jointName, onClose, com
                   </select>
                   <ProfileTable profile={selectedProfile} />
                 </div>
+              )}
+
+              {/* Skip commutation check — for joints that can't spin freely */}
+              {stepPlan !== 'calibrate' && (
+                <label className="flex items-start gap-2 text-xs text-gray-400 cursor-pointer select-none px-1">
+                  <input type="checkbox" checked={skipCommutation}
+                    onChange={(e) => setSkipCommutation(e.target.checked)}
+                    className="accent-accent mt-0.5" />
+                  <span>
+                    Skip commutation check
+                    <span className="block text-[10px] text-gray-600">
+                      For a joint that can't spin freely (assembled / short travel).
+                      The check needs free motion — best to commission free-to-spin instead.
+                    </span>
+                  </span>
+                </label>
               )}
 
               {/* Start */}
