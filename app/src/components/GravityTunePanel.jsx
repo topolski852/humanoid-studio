@@ -22,13 +22,25 @@ export default function GravityTunePanel({ jointName, state, config, onLogError 
 
   useEffect(() => () => abortRef.current?.abort(), [])
 
+  // Prefill from the joint's CURRENT gains, once per joint. Read the LIVE values
+  // off the ESC (reflects any prior tuning), falling back to the file config.
+  // Center the Kd sweep on the joint's actual damping so we test around its real
+  // operating point instead of a fixed 0.5..8 that includes destructive low Kd.
   useEffect(() => {
-    if (cfgInit.current || !config) return
-    cfgInit.current = true
-    if (config.position_kp  != null) setKp(String(config.position_kp))
-    if (config.position_ki  != null) setKi(String(config.position_ki))
-    if (config.torque_limit != null) setTorqueLimit(String(config.torque_limit))
-  }, [config])
+    if (!jointName || cfgInit.current === jointName) return
+    cfgInit.current = jointName
+    const r2 = (x) => Number.parseFloat(Number(x).toFixed(2))
+    const applyFrom = (src) => {
+      if (!src) return
+      if (src.position_kp  != null) setKp(String(r2(src.position_kp)))
+      if (src.position_ki  != null) setKi(String(src.position_ki))
+      if (src.torque_limit != null) setTorqueLimit(String(r2(src.torque_limit)))
+      if (src.velocity_kp  != null && src.velocity_kp > 0)
+        setKdList([0.5, 1, 2, 4, 8].map((m) => r2(src.velocity_kp * m)).join(', '))
+    }
+    applyFrom(config)   // instant, from the (possibly stale) file config
+    api.getMotorConfigFromDevice(jointName).then(applyFrom).catch(() => {})  // refine from ESC
+  }, [jointName, config])
 
   const motorEnabled = state?.mode_name === 'POSITION'
   const rec = result?.recommended

@@ -80,7 +80,7 @@ class FakeActuator:
     """Scripts get_cached_state() responses per scenario so run_diagnosis can be
     driven deterministically and fast (small hold/ramp times)."""
 
-    def __init__(self, scenario, start_pos=0.0, gravity_descent=None):
+    def __init__(self, scenario, start_pos=0.0, gravity_descent=None, gravity_overshoot=None):
         self.scenario = scenario
         self.start_pos = start_pos
         self._pos = start_pos
@@ -88,6 +88,9 @@ class FakeActuator:
         self._kd = 1.0
         self._tl = 6.0
         self._gravity_descent = gravity_descent or {}
+        self._gravity_overshoot = gravity_overshoot or {}  # kd -> overshoot past drop target
+        self._prev_descending = False
+        self._drop_phase = 0
         self._config = JointConfig(
             joint_name="fake", can_id=1, can_channel="can0",
             position_kp=20.0, position_ki=0.0, velocity_kp=2.0, torque_limit=6.0,
@@ -117,11 +120,23 @@ class FakeActuator:
         if sc == "moves":
             self._pos += 0.5 * (target - self._pos)          # tracks the command
         elif sc == "gravity":
-            # lift (target above start) reaches with a fixed droop; drop returns to start
-            if target > self.start_pos + 0.01:
+            descending = target <= self.start_pos + 0.01
+            if not descending:
+                # lift (target above start) reaches with a fixed droop
                 self._pos += 0.6 * ((target - 0.1) - self._pos)
+                self._drop_phase = 0
             else:
-                self._pos += 0.6 * (target - self._pos)
+                if not self._prev_descending:
+                    self._drop_phase = 0
+                self._drop_phase += 1
+                ov = self._gravity_overshoot.get(round(self._kd, 3), 0.0)
+                if self._drop_phase == 1:
+                    self._pos += 0.6 * (target - self._pos)  # move down toward target
+                elif self._drop_phase == 2:
+                    self._pos = target - ov                  # then slam PAST it (overshoot)
+                else:
+                    self._pos += 0.5 * (target - self._pos)  # then settle back
+            self._prev_descending = descending
         # stuck scenarios (kp_starved/torque_starved/commutation): position frozen
         return None
 
@@ -182,10 +197,12 @@ def test_diagnosis_commutation_fault():
     print("ok test_diagnosis_commutation_fault")
 
 
-def test_gravity_tune_knee():
-    # descent velocity plateaus after Kd=2 -> the knee picker should select Kd=2
-    descent = {0.5: 2.0, 1.0: 1.2, 2.0: 0.95, 4.0: 0.92, 8.0: 0.90}
-    act = FakeActuator("gravity", gravity_descent=descent)
+def test_gravity_tune_picks_lowest_well_damped():
+    # Overshoot (the slam) shrinks with Kd. swing=0.3 -> overshoot_ok=max(0.045,0.03)=0.045.
+    # Kd 0.5/1 overshoot too much; Kd=2 is the lowest well-damped -> selected.
+    descent   = {0.5: 2.0,  1.0: 1.2,  2.0: 0.95, 4.0: 0.92, 8.0: 0.90}
+    overshoot = {0.5: 0.15, 1.0: 0.08, 2.0: 0.03, 4.0: 0.01, 8.0: 0.005}
+    act = FakeActuator("gravity", gravity_descent=descent, gravity_overshoot=overshoot)
     r = asyncio.run(run_gravity_tune(
         act, kp=20.0, kd_values=[0.5, 1, 2, 4, 8], lift_rad=0.3, lift_sign=1.0,
         torque_limit=6.0, hold_s=0.08,
@@ -194,7 +211,24 @@ def test_gravity_tune_knee():
     assert r["selected_kd"] == 2.0, r["selected_kd"]
     assert r["recommended"]["ki"] == 0.0
     assert r["recommended"]["kp"] >= 20.0
-    print("ok test_gravity_tune_knee  (selected_kd=%s, rec=%s)" % (r["selected_kd"], r["recommended"]))
+    print("ok test_gravity_tune_picks_lowest_well_damped  (selected_kd=%s)" % r["selected_kd"])
+
+
+def test_gravity_tune_survives_runaway():
+    # Low Kd overshoots PAST the runaway guard (swing 0.3 -> band ~0.4): those Kd
+    # must be recorded unstable and the sweep must continue, selecting a stable Kd.
+    descent   = {0.5: 3.0, 1.0: 2.0, 2.0: 1.0, 4.0: 0.9}
+    overshoot = {0.5: 0.6, 1.0: 0.5, 2.0: 0.03, 4.0: 0.01}   # 0.5/1.0 exceed the ~0.4 band
+    act = FakeActuator("gravity", gravity_descent=descent, gravity_overshoot=overshoot)
+    r = asyncio.run(run_gravity_tune(
+        act, kp=20.0, kd_values=[0.5, 1, 2, 4], lift_rad=0.3, lift_sign=1.0,
+        torque_limit=6.0, hold_s=0.08,
+    ))
+    unstable = [row for row in r["sweep"] if row.get("unstable")]
+    assert len(unstable) == 2, [row["kd"] for row in unstable]     # 0.5 and 1.0 ran away
+    assert r["selected_kd"] == 2.0, r["selected_kd"]               # lowest stable well-damped
+    print("ok test_gravity_tune_survives_runaway  (unstable=%s, selected=%s)" %
+          ([row['kd'] for row in unstable], r["selected_kd"]))
 
 
 class _ProbeFake:

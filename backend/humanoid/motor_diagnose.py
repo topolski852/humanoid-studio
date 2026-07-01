@@ -598,41 +598,89 @@ async def run_gravity_tune(
         sat = _torque_saturated(s_drop, torque_limit) or _torque_saturated(s_lift, torque_limit)
         cur = max(_current_motion_ratio(s_lift)["max_current_a"],
                   _current_motion_ratio(s_drop)["max_current_a"])
+        # Oscillation (velocity reversals) is the robust damping signal — it works
+        # even on a low-gravity joint where the descent-overshoot is small/noisy.
+        reversals = _velocity_reversals(s_lift, 0.1) + _velocity_reversals(s_drop, 0.1)
         return {
             "kd": round(kd_val, 3),
             "droop_rad": abs(droop),
             "descent_peak_velocity": dm["peak_velocity"],
             "descent_overshoot_rad": dm["overshoot_rad"],
+            "reversals": reversals,
             "max_current_a": round(cur, 3),
             "torque_saturated": sat,
         }
 
     sweep: list[dict] = []
     windup = {"tested": False, "detected": False, "delta_pct": None, "ki_probe": ki_probe}
+
+    async def recover_to_start():
+        """After a runaway abort (motor disabled), re-enable and gently bring the
+        joint back to the start with well-damped gains so it's ready for the next Kd."""
+        try:
+            await actuator.enable()   # POSITION; seeds target = current pos (no jump)
+        except Exception:
+            pass
+        await asyncio.sleep(0.2)
+        try:
+            await actuator.write_gains(min(kp, 15.0), 0.0, max(kd0, 8.0), torque_limit)
+            await _hold(actuator, drop_point, duration_s=1.5, start_pos=start_pos,
+                        runaway_band_rad=runaway_band_rad * 2.0)
+        except RunawayAbort:
+            pass
+
     try:
         for kd_val in kd_values:
-            sweep.append(await lift_drop(kd_val))
+            try:
+                sweep.append(await lift_drop(kd_val))
+            except RunawayAbort:
+                # Too under-damped at this Kd — it overshot past the guard. That IS
+                # data (this Kd is too low); record it unstable and keep sweeping.
+                sweep.append({
+                    "kd": round(kd_val, 3), "unstable": True, "droop_rad": None,
+                    "descent_peak_velocity": float("inf"),
+                    "descent_overshoot_rad": float("inf"),
+                    "reversals": 999,
+                    "max_current_a": None, "torque_saturated": None,
+                })
+                await recover_to_start()
 
-        # Kd selection: first row where descent velocity stops improving (>knee_improve_frac)
-        selected_kd = sweep[0]["kd"]
-        for i in range(1, len(sweep)):
-            prev = sweep[i - 1]["descent_peak_velocity"]
-            cur = sweep[i]["descent_peak_velocity"]
-            improve = (prev - cur) / prev if prev > 1e-6 else 0.0
-            selected_kd = sweep[i]["kd"]
-            if improve < knee_improve_frac:
-                selected_kd = sweep[i - 1]["kd"]   # the knee is the previous (smaller) Kd
-                break
+        stable = [r for r in sweep if not r.get("unstable")]
+        if not stable:
+            raise ValueError(
+                "Every Kd in the sweep was too under-damped (ran away). This joint "
+                "needs much more damping — raise the Kd values and re-run."
+            )
+
+        # Kd selection: prefer DAMPING, not descent speed. A well-damped Kd shows
+        # little OSCILLATION (velocity reversals — the robust signal, works even on
+        # low-gravity joints) and low descent overshoot. Pick the LOWEST such Kd;
+        # more Kd past that only adds sluggishness. If none qualify, take the highest
+        # stable Kd (the most damping we measured).
+        overshoot_ok = max(swing * 0.15, 0.03)   # <=15% of swing (or ~1.7°)
+        reversal_ok = 3                           # a damped move barely reverses
+        well_damped = [r for r in stable
+                       if r.get("reversals", 0) <= reversal_ok
+                       and r["descent_overshoot_rad"] <= overshoot_ok]
+        n_unstable = len(sweep) - len(stable)
+        if well_damped:
+            best = min(well_damped, key=lambda r: r["kd"])
+            note = (f"{n_unstable} lower Kd ran away (too under-damped); "
+                    if n_unstable else "")
+            rationale.append(
+                f"Kd={best['kd']:g} is the lowest well-damped move "
+                f"({best.get('reversals', 0)} velocity reversals, overshoot "
+                f"{best['descent_overshoot_rad'] * _R2D:.1f}°). {note}"
+                f"Higher Kd only adds sluggishness."
+            )
         else:
-            # never plateaued — pick the Kd with the lowest descent velocity
-            selected_kd = min(sweep, key=lambda r: r["descent_peak_velocity"])["kd"]
-
-        best = next(r for r in sweep if r["kd"] == selected_kd)
-        rationale.append(
-            f"Descent peak velocity bottoms out near Kd={selected_kd:g} "
-            f"({best['descent_peak_velocity']:.2f} rad/s, overshoot "
-            f"{best['descent_overshoot_rad'] * _R2D:.2f}°) — past that, extra Kd only adds noise."
-        )
+            # Fewest reversals, then lowest Kd — the closest to critically damped.
+            best = min(stable, key=lambda r: (r.get("reversals", 0), r["kd"]))
+            rationale.append(
+                f"No Kd fully damped it; picked Kd={best['kd']:g} with the fewest "
+                f"reversals ({best.get('reversals', 0)}) — consider even higher Kd."
+            )
+        selected_kd = best["kd"]
 
         # Kp recommendation from droop (droop ≈ gravity_torque / Kp)
         droop_rad = best["droop_rad"]
