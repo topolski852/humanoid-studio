@@ -1,6 +1,6 @@
 {
   "name": "humanoid-studio",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Desktop application for configuring and controlling Berkeley Humanoid Lite",
   "author": "Humanoid Studio",
   "main": "electron/main.js",
