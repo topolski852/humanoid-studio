@@ -1,0 +1,31 @@
+# Passwordless sudo for Humanoid Studio CAN adapter setup.
+#
+# Install with scripts/install-can-sudoers.sh — it substitutes __HUMANOID_USER__
+# for the invoking user, validates the result with visudo, and installs it to
+# /etc/sudoers.d/humanoid-can with mode 0440.
+#
+# Without this file, backend/humanoid/can_adapter.py runs `sudo -n` and fails
+# immediately (rather than prompting), so assigning a CAN adapter to a limb in
+# the app silently does nothing.
+
+# `ip` is spelled several ways across the call sites — bare `ip` resolved via
+# sudo's secure_path in can_adapter.py, `/sbin/ip` in routes_flash.py and
+# routes_devices.py — so every path to the same binary is listed.
+Cmnd_Alias HUMANOID_CAN_IP = \
+    /usr/bin/ip link set *, \
+    /usr/sbin/ip link set *, \
+    /bin/ip link set *, \
+    /sbin/ip link set *
+
+# Reloading udev rules after can_adapter.py rewrites them.
+Cmnd_Alias HUMANOID_CAN_UDEV = \
+    /usr/bin/udevadm control --reload-rules, \
+    /bin/udevadm control --reload-rules
+
+# can_adapter.py pipes the generated rule through `sudo tee`. Pinned to the one
+# file it may write — an unrestricted tee would be a root write to any path.
+Cmnd_Alias HUMANOID_CAN_RULES = \
+    /usr/bin/tee /etc/udev/rules.d/99-humanoid-can.rules, \
+    /bin/tee /etc/udev/rules.d/99-humanoid-can.rules
+
+__HUMANOID_USER__ ALL=(root) NOPASSWD: HUMANOID_CAN_IP, HUMANOID_CAN_UDEV, HUMANOID_CAN_RULES
