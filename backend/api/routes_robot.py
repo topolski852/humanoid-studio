@@ -12,13 +12,17 @@ from pathlib import Path
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from humanoid import settings as _app_settings
 from humanoid.robot_config import RobotConfig
 from humanoid.joint_defaults import apply_default_limits
 from humanoid.daemon_client import DaemonClient, DaemonNotRunningError
 
 router = APIRouter(tags=["robot"])
 
-_DEFAULT_CONFIG_PATH = Path(__file__).parents[3] / "configs" / "humanoid_lite.json"
+# Fallback for the rare case app.state.config_path is unset. parents[3] pointed
+# one level above the repo root — a path that never existed — so go through the
+# same resolver the backend starts from, which also stays writable when packaged.
+_DEFAULT_CONFIG_PATH = _app_settings.resolve_config_path()
 
 
 def _ok(data: object) -> dict:
