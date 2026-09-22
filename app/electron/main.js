@@ -1,5 +1,7 @@
 const { app, BrowserWindow, dialog, shell, session, ipcMain } = require('electron')
 const path = require('path')
+const os = require('os')
+const fs = require('fs')
 const { spawn } = require('child_process')
 const http = require('http')
 const dgram = require('dgram')
@@ -16,9 +18,44 @@ const DAEMON_BINARY = IS_DEV
   ? path.resolve(__dirname, '../../daemon/build/humanoid_daemon')
   : path.join(process.resourcesPath, 'daemon/humanoid_daemon')
 
-const DAEMON_CONFIG = IS_DEV
-  ? path.resolve(__dirname, '../../configs/humanoid_lite.json')
-  : path.join(process.resourcesPath, 'configs/humanoid_lite.json')
+// In a packaged build the bundled config lives inside the read-only AppImage
+// mount, so every save (calibration, commission results, CAN assignments) fails
+// against it. Use a writable per-user copy instead, seeded once from the bundle.
+//
+// This path is duplicated in backend/humanoid/settings.py — the daemon and the
+// backend must agree on one file, or the daemon runs on a stale config. It is
+// built from homedir() rather than app.getPath('userData') so it stays pinned to
+// what the Python side computes, independent of Electron's productName.
+const USER_CONFIG_DIR = path.join(os.homedir(), '.config', 'humanoid-studio')
+
+function resolveDaemonConfig() {
+  const bundled = IS_DEV
+    ? path.resolve(__dirname, '../../configs/humanoid_lite.json')
+    : path.join(process.resourcesPath, 'configs/humanoid_lite.json')
+
+  // Branch on whether the bundled config is actually writable, not on IS_DEV —
+  // settings.py decides the same way, and the two must not disagree.
+  try {
+    fs.accessSync(path.dirname(bundled), fs.constants.W_OK)
+    return bundled
+  } catch (_) {
+    // Read-only (AppImage squashfs) — fall through to the per-user copy.
+  }
+
+  const userCopy = path.join(USER_CONFIG_DIR, 'humanoid_lite.json')
+  try {
+    if (!fs.existsSync(userCopy) && fs.existsSync(bundled)) {
+      fs.mkdirSync(USER_CONFIG_DIR, { recursive: true })
+      fs.copyFileSync(bundled, userCopy)
+    }
+    return userCopy
+  } catch (err) {
+    console.error('[main] Could not seed writable config, falling back to bundled:', err.message)
+    return bundled
+  }
+}
+
+const DAEMON_CONFIG = resolveDaemonConfig()
 
 let mainWindow = null
 let backendProcess = null

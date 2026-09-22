@@ -29,10 +29,12 @@ from humanoid.motor_diagnose import (
     find_breakaway_torque, sweep_breakaway_torque,
 )
 from humanoid.joint_defaults import apply_default_limits, default_position_limits
+from humanoid import settings as _app_settings
 from humanoid.range_cal import compute_range_calibration
 from humanoid.robot_config import PositionLimits
 
-_DEFAULT_CONFIG_PATH = Path(__file__).parents[3] / "configs" / "humanoid_lite.json"
+# See routes_robot.py — parents[3] resolved above the repo root and never existed.
+_DEFAULT_CONFIG_PATH = _app_settings.resolve_config_path()
 _log = logging.getLogger(__name__)
 _velocity_ff_warned = False
 

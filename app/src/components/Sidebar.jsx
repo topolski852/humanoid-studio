@@ -126,7 +126,7 @@ export default function Sidebar() {
           </div>
           <div>
             <div className="font-semibold text-sm leading-none">Humanoid Studio</div>
-            <div className="text-[10px] text-gray-500 leading-none mt-0.5">v0.1.0</div>
+            <div className="text-[10px] text-gray-500 leading-none mt-0.5">v{__APP_VERSION__}</div>
           </div>
         </div>
         <div className="flex items-center gap-1.5">

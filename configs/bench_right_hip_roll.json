@@ -1,0 +1,42 @@
+{
+  "robot_name": "bench_right_hip_roll",
+  "telemetry_hz": 100,
+  "can_assignments": {},
+  "joints": {
+    "right_hip_roll_joint": {
+      "joint_name": "right_hip_roll_joint",
+      "joint_type": "revolute",
+      "can_channel": "can_right_leg",
+      "can_id": 4,
+      "phase_inverted": true,
+      "electrical_offset": 73.36698,
+      "gear_ratio": -15.0,
+      "position_limits": {
+        "min": -2.0,
+        "max": 2.0
+      },
+      "position_kp": 20.0,
+      "position_ki": 0.0,
+      "velocity_kp": 4.0,
+      "velocity_ki": 0.0,
+      "torque_limit": 6.0,
+      "velocity_limit": 20.0,
+      "position_offset": -0.45889886705978333,
+      "torque_filter_alpha": 0.1454,
+      "current_limit": 20.0,
+      "current_kp": 0.190956,
+      "current_ki": 4538.416,
+      "undervoltage_threshold": 0.0,
+      "overvoltage_threshold": 0.0,
+      "bus_voltage_filter_alpha": 0.2696,
+      "pole_pairs": 14,
+      "torque_constant": 0.08958,
+      "max_calibration_current": 5.0,
+      "cpr": 4096,
+      "encoder_position_offset": 0.0,
+      "velocity_filter_alpha": 0.7154,
+      "watchdog_timeout": 1000,
+      "fast_frame_frequency": 100
+    }
+  }
+}

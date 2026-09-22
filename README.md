@@ -30,6 +30,21 @@ chmod +x "Humanoid Studio-0.1.0.AppImage"
 ./"Humanoid Studio-0.1.0.AppImage"
 ```
 
+### Grant CAN setup permissions (one-time)
+
+Assigning a USB-CAN adapter to a limb renames the interface and brings it up,
+which needs root. The app calls `sudo -n` and fails immediately rather than
+prompting, so without this step adapter assignment silently does nothing:
+
+```bash
+scripts/install-can-sudoers.sh
+```
+
+This installs `/etc/sudoers.d/humanoid-can`, granting passwordless sudo for
+`ip link set`, `udevadm control --reload-rules`, and writing the CAN udev rules
+file — and nothing else. See [scripts/humanoid-can.sudoers](scripts/humanoid-can.sudoers)
+for the exact grants.
+
 ### From source (development)
 
 ```bash

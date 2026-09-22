@@ -187,7 +187,7 @@ export default function Settings() {
         <section>
           <h2 className="text-xs font-medium text-gray-500 uppercase tracking-widest mb-4">About</h2>
           <div className="card p-4">
-            <SettingRow label="Humanoid Studio" description="Version 1.1.0">
+            <SettingRow label="Humanoid Studio" description={`Version ${__APP_VERSION__}`}>
               <span className="text-xs text-gray-500">Berkeley Humanoid Lite</span>
             </SettingRow>
             <SettingRow label="Robot" description="Motor controller firmware">
